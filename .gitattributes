@@ -1,0 +1,19 @@
+* text=auto eol=lf
+
+*.swift    text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.plist    text eol=lf
+*.json     text eol=lf
+*.sh       text eol=lf
+*.md       text eol=lf
+
+*.xcassets text eol=lf
+*.pbxproj  text eol=lf -merge=binary
+
+# Binary
+*.p12              binary
+*.cer              binary
+*.mobileprovision  binary
+*.png              binary
+*.jpg              binary
