@@ -78,7 +78,6 @@ jobs:
             -configuration "$CONFIGURATION" \
             -archivePath "$ARCHIVE_PATH" \
             -destination "generic/platform=iOS" \
-            -allowProvisioningUpdates NO \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM=DRMTP6V372 \
             PROVISIONING_PROFILE_SPECIFIER="Samizdat Test AdHoc" \
