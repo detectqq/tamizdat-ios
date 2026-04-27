@@ -143,14 +143,16 @@ jobs:
           cd "$EXPORT_PATH"
           mkdir -p _inspect
           unzip -oq samizdat-ios.ipa -d _inspect/
+          APP_DIR="$(find _inspect/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          TUNNEL_DIR="$(find "$APP_DIR/PlugIns" -maxdepth 1 -type d -name '*.appex' -print -quit)"
           echo "--- Payload contents ---"
-          ls _inspect/Payload/*.app/
+          ls "$APP_DIR"
           echo "--- App embedded profile ---"
-          security cms -D -i _inspect/Payload/*.app/embedded.mobileprovision \
-            | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin
+          security cms -D -i "$APP_DIR/embedded.mobileprovision" > _inspect/app-profile.plist
+          /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/app-profile.plist
           echo "--- Tunnel embedded profile ---"
-          security cms -D -i _inspect/Payload/*.app/PlugIns/*.appex/embedded.mobileprovision \
-            | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin
+          security cms -D -i "$TUNNEL_DIR/embedded.mobileprovision" > _inspect/tunnel-profile.plist
+          /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/tunnel-profile.plist
           rm -rf _inspect
 
       - name: Upload IPA artifact
