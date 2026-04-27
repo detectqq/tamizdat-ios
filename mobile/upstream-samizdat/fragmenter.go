@@ -1,4 +1,4 @@
-package samizdatcore
+package samizdat
 
 import (
 	"crypto/rand"

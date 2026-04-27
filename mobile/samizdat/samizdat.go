@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	core "github.com/anarki/samizdat-ios/mobile/internal/samizdatcore"
+	core "github.com/getlantern/samizdat"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -246,15 +246,17 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	var shortID [8]byte
 	copy(shortID[:], shortIDBytes)
 
+	// Match the production server's defaults: BBCR on, both fragmenters on,
+	// noise frames on. We let the upstream applyDefaults() fill timeouts /
+	// pool sizes / churn rates by leaving them zero.
 	client, err := core.NewClient(core.ClientConfig{
-		ServerAddr:          net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
-		ServerName:          cfg.SNI,
-		PublicKey:           pubKeyBytes,
-		ShortID:             shortID,
-		Fingerprint:         cfg.Fingerprint,
-		Jitter:              true,
-		TCPFragmentation:    cfg.TCPFragmentation,
-		RecordFragmentation: true,
+		ServerAddr:  net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
+		ServerName:  cfg.SNI,
+		PublicKey:   pubKeyBytes,
+		ShortID:     shortID,
+		Fingerprint: cfg.Fingerprint,
+		// EnableBBCR=nil → upstream defaults to true.
+		// TCPFragmentation/RecordFragmentation/NoiseFrames default to true.
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat client: %w", err)

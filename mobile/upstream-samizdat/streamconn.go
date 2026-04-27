@@ -1,4 +1,4 @@
-package samizdatcore
+package samizdat
 
 import (
 	"io"
@@ -15,6 +15,7 @@ type streamConn struct {
 	localAddr   net.Addr
 	remoteAddr  net.Addr
 	shaper      *Shaper
+	fragmenter  *RecordFragmenter
 	destination string
 
 	readDeadline  *deadlineTimer
@@ -25,13 +26,16 @@ type streamConn struct {
 }
 
 // newStreamConn creates a net.Conn backed by the given ReadWriteCloser.
-func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string, shaper *Shaper) *streamConn {
+// The fragmenter (may be nil) is consulted on every Write to split the
+// payload across multiple H2 DATA frames (P0.1 wiring).
+func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string, shaper *Shaper, fragmenter *RecordFragmenter) *streamConn {
 	return &streamConn{
 		rwc:           rwc,
 		localAddr:     localAddr,
 		remoteAddr:    remoteAddr,
 		destination:   destination,
 		shaper:        shaper,
+		fragmenter:    fragmenter,
 		readDeadline:  newDeadlineTimer(),
 		writeDeadline: newDeadlineTimer(),
 	}
@@ -49,7 +53,7 @@ func (sc *streamConn) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	if sc.shaper != nil {
-		return sc.shaper.Write(sc.rwc, b)
+		return sc.shaper.FragmentWrite(sc.rwc, sc.fragmenter, b)
 	}
 	return sc.rwc.Write(b)
 }
