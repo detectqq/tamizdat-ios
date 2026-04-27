@@ -605,6 +605,16 @@ func parseConfig(blob string) (*config, error) {
 		return nil, fmt.Errorf("invalid port %q", portStr)
 	}
 	q := u.Query()
+	if connectHost := q.Get("connect_host"); connectHost != "" {
+		host = connectHost
+	}
+	if connectPort := q.Get("connect_port"); connectPort != "" {
+		parsedPort, err := strconv.Atoi(connectPort)
+		if err != nil || parsedPort <= 0 || parsedPort > 65535 {
+			return nil, fmt.Errorf("invalid connect_port %q", connectPort)
+		}
+		port = parsedPort
+	}
 
 	sni := q.Get("sni")
 	if sni == "" {

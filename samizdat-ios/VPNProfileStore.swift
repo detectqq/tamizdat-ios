@@ -14,9 +14,9 @@ final class VPNProfileStore {
     func startTunnel(configBlob: String) async throws {
         SamizdatAddLog("info: preparing VPN profile")
         let serverIP = await resolvedIPv4Address(from: configBlob)
-        let engineConfigBlob = configBlobWithHost(serverIP, in: configBlob) ?? configBlob
+        let engineConfigBlob = configBlobWithConnectEndpoint(serverIP, in: configBlob) ?? configBlob
         if let serverIP {
-            SamizdatAddLog("info: resolved server IPv4 before VPN start")
+            SamizdatAddLog("info: resolved server IPv4 before VPN start: \(serverIP)")
         } else {
             SamizdatAddLog("warn: server IPv4 resolve timed out before VPN start")
         }
@@ -158,9 +158,11 @@ final class VPNProfileStore {
     private func resolvedIPv4Address(from configBlob: String) async -> String? {
         guard let host = URL(string: configBlob)?.host else { return nil }
         var parsed = in_addr()
-        if inet_pton(AF_INET, host, &parsed) == 1 { return host }
+        if inet_pton(AF_INET, host, &parsed) == 1 {
+            return isReservedFakeIPv4(host) ? nil : host
+        }
 
-        return await withCheckedContinuation { continuation in
+        let systemResult = await withCheckedContinuation { continuation in
             let lock = NSLock()
             var didResume = false
 
@@ -179,6 +181,13 @@ final class VPNProfileStore {
                 resumeOnce(nil)
             }
         }
+        if let systemResult, !isReservedFakeIPv4(systemResult) {
+            return systemResult
+        }
+        if let systemResult {
+            SamizdatAddLog("warn: ignoring fake/reserved DNS result: \(systemResult)")
+        }
+        return await resolveIPv4AddressWithDoH(host: host)
     }
 
     private static func resolveIPv4Address(host: String) -> String? {
@@ -198,9 +207,65 @@ final class VPNProfileStore {
         return String(cString: buffer)
     }
 
-    private func configBlobWithHost(_ host: String?, in configBlob: String) -> String? {
-        guard let host, var components = URLComponents(string: configBlob) else { return nil }
-        components.host = host
+    private func resolveIPv4AddressWithDoH(host: String) async -> String? {
+        var components = URLComponents(string: "https://1.1.1.1/dns-query")
+        components?.queryItems = [
+            URLQueryItem(name: "name", value: host),
+            URLQueryItem(name: "type", value: "A"),
+        ]
+        guard let url = components?.url else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let response = try JSONDecoder().decode(DNSJSONResponse.self, from: data)
+            let address = response.Answer?
+                .filter { $0.type == 1 }
+                .map(\.data)
+                .first { isUsableIPv4($0) }
+            if let address {
+                SamizdatAddLog("info: resolved server IPv4 via DoH: \(address)")
+            }
+            return address
+        } catch {
+            SamizdatAddLog("warn: DoH resolve failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func isUsableIPv4(_ address: String) -> Bool {
+        var parsed = in_addr()
+        return inet_pton(AF_INET, address, &parsed) == 1 && !isReservedFakeIPv4(address)
+    }
+
+    private func isReservedFakeIPv4(_ address: String) -> Bool {
+        let parts = address.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return false }
+        // 198.18.0.0/15 is reserved for benchmarking and commonly used as fake-ip.
+        if parts[0] == 198 && (parts[1] == 18 || parts[1] == 19) { return true }
+        if parts[0] == 0 || parts[0] == 127 || parts[0] >= 224 { return true }
+        return false
+    }
+
+    private func configBlobWithConnectEndpoint(_ host: String?, in configBlob: String) -> String? {
+        guard let host,
+              var components = URLComponents(string: configBlob),
+              let port = components.port else { return nil }
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name == "connect_host" || $0.name == "connect_port" }
+        queryItems.append(URLQueryItem(name: "connect_host", value: host))
+        queryItems.append(URLQueryItem(name: "connect_port", value: String(port)))
+        components.queryItems = queryItems
         return components.string
     }
+}
+
+private struct DNSJSONResponse: Decodable {
+    let Answer: [DNSJSONAnswer]?
+}
+
+private struct DNSJSONAnswer: Decodable {
+    let type: Int
+    let data: String
 }
