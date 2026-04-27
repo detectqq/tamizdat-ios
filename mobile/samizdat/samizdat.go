@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -318,7 +319,7 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 		localConn := gonet.NewTCPConn(&wq, endpoint)
 		go func() {
 			defer localConn.Close()
-			remote, dialErr := client.DialContext(ctx, "tcp", dest)
+			remote, dialErr := dialWithBBCRRetry(ctx, client, dest)
 			if dialErr != nil {
 				rt.appendLog(fmt.Sprintf("error: TCP dial %s: %v", dest, dialErr))
 				return
@@ -329,8 +330,17 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
+	// UDP forwarder: samizdat tunnels TCP only. We accept DNS (port 53) and
+	// proxy it as DNS-over-TCP via samizdat. All other UDP (QUIC/443,
+	// games, etc.) is dropped — modern browsers fall back to TCP/TLS.
+	//
+	// Returning false drops the packet without creating an endpoint, which
+	// dodges the IPv6 "too many colons" path entirely.
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
+		if id.LocalPort != 53 {
+			return false
+		}
 		dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 		var wq waiter.Queue
 		endpoint, udpErr := r.CreateEndpoint(&wq)
@@ -339,17 +349,10 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 			return true
 		}
 		conn := gonet.NewUDPConn(&wq, endpoint)
-		if id.LocalPort == 53 {
-			go func() {
-				defer conn.Close()
-				forwardDNS(ctx, conn, dest, client)
-			}()
-		} else {
-			go func() {
-				defer conn.Close()
-				forwardUDP(ctx, conn, dest, client)
-			}()
-		}
+		go func() {
+			defer conn.Close()
+			forwardDNS(ctx, conn, dest, client)
+		}()
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
@@ -482,7 +485,7 @@ func forwardDNS(ctx context.Context, conn *gonet.UDPConn, dest string, client *c
 	}
 	query := buf[:n]
 
-	remote, err := client.DialContext(ctx, "tcp", dest)
+	remote, err := dialWithBBCRRetry(ctx, client, dest)
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: DNS TCP dial %s: %v", dest, err))
 		return
@@ -512,52 +515,45 @@ func forwardDNS(ctx context.Context, conn *gonet.UDPConn, dest string, client *c
 	conn.Write(resp)
 }
 
-func forwardUDP(ctx context.Context, conn *gonet.UDPConn, dest string, client *core.Client) {
-	remote, err := client.DialContext(ctx, "tcp", "udp:"+dest)
-	if err != nil {
-		rt.appendLog(fmt.Sprintf("error: UDP dial %s: %v", dest, err))
-		return
+// dialWithBBCRRetry wraps client.DialContext with a small retry loop for
+// transient BBCR-session-not-yet-active errors. The BBCR session is async:
+// the first DialContext can race with the outer transport's transition from
+// Idle → Active, and parallel dials during outer rotation can briefly hit
+// "transport is not active" or "scheduler backpressure". Both are
+// recoverable on the order of tens to a few hundred ms, so we retry rather
+// than surface the failure to the iOS app.
+//
+// Real failures (TCP refused, TLS handshake, auth) bubble up immediately.
+func dialWithBBCRRetry(ctx context.Context, client *core.Client, dest string) (net.Conn, error) {
+	const overallTimeout = 8 * time.Second
+	deadline := time.Now().Add(overallTimeout)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		conn, err := client.DialContext(ctx, "tcp", dest)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		msg := err.Error()
+		transient := strings.Contains(msg, "transport is not active") ||
+			strings.Contains(msg, "scheduler backpressure")
+		if !transient {
+			return nil, err
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, lastErr
+		}
+		// 50, 100, 200, 250, 250… ms backoff.
+		d := time.Duration(50<<attempt) * time.Millisecond
+		if d > 250*time.Millisecond {
+			d = 250 * time.Millisecond
+		}
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	defer remote.Close()
-
-	done := make(chan struct{}, 2)
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 2+65536)
-		for {
-			n, err := conn.Read(buf[2:])
-			if err != nil {
-				return
-			}
-			buf[0] = byte(n >> 8)
-			buf[1] = byte(n)
-			if _, err := remote.Write(buf[:2+n]); err != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		lenBuf := make([]byte, 2)
-		for {
-			if _, err := io.ReadFull(remote, lenBuf); err != nil {
-				return
-			}
-			size := int(lenBuf[0])<<8 | int(lenBuf[1])
-			if size == 0 || size > 65535 {
-				return
-			}
-			pkt := make([]byte, size)
-			if _, err := io.ReadFull(remote, pkt); err != nil {
-				return
-			}
-			conn.Write(pkt)
-		}
-	}()
-
-	<-done
 }
 
 func (r *runtimeState) setState(s string) {
