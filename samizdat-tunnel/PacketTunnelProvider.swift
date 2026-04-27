@@ -18,14 +18,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         SamizdatAddLog("info: PacketTunnelProvider startTunnel")
-        let serverIP = resolvedIPv4Address(from: configBlob)
+        let engineConfigBlob = proto.providerConfiguration?["engineConfigBlob"] as? String ?? configBlob
+        let serverIP = proto.providerConfiguration?["serverIP"] as? String
         if let serverIP {
-            SamizdatAddLog("info: resolved server IPv4 \(serverIP)")
+            SamizdatAddLog("info: using pre-resolved server IPv4")
         } else {
-            SamizdatAddLog("warn: could not resolve server IPv4 before routing")
+            SamizdatAddLog("warn: no pre-resolved server IPv4 in provider configuration")
         }
 
-        let engineConfigBlob = configBlobWithHost(serverIP, in: configBlob) ?? configBlob
         let settings = makeNetworkSettings(configBlob: configBlob, serverIP: serverIP)
         SamizdatAddLog("info: applying packet tunnel network settings")
         setTunnelNetworkSettings(settings) { [weak self] error in
@@ -102,33 +102,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         settings.dnsSettings = dns
 
         return settings
-    }
-
-    private func configBlobWithHost(_ host: String?, in configBlob: String) -> String? {
-        guard let host, var components = URLComponents(string: configBlob) else { return nil }
-        components.host = host
-        return components.string
-    }
-
-    private func resolvedIPv4Address(from configBlob: String) -> String? {
-        guard let host = URL(string: configBlob)?.host else { return nil }
-        var parsed = in_addr()
-        if inet_pton(AF_INET, host, &parsed) == 1 { return host }
-
-        var hints = addrinfo()
-        hints.ai_family = AF_INET
-        hints.ai_socktype = SOCK_STREAM
-        hints.ai_protocol = IPPROTO_TCP
-        var result: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &result) == 0, let result else { return nil }
-        defer { freeaddrinfo(result) }
-
-        var addr = result.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
-        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
-            return nil
-        }
-        return String(cString: buffer)
     }
 
     private func startPacketReadLoop() {

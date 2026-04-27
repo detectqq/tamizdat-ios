@@ -1,5 +1,7 @@
 import Foundation
+import Darwin
 import NetworkExtension
+import SamizdatClient
 
 final class VPNProfileStore {
     static let shared = VPNProfileStore()
@@ -10,8 +12,22 @@ final class VPNProfileStore {
     private init() {}
 
     func startTunnel(configBlob: String) async throws {
-        let manager = try await ensureProfile(configBlob: configBlob)
+        SamizdatAddLog("info: preparing VPN profile")
+        let serverIP = await resolvedIPv4Address(from: configBlob)
+        let engineConfigBlob = configBlobWithHost(serverIP, in: configBlob) ?? configBlob
+        if let serverIP {
+            SamizdatAddLog("info: resolved server IPv4 before VPN start")
+        } else {
+            SamizdatAddLog("warn: server IPv4 resolve timed out before VPN start")
+        }
+
+        let manager = try await ensureProfile(
+            configBlob: configBlob,
+            engineConfigBlob: engineConfigBlob,
+            serverIP: serverIP
+        )
         if manager.connection.status != .connected && manager.connection.status != .connecting {
+            SamizdatAddLog("info: starting NETunnelProviderSession")
             try manager.connection.startVPNTunnel()
         }
     }
@@ -37,24 +53,31 @@ final class VPNProfileStore {
     }
 
     @discardableResult
-    private func ensureProfile(configBlob: String) async throws -> NETunnelProviderManager {
+    private func ensureProfile(configBlob: String, engineConfigBlob: String, serverIP: String?) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager
         if let existingManager = try await loadExistingManager() {
             manager = existingManager
         } else {
             manager = NETunnelProviderManager()
         }
-        configure(manager, configBlob: configBlob)
+        configure(manager, configBlob: configBlob, engineConfigBlob: engineConfigBlob, serverIP: serverIP)
         try await save(manager)
         try await load(manager)
         return manager
     }
 
-    private func configure(_ manager: NETunnelProviderManager, configBlob: String) {
+    private func configure(_ manager: NETunnelProviderManager, configBlob: String, engineConfigBlob: String, serverIP: String?) {
         let proto = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
         proto.providerBundleIdentifier = providerBundleIdentifier
         proto.serverAddress = "Samizdat"
-        proto.providerConfiguration = ["configBlob": configBlob]
+        var providerConfiguration: [String: String] = [
+            "configBlob": configBlob,
+            "engineConfigBlob": engineConfigBlob,
+        ]
+        if let serverIP {
+            providerConfiguration["serverIP"] = serverIP
+        }
+        proto.providerConfiguration = providerConfiguration
 
         manager.protocolConfiguration = proto
         manager.localizedDescription = localizedDescription
@@ -130,5 +153,54 @@ final class VPNProfileStore {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    private func resolvedIPv4Address(from configBlob: String) async -> String? {
+        guard let host = URL(string: configBlob)?.host else { return nil }
+        var parsed = in_addr()
+        if inet_pton(AF_INET, host, &parsed) == 1 { return host }
+
+        return await withCheckedContinuation { continuation in
+            let lock = NSLock()
+            var didResume = false
+
+            func resumeOnce(_ value: String?) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+
+            DispatchQueue.global(qos: .utility).async {
+                resumeOnce(Self.resolveIPv4Address(host: host))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.5) {
+                resumeOnce(nil)
+            }
+        }
+    }
+
+    private static func resolveIPv4Address(host: String) -> String? {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        hints.ai_protocol = IPPROTO_TCP
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let result else { return nil }
+        defer { freeaddrinfo(result) }
+
+        var addr = result.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+            return nil
+        }
+        return String(cString: buffer)
+    }
+
+    private func configBlobWithHost(_ host: String?, in configBlob: String) -> String? {
+        guard let host, var components = URLComponents(string: configBlob) else { return nil }
+        components.host = host
+        return components.string
     }
 }
