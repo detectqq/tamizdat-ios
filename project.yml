@@ -59,6 +59,10 @@ targets:
         excludes:
           - "*.entitlements"
           - "Info.plist"
+    dependencies:
+      - framework: Frameworks/SamizdatClient.xcframework
+        embed: true
+        codeSign: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test.tunnel

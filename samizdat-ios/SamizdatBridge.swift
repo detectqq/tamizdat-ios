@@ -38,19 +38,17 @@ final class SamizdatBridge: ObservableObject {
         return err.isEmpty ? nil : err
     }
 
-    /// Connect using a samizdat:// URL. Throws on parse error; network
-    /// errors surface via `state == .error` + `lastError`.
-    func connect(_ blob: String) throws {
-        var nsErr: NSError?
-        SamizdatConnect(blob, &nsErr)
-        if let nsErr {
-            throw nsErr
-        }
-        // Poll loop will pick up the new state immediately on next tick.
+    /// Starts the system VPN configuration backed by PacketTunnelProvider.
+    func connect(_ blob: String) async throws {
+        state = .connecting
+        lastError = ""
+        try await VPNProfileStore.shared.startTunnel(configBlob: blob)
+        await refresh()
     }
 
     func disconnect() {
-        SamizdatDisconnect()
+        VPNProfileStore.shared.stopTunnel()
+        state = .disconnected
     }
 
     func clearLogs() {
@@ -74,10 +72,21 @@ final class SamizdatBridge: ObservableObject {
     }
 
     private func refresh() async {
-        let raw = SamizdatStatus()
-        let newState = State(rawValue: raw) ?? .disconnected
+        let newState: State
+        switch await VPNProfileStore.shared.connectionStatus() {
+        case .invalid, .disconnected:
+            newState = .disconnected
+        case .connecting, .reasserting:
+            newState = .connecting
+        case .connected:
+            newState = .connected
+        case .disconnecting:
+            newState = .disconnected
+        @unknown default:
+            newState = .error
+        }
         let err = SamizdatLastError()
-        let socks = SamizdatSocksAddr()
+        let socks = ""
         let dump = SamizdatLogs(0)
         let lines = dump.isEmpty ? [] : dump.components(separatedBy: "\n")
 

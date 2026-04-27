@@ -152,8 +152,7 @@ struct ContentView: View {
         Task { @MainActor in
             defer { isPreparingVPN = false }
             do {
-                try await VPNProfileStore.shared.ensureProfile()
-                try bridge.connect(blob)
+                try await bridge.connect(blob)
             } catch {
                 vpnProfileError = error.localizedDescription
             }

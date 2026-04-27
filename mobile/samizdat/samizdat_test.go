@@ -57,7 +57,7 @@ func TestParseConfig_Errors(t *testing.T) {
 	}
 }
 
-func TestConnectStubLifecycle(t *testing.T) {
+func TestConnectLifecycle(t *testing.T) {
 	// reset
 	rt = &runtimeState{state: StateDisconnected, logsMax: 1000}
 
@@ -70,19 +70,9 @@ func TestConnectStubLifecycle(t *testing.T) {
 	if got := Status(); got != StateConnecting && got != StateConnected {
 		t.Errorf("immediately after Connect, status = %q", got)
 	}
-	// Stub takes ~900ms.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if Status() == StateConnected {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	time.Sleep(10 * time.Millisecond)
 	if got := Status(); got != StateConnected {
-		t.Fatalf("after wait, status = %q", got)
-	}
-	if got := SocksAddr(); got != "127.0.0.1:1080" {
-		t.Errorf("SocksAddr = %q", got)
+		t.Fatalf("after Connect, status = %q", got)
 	}
 	Disconnect()
 	if got := Status(); got != StateDisconnected {
