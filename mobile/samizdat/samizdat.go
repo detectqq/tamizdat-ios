@@ -153,6 +153,10 @@ func Version() string {
 	return "0.2.0-vpn"
 }
 
+func AddLog(line string) {
+	rt.appendLog(line)
+}
+
 // TunnelStart starts the gVisor TCP/IP stack used by the iOS Packet Tunnel
 // extension. Swift injects raw IP packets with TunnelInjectPacket and drains
 // outgoing packets via TunnelReadPacket.

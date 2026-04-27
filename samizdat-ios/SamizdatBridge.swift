@@ -20,6 +20,8 @@ final class SamizdatBridge: ObservableObject {
     @Published private(set) var logs: [String] = []
 
     private var pollTask: Task<Void, Never>?
+    private var lastExtensionLogPoll = Date.distantPast
+    private var extensionLogDump = ""
 
     init() {
         startPolling()
@@ -53,6 +55,10 @@ final class SamizdatBridge: ObservableObject {
 
     func clearLogs() {
         SamizdatClearLogs()
+        extensionLogDump = ""
+        Task {
+            await VPNProfileStore.shared.clearExtensionLogs()
+        }
         logs = []
     }
 
@@ -85,9 +91,22 @@ final class SamizdatBridge: ObservableObject {
         @unknown default:
             newState = .error
         }
-        let err = SamizdatLastError()
+        var err = SamizdatLastError()
         let socks = ""
-        let dump = SamizdatLogs(0)
+        var dump = SamizdatLogs(0)
+
+        if Date().timeIntervalSince(lastExtensionLogPoll) >= 1 {
+            lastExtensionLogPoll = Date()
+            if let extensionDump = await VPNProfileStore.shared.extensionLogs(), !extensionDump.isEmpty {
+                extensionLogDump = extensionDump
+                if err.isEmpty,
+                   let lastErrorLine = extensionDump.components(separatedBy: "\n").last(where: { $0.contains(" error:") }) {
+                    err = lastErrorLine
+                }
+            }
+        }
+
+        dump = [dump, extensionLogDump].filter { !$0.isEmpty }.joined(separator: "\n")
         let lines = dump.isEmpty ? [] : dump.components(separatedBy: "\n")
 
         if state != newState { state = newState }

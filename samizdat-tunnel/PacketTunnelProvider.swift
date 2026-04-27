@@ -17,17 +17,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        let settings = makeNetworkSettings(configBlob: configBlob)
+        SamizdatAddLog("info: PacketTunnelProvider startTunnel")
+        let serverIP = resolvedIPv4Address(from: configBlob)
+        if let serverIP {
+            SamizdatAddLog("info: resolved server IPv4 \(serverIP)")
+        } else {
+            SamizdatAddLog("warn: could not resolve server IPv4 before routing")
+        }
+
+        let engineConfigBlob = configBlobWithHost(serverIP, in: configBlob) ?? configBlob
+        let settings = makeNetworkSettings(configBlob: configBlob, serverIP: serverIP)
+        SamizdatAddLog("info: applying packet tunnel network settings")
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self else { return }
             if let error {
+                SamizdatAddLog("error: setTunnelNetworkSettings: \(error.localizedDescription)")
                 completionHandler(error)
                 return
             }
 
             var nsError: NSError?
-            SamizdatTunnelStart(configBlob, &nsError)
+            SamizdatTunnelStart(engineConfigBlob, &nsError)
             if let nsError {
+                SamizdatAddLog("error: SamizdatTunnelStart: \(nsError.localizedDescription)")
                 completionHandler(nsError)
                 return
             }
@@ -36,6 +48,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.startPacketReadLoop()
             self.startPacketWriteLoop()
             self.log.info("packet tunnel started")
+            SamizdatAddLog("info: packet tunnel started")
             completionHandler(nil)
         }
     }
@@ -44,23 +57,38 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        SamizdatAddLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
         SamizdatTunnelStop()
         completionHandler()
     }
 
     override func handleAppMessage(_ messageData: Data,
                                    completionHandler: ((Data?) -> Void)?) {
-        completionHandler?(nil)
+        let command = String(data: messageData, encoding: .utf8) ?? "logs"
+        switch command {
+        case "clearLogs":
+            SamizdatClearLogs()
+            completionHandler?(Data())
+        case "status":
+            let payload = [
+                "status=\(SamizdatStatus())",
+                "lastError=\(SamizdatLastError())",
+                SamizdatLogs(0)
+            ].filter { !$0.isEmpty }.joined(separator: "\n")
+            completionHandler?(payload.data(using: .utf8))
+        default:
+            completionHandler?(SamizdatLogs(0).data(using: .utf8))
+        }
     }
 
-    private func makeNetworkSettings(configBlob: String) -> NEPacketTunnelNetworkSettings {
+    private func makeNetworkSettings(configBlob: String, serverIP: String?) -> NEPacketTunnelNetworkSettings {
         let remoteAddress = URL(string: configBlob)?.host ?? "Samizdat"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
         settings.mtu = 1500
 
         let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        if let serverIP = resolvedIPv4Address(from: configBlob) {
+        if let serverIP {
             ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255")]
         }
         settings.ipv4Settings = ipv4
@@ -74,6 +102,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         settings.dnsSettings = dns
 
         return settings
+    }
+
+    private func configBlobWithHost(_ host: String?, in configBlob: String) -> String? {
+        guard let host, var components = URLComponents(string: configBlob) else { return nil }
+        components.host = host
+        return components.string
     }
 
     private func resolvedIPv4Address(from configBlob: String) -> String? {

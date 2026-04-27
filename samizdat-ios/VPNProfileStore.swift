@@ -28,6 +28,14 @@ final class VPNProfileStore {
         return manager.connection.status
     }
 
+    func extensionLogs() async -> String? {
+        try? await sendProviderMessage("logs")
+    }
+
+    func clearExtensionLogs() async {
+        _ = try? await sendProviderMessage("clearLogs")
+    }
+
     @discardableResult
     private func ensureProfile(configBlob: String) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager
@@ -95,6 +103,31 @@ final class VPNProfileStore {
                     return
                 }
                 continuation.resume(returning: ())
+            }
+        }
+    }
+
+    private func sendProviderMessage(_ message: String) async throws -> String {
+        guard let manager = try await loadExistingManager(),
+              let session = manager.connection as? NETunnelProviderSession else {
+            return ""
+        }
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            break
+        default:
+            return ""
+        }
+
+        let data = message.data(using: .utf8) ?? Data()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            do {
+                try session.sendProviderMessage(data) { responseData in
+                    let response = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                    continuation.resume(returning: response)
+                }
+            } catch {
+                continuation.resume(throwing: error)
             }
         }
     }
