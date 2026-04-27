@@ -82,7 +82,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func makeNetworkSettings(configBlob: String, serverIP: String?) -> NEPacketTunnelNetworkSettings {
-        let remoteAddress = URL(string: configBlob)?.host ?? "Samizdat"
+        let remoteAddress = serverIP ?? "127.0.0.1"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
         settings.mtu = 1500
 
