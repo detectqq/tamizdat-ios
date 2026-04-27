@@ -129,9 +129,9 @@ struct ContentView: View {
     private var buttonTitle: String {
         if isPreparingVPN { return "Preparing VPN..." }
         switch bridge.state {
-        case .connected:  "Disconnect"
-        case .connecting: "Connecting…"
-        default:          "Connect"
+        case .connected:  return "Disconnect"
+        case .connecting: return "Connecting…"
+        default:          return "Connect"
         }
     }
 
