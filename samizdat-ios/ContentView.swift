@@ -5,6 +5,8 @@ struct ContentView: View {
     @State private var showConfig = false
     @State private var showLogs = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
+    @State private var isPreparingVPN = false
+    @State private var vpnProfileError: String?
 
     var body: some View {
         VStack(spacing: 28) {
@@ -26,6 +28,13 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
                 }
+                if let vpnProfileError {
+                    Text(vpnProfileError)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
                 if !bridge.socksAddr.isEmpty && bridge.state == .connected {
                     Text("SOCKS5: \(bridge.socksAddr)")
                         .font(.footnote.monospaced())
@@ -44,7 +53,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(buttonTint)
-            .disabled(bridge.state == .connecting || !hasConfig)
+            .disabled(bridge.state == .connecting || isPreparingVPN || !hasConfig)
 
             if !hasConfig {
                 Text("Paste a samizdat:// config first")
@@ -118,6 +127,7 @@ struct ContentView: View {
     }
 
     private var buttonTitle: String {
+        if isPreparingVPN { return "Preparing VPN..." }
         switch bridge.state {
         case .connected:  "Disconnect"
         case .connecting: "Connecting…"
@@ -135,10 +145,18 @@ struct ContentView: View {
             return
         }
         guard let blob = ConfigStore.shared.load() else { return }
-        do {
-            try bridge.connect(blob)
-        } catch {
-            // bridge state is already .error via Go side; nothing else to do.
+
+        isPreparingVPN = true
+        vpnProfileError = nil
+
+        Task { @MainActor in
+            defer { isPreparingVPN = false }
+            do {
+                try await VPNProfileStore.shared.ensureProfile()
+                try bridge.connect(blob)
+            } catch {
+                vpnProfileError = error.localizedDescription
+            }
         }
     }
 }
