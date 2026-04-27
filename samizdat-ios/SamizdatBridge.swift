@@ -35,7 +35,7 @@ final class SamizdatBridge: ObservableObject {
     /// or a human-readable error message.
     static func validate(_ blob: String) -> String? {
         let err = SamizdatParseConfigError(blob)
-        return (err?.isEmpty ?? true) ? nil : err
+        return err.isEmpty ? nil : err
     }
 
     /// Connect using a samizdat:// URL. Throws on parse error; network
@@ -59,7 +59,7 @@ final class SamizdatBridge: ObservableObject {
     }
 
     var version: String {
-        SamizdatVersion() ?? "?"
+        SamizdatVersion()
     }
 
     // MARK: – Polling
@@ -74,11 +74,11 @@ final class SamizdatBridge: ObservableObject {
     }
 
     private func refresh() async {
-        let raw = SamizdatStatus() ?? "disconnected"
+        let raw = SamizdatStatus()
         let newState = State(rawValue: raw) ?? .disconnected
-        let err = SamizdatLastError() ?? ""
-        let socks = SamizdatSocksAddr() ?? ""
-        let dump = SamizdatLogs(0) ?? ""
+        let err = SamizdatLastError()
+        let socks = SamizdatSocksAddr()
+        let dump = SamizdatLogs(0)
         let lines = dump.isEmpty ? [] : dump.components(separatedBy: "\n")
 
         if state != newState { state = newState }
