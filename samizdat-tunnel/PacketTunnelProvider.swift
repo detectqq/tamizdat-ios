@@ -1,5 +1,5 @@
 import NetworkExtension
-import os.log
+import OSLog
 
 /// Iteration 1 stub. Apple requires the extension target exist with the
 /// Network Extensions entitlement before the App ID's provisioning profile
