@@ -7,16 +7,16 @@ on:
 
 jobs:
   build:
-    name: Archive & export IPA
+    name: gomobile + xcodebuild → IPA
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
       SCHEME: samizdat-ios
-      BUNDLE_ID: com.anarki.samizdat-test
       CONFIGURATION: Release
       ARCHIVE_PATH: ${{ github.workspace }}/build/samizdat-ios.xcarchive
       EXPORT_PATH: ${{ github.workspace }}/build/export
+      FRAMEWORK_OUT: ${{ github.workspace }}/Frameworks/SamizdatClient.xcframework
 
     steps:
       - name: Checkout
@@ -24,6 +24,31 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: gomobile init
+        run: gomobile init
+
+      - name: gomobile bind → SamizdatClient.xcframework
+        working-directory: mobile
+        run: |
+          mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
+          gomobile bind -v \
+            -target=ios,iossimulator \
+            -iosversion=17.0 \
+            -o "${{ env.FRAMEWORK_OUT }}" \
+            ./samizdat
+          ls -la "${{ env.FRAMEWORK_OUT }}"
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -40,38 +65,49 @@ jobs:
           CERT_PATH=$RUNNER_TEMP/build_certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERT_PATH
+          printf %s "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          security import $CERT_PATH -P "$P12_PASSWORD" \
-            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security import "$CERT_PATH" -P "$P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
 
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          security list-keychains -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
-          security default-keychain -s $KEYCHAIN_PATH
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_PATH"
 
           echo "--- Available signing identities ---"
-          security find-identity -v -p codesigning $KEYCHAIN_PATH
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
-      - name: Install provisioning profile
+      - name: Install provisioning profiles (app + tunnel)
         env:
           BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          BUILD_TUNNEL_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_TUNNEL_PROVISION_PROFILE_BASE64 }}
         run: |
           PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILES_DIR"
-          PROFILE_PATH="$PROFILES_DIR/samizdat_test_adhoc.mobileprovision"
-          echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o "$PROFILE_PATH"
-          echo "--- Installed profile ---"
-          /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin \
-            <<< "$(security cms -D -i "$PROFILE_PATH")"
+
+          APP="$PROFILES_DIR/samizdat_test_adhoc.mobileprovision"
+          printf %s "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$APP"
+
+          TUN="$PROFILES_DIR/samizdat_tunnel_adhoc.mobileprovision"
+          printf %s "$BUILD_TUNNEL_PROVISION_PROFILE_BASE64" | base64 --decode > "$TUN"
+
+          for p in "$APP" "$TUN"; do
+            echo "--- $p ---"
+            /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin \
+              <<< "$(security cms -D -i "$p")"
+            /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin \
+              <<< "$(security cms -D -i "$p")"
+          done
 
       - name: Archive
         run: |
+          set -o pipefail
           xcodebuild archive \
             -project samizdat-ios.xcodeproj \
             -scheme "$SCHEME" \
@@ -80,25 +116,40 @@ jobs:
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM=DRMTP6V372 \
-            PROVISIONING_PROFILE_SPECIFIER="Samizdat Test AdHoc" \
             CODE_SIGN_IDENTITY="Apple Distribution" \
-            | xcpretty && exit ${PIPESTATUS[0]}
+            | xcpretty
 
       - name: Export IPA
         run: |
+          set -o pipefail
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportPath "$EXPORT_PATH" \
             -exportOptionsPlist ExportOptions.plist \
-            | xcpretty && exit ${PIPESTATUS[0]}
+            | xcpretty
 
       - name: Rename IPA
         run: |
           cd "$EXPORT_PATH"
           ls -la
-          # Ensure deterministic filename
           IPA=$(ls *.ipa | head -1)
           mv "$IPA" samizdat-ios.ipa
+          ls -la
+
+      - name: Inspect signed IPA
+        run: |
+          cd "$EXPORT_PATH"
+          mkdir -p _inspect
+          unzip -oq samizdat-ios.ipa -d _inspect/
+          echo "--- Payload contents ---"
+          ls _inspect/Payload/*.app/
+          echo "--- App embedded profile ---"
+          security cms -D -i _inspect/Payload/*.app/embedded.mobileprovision \
+            | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin
+          echo "--- Tunnel embedded profile ---"
+          security cms -D -i _inspect/Payload/*.app/PlugIns/*.appex/embedded.mobileprovision \
+            | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin
+          rm -rf _inspect
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4

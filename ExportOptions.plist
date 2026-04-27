@@ -14,6 +14,8 @@
     <dict>
         <key>com.anarki.samizdat-test</key>
         <string>Samizdat Test AdHoc</string>
+        <key>com.anarki.samizdat-test.tunnel</key>
+        <string>Samizdat Tunnel AdHoc</string>
     </dict>
     <key>compileBitcode</key>
     <false/>
