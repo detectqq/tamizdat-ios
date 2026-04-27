@@ -20,7 +20,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SamizdatAddLog("info: PacketTunnelProvider startTunnel")
         let engineConfigBlob = proto.providerConfiguration?["engineConfigBlob"] as? String ?? configBlob
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
-        if let serverIP {
+        if serverIP != nil {
             SamizdatAddLog("info: using pre-resolved server IPv4")
         } else {
             SamizdatAddLog("warn: no pre-resolved server IPv4 in provider configuration")

@@ -162,7 +162,7 @@ final class VPNProfileStore {
             return isReservedFakeIPv4(host) ? nil : host
         }
 
-        let systemResult = await withCheckedContinuation { continuation in
+        let systemResult: String? = await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
             let lock = NSLock()
             var didResume = false
 
