@@ -200,7 +200,10 @@ func TunnelStart(configBlob string) error {
 }
 
 func runtimeMetricsLoop(ctx context.Context) {
-	t := time.NewTicker(5 * time.Second)
+	// 2s tick — fast enough to land 4-5 snapshots inside the few seconds
+	// between iOS killing the extension and us learning about it through
+	// the bridge poll, but slow enough not to spam the buffer.
+	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -209,8 +212,10 @@ func runtimeMetricsLoop(ctx context.Context) {
 		case <-t.C:
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
+			// Sys is the closest go-runtime knob to iOS-visible RSS.
+			// Hit ~50 MB and the NEPacketTunnelProvider gets reaped.
 			rt.appendLog(fmt.Sprintf(
-				"info: rt heap=%dKB sys=%dKB goroutines=%d numgc=%d",
+				"info: rt heap=%dKB sys=%dKB(<50MB cap) goroutines=%d numgc=%d",
 				ms.HeapAlloc/1024,
 				ms.Sys/1024,
 				runtime.NumGoroutine(),
@@ -318,22 +323,31 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
+	// gVisor TCP buffers — sized for the iOS NEPacketTunnelProvider's
+	// 50 MB RSS cap, NOT the desktop server's. Original settings (1 MB
+	// default / 16 MB max) blew through the cap inside ~60s of Speedtest:
+	// 10-20 parallel streams × 16 MB recv × 16 MB send → easily 300+ MB.
+	// Mobile cap of 1 MB max is enough for ~80 Mbps over 10-15 ms RTT
+	// (BDP ≈ 100-150 KB) with comfortable headroom; further streams just
+	// share the budget instead of stacking it.
 	recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{
-		Min:     65536,
-		Default: 1048576,
-		Max:     16 * 1024 * 1024,
+		Min:     32 * 1024,
+		Default: 128 * 1024,
+		Max:     1 * 1024 * 1024,
 	}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &recvOpt)
 	sendOpt := tcpip.TCPSendBufferSizeRangeOption{
-		Min:     65536,
-		Default: 1048576,
-		Max:     16 * 1024 * 1024,
+		Min:     32 * 1024,
+		Default: 128 * 1024,
+		Max:     1 * 1024 * 1024,
 	}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt)
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
-	tcpFwd := tcp.NewForwarder(s, 1048576, 65535, func(r *tcp.ForwarderRequest) {
+	// tcp.NewForwarder(stack, recvWindowDefault, maxInFlight, …) — defaults
+	// trimmed to match the new buffer ceiling above.
+	tcpFwd := tcp.NewForwarder(s, 128*1024, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		host := id.LocalAddress.String()
 		dest := net.JoinHostPort(host, strconv.Itoa(int(id.LocalPort)))
@@ -501,14 +515,17 @@ func (e *packetFlowEndpoint) InjectPacket(data []byte) error {
 }
 
 func relay(a, b net.Conn) {
+	// 32 KB matches io.Copy's internal default; 256 KB was wasteful
+	// per-stream on the iOS extension (64 streams × 2 dirs × 256 KB =
+	// 32 MB just for the relay copy buffers).
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(b, a, buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(a, b, buf)
 		done <- struct{}{}
 	}()
