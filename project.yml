@@ -63,6 +63,7 @@ targets:
         excludes:
           - "*.entitlements"
           - "Info.plist"
+          - "Bridging-Header.h"
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true
@@ -80,3 +81,4 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         SKIP_INSTALL: YES
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
+        SWIFT_OBJC_BRIDGING_HEADER: samizdat-tunnel/Bridging-Header.h
