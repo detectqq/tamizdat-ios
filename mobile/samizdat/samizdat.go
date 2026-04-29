@@ -380,10 +380,19 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	// churn. IdleTimeout=30s reaps dead transports faster than the
 	// upstream default (5min) so a brief load spike does not pin extra
 	// transports across the iOS RAM budget for minutes.
-	// Honor the user's `tcpfrag=` URL toggle. When the URL specifies
-	// false explicitly, we pass DisableDefaultSecurity=true so upstream
-	// applyDefaults stops force-overriding to true.
-	disableDefaults := !cfg.TCPFragmentation
+	// IPA-B (tactical CPU reduction): disable RecordFragmentation and
+	// TCPFragmentation in the upstream samizdat client. These two
+	// features run per-byte / per-segment work for DPI obfuscation, and
+	// in our 22:34 trace under Speedtest the extension hit a different
+	// kill mode (status: connected → disconnecting at +21s with stable
+	// memory) that smells like an iOS CPU watchdog rather than jetsam.
+	// Removing per-packet shaping should significantly drop CPU.
+	//
+	// We pay the cost of looking less like browser TLS to a passive
+	// observer; on Russian carriers with active DPI this matters, on
+	// other networks it doesn't. For the milestone-IPA testing flow
+	// this is acceptable — we just want to know if CPU pressure is the
+	// real wall.
 	client, err := core.NewClient(core.ClientConfig{
 		ServerAddr:             net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
 		ServerName:             cfg.SNI,
@@ -392,9 +401,9 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 		Fingerprint:            cfg.Fingerprint,
 		MaxStreamsPerConn:      200,
 		IdleTimeout:            30 * time.Second,
-		TCPFragmentation:       cfg.TCPFragmentation,
-		RecordFragmentation:    cfg.TCPFragmentation, // tied to the same URL toggle for now
-		DisableDefaultSecurity: disableDefaults,
+		TCPFragmentation:       false,
+		RecordFragmentation:    false,
+		DisableDefaultSecurity: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat client: %w", err)
