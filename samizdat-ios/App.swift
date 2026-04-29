@@ -20,9 +20,11 @@ struct SamizdatTestApp: App {
             let logURL = containerURL.appendingPathComponent("extension-log.txt")
             SocksstubSetLogSink(logURL.path)
         }
-        // Idempotent — second call returns "already listening" which we
-        // intentionally ignore.
-        _ = SocksstubStart("127.0.0.1:18443")
+        // gomobile-generated signature for Go funcs returning `error` is
+        // (arg, NSError**). Idempotent — second call's "already listening"
+        // gets surfaced as nsError, ignored.
+        var nsError: NSError?
+        SocksstubStart("127.0.0.1:18443", &nsError)
     }
 
     @Environment(\.scenePhase) private var scenePhase
@@ -33,7 +35,8 @@ struct SamizdatTestApp: App {
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
-                _ = SocksstubStart("127.0.0.1:18443")
+                var err: NSError?
+                SocksstubStart("127.0.0.1:18443", &err)
             }
         }
     }
