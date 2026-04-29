@@ -8,6 +8,15 @@ go 1.25.5
 // current auth_extension flow).
 replace github.com/getlantern/samizdat => ./upstream-samizdat
 
+// iOS-vendor patch of golang.org/x/net to shrink the http2 client's
+// transportDefaultConnFlow (1 GiB → 4 MiB) and transportDefaultStreamFlow
+// (4 MiB → 256 KiB). Without this, every CONNECT stream advertises a
+// 4 MiB receive window — under Speedtest fanout (~64 parallel streams)
+// the server can push up to 256 MiB at us before WINDOW_UPDATE, blowing
+// past the iOS NEPacketTunnelProvider 50 MB RSS cap. See
+// vendor-x-net/http2/transport.go for the patched constants.
+replace golang.org/x/net => ./vendor-x-net
+
 require (
 	github.com/getlantern/samizdat v0.0.0-00010101000000-000000000000
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b

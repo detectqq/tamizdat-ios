@@ -4,6 +4,10 @@ go 1.24.0
 
 toolchain go1.24.1
 
+// Mirror the parent mobile/ module's vendor patch for golang.org/x/net.
+// See ../go.mod for rationale.
+replace golang.org/x/net => ../vendor-x-net
+
 require (
 	github.com/refraction-networking/utls v1.8.2
 	github.com/xjasonlyu/tun2socks/v2 v2.6.0
