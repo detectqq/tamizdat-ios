@@ -246,20 +246,17 @@ func TunnelStart(configBlob string) error {
 	rt.mu.Unlock()
 	rt.appendLog(fmt.Sprintf("info: packet tunnel active via %s:%d", cfg.ServerHost, cfg.ServerPort))
 
-	// Pin the Go runtime under iOS's 50 MB extension cap.
-	//
-	// 40 MB soft limit: GOMEMLIMIT triggers GC progressively earlier as
-	// heap approaches it, which is exactly what we want — the default
-	// "wait until heap doubles" pacer runs only ~7 GCs in 90 s and lets
-	// heap drift from 5 MB to 52 MB linearly. With GOMEMLIMIT=40 MB, the
-	// runtime starts force-collecting around 30-35 MB and never lets us
-	// blow the cap.
+	// 25 MB soft limit (down from 40 MB): the iOS jetsam-pressure trace
+	// at 22:18 showed os_proc_available_memory dropping 41 MB → 3.8 MB
+	// in 50 s while Go-runtime sys was stable at 17 MB. iOS shrinks our
+	// process budget under system pressure (other foreground apps
+	// allocating, etc.) — by holding to 25 MB ourselves and aggressively
+	// returning pages to the OS via the heartbeat-driven FreeOSMemory()
+	// below, we leave more headroom for iOS to shrink without reaping.
 	//
 	// GOGC=20 (default 100) shrinks the heap-growth trigger to 1.2× last-
-	// live, not 2×. Combined with GOMEMLIMIT this gives a much tighter
-	// sawtooth and protects against transient bursts (a Speedtest fanout
-	// can allocate 10+ MB in <1 s; we need GC to catch up at that rate).
-	debug.SetMemoryLimit(40 * 1024 * 1024)
+	// live, not 2×. Combined with GOMEMLIMIT this gives a tighter sawtooth.
+	debug.SetMemoryLimit(25 * 1024 * 1024)
 	debug.SetGCPercent(20)
 
 	go runtimeMetricsLoop(tun.ctx)
@@ -304,6 +301,14 @@ func runtimeMetricsLoop(ctx context.Context) {
 				_ = logSink.Sync()
 			}
 			logSinkMu.Unlock()
+
+			// Aggressively return freed pages to the OS via madvise()
+			// MADV_FREE_REUSABLE on darwin. Without this, Go's lazy
+			// scavenger waits seconds-to-minutes; iOS sees those pages as
+			// "ours" and counts them against our jetsam budget. With it,
+			// iOS can reclaim immediately as system pressure rises and is
+			// less likely to reap us.
+			debug.FreeOSMemory()
 		}
 	}
 }

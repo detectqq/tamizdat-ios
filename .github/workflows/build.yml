@@ -110,6 +110,13 @@ jobs:
       - name: Archive
         run: |
           set -o pipefail
+          # Bake the GitHub Actions run number + short SHA into the bundle
+          # so the in-app version label changes every build (and tracks
+          # the source revision).
+          GIT_SHA=$(git rev-parse --short HEAD)
+          MARKETING="0.2.${GITHUB_RUN_NUMBER}-${GIT_SHA}"
+          BUILD_NUM="${GITHUB_RUN_NUMBER}"
+          echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM"
           xcodebuild archive \
             -project samizdat-ios.xcodeproj \
             -scheme "$SCHEME" \
@@ -119,6 +126,8 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM=DRMTP6V372 \
             CODE_SIGN_IDENTITY="Apple Distribution" \
+            MARKETING_VERSION="$MARKETING" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             | xcpretty
 
       - name: Export IPA

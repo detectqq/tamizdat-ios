@@ -82,7 +82,7 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
 
-            Text("v\(bridge.version)")
+            Text(buildLabel)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
@@ -137,6 +137,16 @@ struct ContentView: View {
 
     private var buttonTint: Color {
         bridge.state == .connected ? .red : .blue
+    }
+
+    /// "v0.2.42-fab1f9e (build 42)" — pulled from Info.plist, which the
+    /// CI workflow stamps with MARKETING_VERSION = 0.2.<run>-<git-sha>
+    /// and CURRENT_PROJECT_VERSION = <run>. Updates on every build.
+    private var buildLabel: String {
+        let info = Bundle.main.infoDictionary
+        let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(marketing) (build \(build))"
     }
 
     private func toggleConnection() {
