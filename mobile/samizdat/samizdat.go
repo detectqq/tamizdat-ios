@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -199,10 +200,22 @@ func TunnelStart(configBlob string) error {
 	rt.mu.Unlock()
 	rt.appendLog(fmt.Sprintf("info: packet tunnel active via %s:%d", cfg.ServerHost, cfg.ServerPort))
 
-	// Periodic runtime metrics — gives us a memory ceiling history so when
-	// iOS kills the NEPacketTunnelProvider extension (50 MB hard cap on
-	// recent iOS), we can read the last snapshot before death from the app
-	// side via SamizdatLogs.
+	// Pin the Go runtime under iOS's 50 MB extension cap.
+	//
+	// 40 MB soft limit: GOMEMLIMIT triggers GC progressively earlier as
+	// heap approaches it, which is exactly what we want — the default
+	// "wait until heap doubles" pacer runs only ~7 GCs in 90 s and lets
+	// heap drift from 5 MB to 52 MB linearly. With GOMEMLIMIT=40 MB, the
+	// runtime starts force-collecting around 30-35 MB and never lets us
+	// blow the cap.
+	//
+	// GOGC=20 (default 100) shrinks the heap-growth trigger to 1.2× last-
+	// live, not 2×. Combined with GOMEMLIMIT this gives a much tighter
+	// sawtooth and protects against transient bursts (a Speedtest fanout
+	// can allocate 10+ MB in <1 s; we need GC to catch up at that rate).
+	debug.SetMemoryLimit(40 * 1024 * 1024)
+	debug.SetGCPercent(20)
+
 	go runtimeMetricsLoop(tun.ctx)
 
 	return nil

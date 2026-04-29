@@ -7,6 +7,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
     private let pumpQueue = DispatchQueue(label: "com.anarki.samizdat-test.packet-writer")
+    /// Dedicated queue for the iOS metrics timer. Cannot share pumpQueue:
+    /// the packet-writer pumps a tight loop most of the time and would
+    /// starve our 1 Hz timer events queued behind it.
+    private let metricsQueue = DispatchQueue(label: "com.anarki.samizdat-test.ios-metrics", qos: .utility)
     private var isRunning = false
     private var iosMetricsTimer: DispatchSourceTimer?
 
@@ -64,7 +68,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// suspended (`sleep` callback fires) and never wakes back, we know
     /// the kill was a suspend-then-reap rather than memory pressure.
     private func startIOSMetricsLoop() {
-        let timer = DispatchSource.makeTimerSource(queue: pumpQueue)
+        let timer = DispatchSource.makeTimerSource(queue: metricsQueue)
         timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
