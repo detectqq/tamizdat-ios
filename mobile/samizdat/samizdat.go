@@ -280,20 +280,26 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	var shortID [8]byte
 	copy(shortID[:], shortIDBytes)
 
-	// MaxStreamsPerConn=1000 instead of upstream default 100. The default
-	// is right for desktop SOCKS5 but on iOS a Speedtest spawns 100-300
-	// parallel streams in seconds. With cap=100 the connpool spins up a
-	// fresh TCP+TLS+H2 every 100 streams, and uTLS Chrome handshakes on
-	// arm64 are CPU-expensive — the handshake storm blows the extension's
-	// memory budget AND the server starts rejecting new TLS sessions
-	// (EOF). One transport carrying 1000 H2 streams is much cheaper.
+	// Stream/transport caps tuned to the production server's
+	// MaxConcurrentStreams=250 (samizdat.go:117). If we let the client
+	// fan out >250 streams on a single transport, the server emits
+	// GOAWAY, h2Transport flips to draining, connpool dials a fresh
+	// TLS+H2, the Speedtest fanout pushes the new transport to 250 too,
+	// it drains, etc. — that's the connect-storm behind the goroutine
+	// explosion observed in the 17:50 trace.
+	//
+	// 200 keeps us safely under server's 250 → no GOAWAY, no transport
+	// churn. IdleTimeout=30s reaps dead transports faster than the
+	// upstream default (5min) so a brief load spike does not pin extra
+	// transports across the iOS RAM budget for minutes.
 	client, err := core.NewClient(core.ClientConfig{
 		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
 		ServerName:        cfg.SNI,
 		PublicKey:         pubKeyBytes,
 		ShortID:           shortID,
 		Fingerprint:       cfg.Fingerprint,
-		MaxStreamsPerConn: 1000,
+		MaxStreamsPerConn: 200,
+		IdleTimeout:       30 * time.Second,
 		// TCPFragmentation/RecordFragmentation default to true via applyDefaults.
 	})
 	if err != nil {
@@ -349,9 +355,13 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
-	// tcp.NewForwarder(stack, recvWindowDefault, maxInFlight, …) — defaults
-	// trimmed to match the new buffer ceiling above.
-	tcpFwd := tcp.NewForwarder(s, 128*1024, 1024, func(r *tcp.ForwarderRequest) {
+	// tcp.NewForwarder(stack, recvWindowDefault, maxInFlight, …)
+	// maxInFlight=128: 1024 was a worst-case 256 MB window memory at
+	// 128 KB recv default × 2 dirs × 1024 streams. 128 caps the gVisor
+	// SYN backlog at ~32 MB worst case, fits the iOS extension budget.
+	// Above 128 in-flight SYNs, gVisor will reset new SYNs which is
+	// exactly the load-shedding we want under Speedtest pressure.
+	tcpFwd := tcp.NewForwarder(s, 128*1024, 128, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		host := id.LocalAddress.String()
 		dest := net.JoinHostPort(host, strconv.Itoa(int(id.LocalPort)))

@@ -300,21 +300,22 @@ func (s *h2StreamRWC) Close() error {
 	s.once.Do(func() {
 		closeErr = s.closeWriter()
 
-		go func() {
-			timer := time.AfterFunc(5*time.Second, func() {
-				s.reader.Close()
-			})
-			io.Copy(io.Discard, s.reader)
-			timer.Stop()
-			s.reader.Close()
-			if s.tunnelCancel != nil {
-				s.tunnelCancel()
-			}
-			remaining := s.transport.activeStreams.Add(-1)
-			if remaining == 0 && s.transport.isDraining() {
-				_ = s.transport.close()
-			}
-		}()
+		// iOS-vendor patch: don't spawn a 5s drain goroutine.
+		// On the iOS NEPacketTunnelProvider with its 50 MB cap, the
+		// upstream's "drain reader for HTTP semantics" goroutine adds
+		// hundreds of leaked goroutines under Speedtest churn (one per
+		// closed stream, alive up to 5s). For a CONNECT/UDP tunnel the
+		// drain has no semantic meaning — the wrapped relay() side has
+		// already returned, both halves of the duplex are torn down.
+		// Synchronous close is enough.
+		_ = s.reader.Close()
+		if s.tunnelCancel != nil {
+			s.tunnelCancel()
+		}
+		remaining := s.transport.activeStreams.Add(-1)
+		if remaining == 0 && s.transport.isDraining() {
+			_ = s.transport.close()
+		}
 	})
 	return closeErr
 }
