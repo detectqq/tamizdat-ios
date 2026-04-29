@@ -35,6 +35,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,19 @@ func Start(addrSpec string) error {
 		return errors.New("already listening")
 	}
 	rt.mu.Unlock()
+
+	// Pin the Go runtime under iOS's NEPacketTunnelProvider memory cap.
+	// Path 3 runs the Go runtime + samizdat client + lwIP-via-hev all
+	// inside the extension; iOS jetsam will reap us if the process RSS
+	// approaches 50 MB. 25 MB soft limit + GOGC=20 tells the pacer to
+	// run GC progressively earlier rather than waiting for heap to
+	// double. FreeOSMemory is fired periodically below — we don't have
+	// a clean place for that here without spawning a goroutine, so we
+	// rely on the runtime's natural scavenger plus the heartbeat-driven
+	// FreeOSMemory call from the extension Swift side (which, if added,
+	// can call back into Go via gomobile).
+	debug.SetMemoryLimit(25 * 1024 * 1024)
+	debug.SetGCPercent(20)
 
 	network := "tcp"
 	addr := addrSpec
@@ -345,6 +359,15 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 		ShortIDHex:  sid,
 		Fingerprint: fp,
 	}, nil
+}
+
+// FreeOSMemory triggers Go's runtime to return as much memory as possible
+// to the OS via madvise(MADV_FREE_REUSABLE) on darwin. iOS will count
+// pages we hold against our jetsam ledger even after Go has freed them
+// internally; calling this from the extension's 2 s heartbeat loop
+// keeps the visible process RSS as low as the live-set permits.
+func FreeOSMemory() {
+	debug.FreeOSMemory()
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.

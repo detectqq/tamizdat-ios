@@ -349,6 +349,10 @@ misc:
             let avail = os_proc_available_memory()
             var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
             hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            // Ask the Go runtime to return freed pages to iOS so they
+            // don't sit on our jetsam ledger between heartbeats. Cheap
+            // (a single madvise loop in Go's scavenger).
+            SocksstubFreeOSMemory()
             self.appendExtLog(String(
                 format: "info: hb avail=%dKB hev tx=%d/%dKB rx=%d/%dKB",
                 avail / 1024,
