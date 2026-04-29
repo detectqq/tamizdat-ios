@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1d28"></stop>
+      <stop offset="100%" stop-color="#0a0c14"></stop>
+    </linearGradient>
+    <linearGradient id="stone" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3a4050"></stop>
+      <stop offset="100%" stop-color="#1a1e2a"></stop>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f5d678"></stop>
+      <stop offset="50%" stop-color="#c9a04a"></stop>
+      <stop offset="100%" stop-color="#7a5a1c"></stop>
+    </linearGradient>
+    <filter id="emboss" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2"></feGaussianBlur>
+      <feOffset dx="0" dy="2"></feOffset>
+      <feComponentTransfer><feFuncA type="linear" slope="0.6"></feFuncA></feComponentTransfer>
+      <feMerge><feMergeNode></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"></rect>
+
+  <path d="M 242 302.6 L 242 230 L 319.1428571428571 230 L 319.1428571428571 302.6 L 396.2857142857143 302.6 L 396.2857142857143 230 L 473.42857142857144 230 L 473.42857142857144 302.6 L 550.5714285714286 302.6 L 550.5714285714286 230 L 627.7142857142857 230 L 627.7142857142857 302.6 L 704.8571428571429 302.6 L 704.8571428571429 230 L 782 230 L 782 302.6 L 782 302.6 L 814.4 342.20000000000005 L 760.4 824 L 836 824 L 836 890 L 188 890 L 188 824 L 263.6 824 L 209.6 342.20000000000005 L 242 302.6 Z" fill="url(#stone)"></path>
+
+  <g stroke="#0a0c14" stroke-width="3" opacity="0.7">
+    <line x1="260" y1="420" x2="764" y2="420"></line>
+    <line x1="260" y1="520" x2="764" y2="520"></line>
+    <line x1="260" y1="620" x2="764" y2="620"></line>
+    <line x1="260" y1="720" x2="764" y2="720"></line>
+    <line x1="380" y1="370" x2="380" y2="820"></line>
+    <line x1="512" y1="370" x2="512" y2="820"></line>
+    <line x1="644" y1="370" x2="644" y2="820"></line>
+  </g>
+
+  <g filter="url(#emboss)">
+    <text x="404" y="560" text-anchor="middle" dominant-baseline="central" font-family="&#39;Bodoni 72&#39;,&#39;Didot&#39;,Georgia,serif" font-weight="700" font-size="440" fill="url(#gold)" letter-spacing="-0.08em">S</text>
+    <text x="620" y="560" text-anchor="middle" dominant-baseline="central" font-family="&#39;Bodoni 72&#39;,&#39;Didot&#39;,Georgia,serif" font-weight="700" font-size="440" fill="url(#gold)" letter-spacing="-0.08em">Z</text>
+  </g>
+</svg>
