@@ -51,6 +51,10 @@ targets:
           - $(PROJECT_DIR)/Frameworks
 
   # ── PacketTunnel network-extension target ───────────────────────────────
+  # Path 3: extension carries only HevSocks5Tunnel.xcframework (C/lwIP).
+  # No Go runtime, no gVisor, no samizdat client. Heavy proxy work lives
+  # in the main app's SocksStub Go listener (still bundled via
+  # SamizdatClient.xcframework but only on the main-app target).
   samizdat-tunnel:
     type: app-extension
     platform: iOS
@@ -60,7 +64,7 @@ targets:
           - "*.entitlements"
           - "Info.plist"
     dependencies:
-      - framework: Frameworks/SamizdatClient.xcframework
+      - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true
         codeSign: true
     settings:

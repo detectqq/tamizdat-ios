@@ -108,11 +108,11 @@ final class SamizdatBridge: ObservableObject {
         state = .connecting
         lastError = ""
         try await VPNProfileStore.shared.startTunnel(configBlob: blob)
-        // Truncate any prior session's log file so the next dump shows
-        // only this session's lines.
-        truncateLogFile()
-        logFileOffset = 0
-        fileLogLines.removeAll(keepingCapacity: true)
+        // Note: previously truncated the log file here. Path 3 keeps it
+        // because the main-app SocksStub also writes there from app launch
+        // (well before connect()). Truncation would erase that history.
+        // The extension truncates the file itself on its startTunnel
+        // entry, so per-extension-session boundaries still exist.
         await refreshStatus()
     }
 

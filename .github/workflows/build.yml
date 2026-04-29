@@ -41,15 +41,18 @@ jobs:
       - name: gomobile init
         run: gomobile init
 
-      - name: gomobile bind → SamizdatClient.xcframework
+      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub)
         working-directory: mobile
         run: |
           mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
+          # Bundle BOTH packages into one xcframework. Path 3 puts the
+          # SocksStub listener in the main-app process; the existing
+          # samizdat package retains its config-parser API for the UI.
           gomobile bind -v \
             -target=ios,iossimulator \
             -iosversion=17.0 \
             -o "${{ env.FRAMEWORK_OUT }}" \
-            ./samizdat
+            ./samizdat ./socksstub
           ls -la "${{ env.FRAMEWORK_OUT }}"
 
       - name: Build HevSocks5Tunnel.xcframework

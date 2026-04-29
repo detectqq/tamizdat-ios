@@ -2,18 +2,31 @@ import Foundation
 import NetworkExtension
 import OSLog
 import os
-import SamizdatClient
+import Darwin
+import HevSocks5Tunnel
 
+/// Path 3 PacketTunnelProvider — pure C/lwIP via hev-socks5-tunnel, no Go
+/// runtime in the extension. The heavy lifting (Go SOCKS5 listener,
+/// optional samizdat proxy) lives in the main-app process where there is
+/// no jetsam memory cap. The extension's job in this design is reduced to
+/// just three things:
+///
+///   1. install NEPacketTunnelNetworkSettings;
+///   2. find the utun file descriptor that NEPacketTunnelProvider just
+///      opened for us (Apple does not pass it through the public API; we
+///      enumerate fds and match the "com.apple.net.utun_control" socket
+///      pattern — same trick every shipping iOS proxy app uses);
+///   3. call hev_socks5_tunnel_main_from_str(config, len, fd), which
+///      blocks until hev_socks5_tunnel_quit().
+///
+/// Memory profile observed on production iOS proxy clients (V2Box, FoXray,
+/// Hiddify variants) running this exact pattern: 5-15 MB RSS sustained
+/// even at 100 Mbps, vs. our ~30-40 MB Go/gVisor stack that hit jetsam at
+/// 50 s. The savings come from: no Go runtime, no gVisor packet pools, no
+/// gomobile cgo bridging, no per-flow Go goroutines.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
-    private let pumpQueue = DispatchQueue(label: "com.anarki.samizdat-test.packet-writer")
-
-    /// Lifecycle flag read from three different queues (NE callback queue
-    /// for packetFlow.readPackets, our pumpQueue for the write loop, and
-    /// stopTunnel from yet another queue). Plain `Bool` had a torn-write
-    /// race; on Swift 6 it would be a compile error. OSAllocatedUnfairLock
-    /// keeps writes/reads atomic without the cost of a serial queue.
     private let runningState = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var isRunning: Bool {
         get { runningState.withLock { $0 } }
@@ -23,156 +36,214 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let logFileName = "extension-log.txt"
 
-    /// Swift-side heartbeat into the App Group log file. Runs INDEPENDENT
-    /// of the Go runtime so we can tell whether a freeze is process-wide
-    /// (both heartbeats stop) or Go-only (Swift continues, Go stuck in cgo).
+    /// TCP port the main-app's SocksStubStart binds to on 127.0.0.1. Hev
+    /// connects here for every flow it forwards. Hardcoded so extension
+    /// and app agree without an extra rendezvous; collision-unlikely in
+    /// the iOS sandbox.
+    private static let socksPort: UInt16 = 18443
+
     private var swiftHeartbeatTimer: DispatchSourceTimer?
     private var swiftLogHandle: FileHandle?
-    private static let swiftHbFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss.SSS"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
+    private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
+        // Start writing into App Group log file immediately so we have a
+        // timeline even if hev fails to launch.
+        openLogSink()
+        appendExtLog("info: PacketTunnelProvider startTunnel (Path 3 / hev)")
+
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
               let configBlob = proto.providerConfiguration?["configBlob"] as? String else {
+            appendExtLog("error: missing configBlob in providerConfiguration")
             completionHandler(makeError("missing samizdat config"))
             return
         }
-
-        // Point the Go shim's log sink at the App Group container BEFORE
-        // anything else, so even early-startup messages land in the file
-        // the main app reads. The file survives extension death — it's
-        // our "last words" trail for diagnosing iOS reaps.
-        if let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: Self.appGroupID
-        ) {
-            let logURL = containerURL.appendingPathComponent(Self.logFileName)
-            SamizdatSetLogSink(logURL.path)
-        }
-
-        SamizdatAddLog("info: PacketTunnelProvider startTunnel")
-        let engineConfigBlob = proto.providerConfiguration?["engineConfigBlob"] as? String ?? configBlob
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
-        if serverIP != nil {
-            SamizdatAddLog("info: using pre-resolved server IPv4")
-        } else {
-            SamizdatAddLog("warn: no pre-resolved server IPv4 in provider configuration")
-        }
 
-        let settings = makeNetworkSettings(configBlob: configBlob, serverIP: serverIP)
-        SamizdatAddLog("info: applying packet tunnel network settings")
+        let settings = makeNetworkSettings(serverIP: serverIP)
+        appendExtLog("info: applying packet tunnel network settings")
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self else { return }
             if let error {
-                SamizdatAddLog("error: setTunnelNetworkSettings: \(error.localizedDescription)")
+                self.appendExtLog("error: setTunnelNetworkSettings: \(error.localizedDescription)")
                 completionHandler(error)
                 return
             }
-
-            var nsError: NSError?
-            SamizdatTunnelStart(engineConfigBlob, &nsError)
-            if let nsError {
-                SamizdatAddLog("error: SamizdatTunnelStart: \(nsError.localizedDescription)")
-                completionHandler(nsError)
-                return
-            }
-
-            self.isRunning = true
-            self.startPacketReadLoop()
-            self.startPacketWriteLoop()
-            self.startSwiftHeartbeat()
-            self.log.info("packet tunnel started")
-            SamizdatAddLog("info: packet tunnel started")
-            completionHandler(nil)
+            self.startHev(configBlob: configBlob, completionHandler: completionHandler)
         }
-    }
-
-    private func startSwiftHeartbeat() {
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: Self.appGroupID
-        ) else { return }
-        let logURL = containerURL.appendingPathComponent(Self.logFileName)
-        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
-        try? handle.seekToEnd()
-        swiftLogHandle = handle
-
-        // userInitiated QoS so iOS does not throttle us first under load
-        // (the previous .utility timer was suspected of being a victim
-        // of Apple's QoS escalator on busy devices).
-        let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
-        timer.setEventHandler { [weak self] in
-            guard let self, self.isRunning, let handle = self.swiftLogHandle else { return }
-            let avail = os_proc_available_memory()
-            let stamp = Self.swiftHbFormatter.string(from: Date())
-            let line = "\(stamp) info: swift-hb avail=\(avail / 1024)KB\n"
-            do {
-                try handle.write(contentsOf: Data(line.utf8))
-                try handle.synchronize()
-            } catch {
-                // Best effort.
-            }
-        }
-        timer.resume()
-        swiftHeartbeatTimer = timer
-    }
-
-    override func sleep(completionHandler: @escaping () -> Void) {
-        SamizdatAddLog("warn: PacketTunnelProvider sleep() — iOS suspending extension")
-        completionHandler()
-    }
-
-    override func wake() {
-        SamizdatAddLog("info: PacketTunnelProvider wake() — iOS resumed extension")
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
+        hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
         try? swiftLogHandle?.close()
         swiftLogHandle = nil
-        SamizdatAddLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
-        SamizdatTunnelStop()
-        // Detach the log sink so the next startTunnel reopens it. Keep the
-        // file content though — main app may still want to read it.
-        SamizdatSetLogSink("")
         completionHandler()
     }
 
     override func handleAppMessage(_ messageData: Data,
                                    completionHandler: ((Data?) -> Void)?) {
-        let command = String(data: messageData, encoding: .utf8) ?? "logs"
-        switch command {
-        case "clearLogs":
-            SamizdatClearLogs()
-            completionHandler?(Data())
-        case "status":
-            let payload = [
-                "status=\(SamizdatStatus())",
-                "lastError=\(SamizdatLastError())",
-                SamizdatLogs(0)
-            ].filter { !$0.isEmpty }.joined(separator: "\n")
-            completionHandler?(payload.data(using: .utf8))
+        // App reads logs from the App Group file directly now; this RPC
+        // path is kept only for explicit "ping" probes from the bridge.
+        let cmd = String(data: messageData, encoding: .utf8) ?? "ping"
+        switch cmd {
+        case "ping":
+            completionHandler?("pong".data(using: .utf8))
         default:
-            completionHandler?(SamizdatLogs(0).data(using: .utf8))
+            completionHandler?(Data())
         }
     }
 
-    private func makeNetworkSettings(configBlob: String, serverIP: String?) -> NEPacketTunnelNetworkSettings {
+    // MARK: – hev invocation
+
+    private func startHev(configBlob: String, completionHandler: @escaping (Error?) -> Void) {
+        // hev's YAML config. iOS knobs from heiher's published memory-tuning
+        // recommendations (issue #109): tiny task stacks, small TCP buffer,
+        // bounded session count. socks5 endpoint = our main-app SOCKS5
+        // listener on localhost. UDP-over-TCP keeps memory bounded for
+        // QUIC-heavy traffic.
+        let yaml = """
+tunnel:
+  mtu: 1280
+
+socks5:
+  port: \(Self.socksPort)
+  address: '127.0.0.1'
+  udp: 'tcp'
+
+misc:
+  task-stack-size: 24576
+  log-level: 'warn'
+  connect-timeout: 5000
+  read-write-timeout: 60000
+"""
+        appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
+
+        guard let fd = Self.findTunnelFileDescriptor() else {
+            appendExtLog("error: could not locate utun fd")
+            completionHandler(makeError("utun fd not found"))
+            return
+        }
+        appendExtLog("info: utun fd = \(fd)")
+
+        // Verify main app's SOCKS5 listener is reachable before handing
+        // packets to hev. If the app hasn't started SocksStubStart yet,
+        // fail fast with a clear error so the user sees "open the app".
+        if !Self.probeSocks5(port: Self.socksPort, timeout: 1.0) {
+            appendExtLog("error: SOCKS5 listener not reachable on 127.0.0.1:\(Self.socksPort) — open the main app first")
+            completionHandler(makeError("Open the Samizdat app first to start the SOCKS5 listener."))
+            return
+        }
+        appendExtLog("info: SOCKS5 reachable; handing packets to hev")
+
+        startSwiftHeartbeat()
+        isRunning = true
+
+        // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
+        // dedicated background queue.
+        let yamlCopy = yaml
+        hevQueue.async { [weak self] in
+            let rc = yamlCopy.withCString { cstr -> Int32 in
+                hev_socks5_tunnel_main_from_str(cstr, UInt32(yamlCopy.utf8.count), fd)
+            }
+            self?.appendExtLog("info: hev returned rc=\(rc)")
+            self?.runningState.withLock { $0 = false }
+        }
+
+        // hev itself does not have a "ready" callback — it starts
+        // accepting packets immediately on the fd. Synchronous return.
+        completionHandler(nil)
+    }
+
+    // MARK: – utun fd discovery
+
+    /// Enumerates open file descriptors and returns the one that points at
+    /// the utun control socket NEPacketTunnelProvider opened for us.
+    /// Pattern from EbrahimTahernejad/Tun2SocksKit; works on every iOS
+    /// version since 13 because the kernel tags utun with a specific
+    /// AF_SYSTEM control name.
+    private static func findTunnelFileDescriptor() -> Int32? {
+        var ctlInfo = ctl_info()
+        withUnsafeMutablePointer(to: &ctlInfo.ctl_name) {
+            $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: $0.pointee)) {
+                _ = strcpy($0, "com.apple.net.utun_control")
+            }
+        }
+        for fd: Int32 in 0...1024 {
+            var addr = sockaddr_ctl()
+            var ret: Int32 = -1
+            var len = socklen_t(MemoryLayout.size(ofValue: addr))
+            withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    ret = getpeername(fd, $0, &len)
+                }
+            }
+            if ret != 0 || addr.sc_family != AF_SYSTEM {
+                continue
+            }
+            if ctlInfo.ctl_id == 0 {
+                ret = ioctl(fd, CTLIOCGINFO, &ctlInfo)
+                if ret != 0 {
+                    continue
+                }
+            }
+            if addr.sc_id == ctlInfo.ctl_id {
+                return fd
+            }
+        }
+        return nil
+    }
+
+    /// Best-effort TCP probe to see if the main app's SOCKS5 listener is up
+    /// before we hand packets to hev. Avoids a 60-second hev timeout for
+    /// each early flow when the app isn't running.
+    private static func probeSocks5(port: UInt16, timeout: TimeInterval) -> Bool {
+        let s = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard s >= 0 else { return false }
+        defer { close(s) }
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        // Non-blocking connect with timeout.
+        let flags = fcntl(s, F_GETFL, 0)
+        _ = fcntl(s, F_SETFL, flags | O_NONBLOCK)
+
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if rc == 0 { return true }
+        if errno != EINPROGRESS { return false }
+
+        // Wait for write-ready or timeout.
+        var fdSet = fd_set()
+        __darwin_fd_set(s, &fdSet)
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
+        let sel = select(s + 1, nil, &fdSet, nil, &tv)
+        if sel <= 0 { return false }
+
+        // Check SO_ERROR.
+        var err: Int32 = 0
+        var elen = socklen_t(MemoryLayout<Int32>.size)
+        if getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 { return false }
+        return err == 0
+    }
+
+    // MARK: – Network settings
+
+    private func makeNetworkSettings(serverIP: String?) -> NEPacketTunnelNetworkSettings {
         let remoteAddress = serverIP ?? "127.0.0.1"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
-        // 1280 is the IPv6 minimum and gives plenty of headroom for our
-        // outer overhead: TLS + H2 frame header + inner TCP/UDP. The old
-        // 1500 left only ~1391 effective bytes after overhead, which iOS
-        // would split with PMTU-sized writePackets calls under load.
         settings.mtu = 1280
 
         let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
@@ -180,13 +251,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if let serverIP {
             ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255")]
         }
+        // Critically: exclude 127.0.0.1/8 from the tunnel so hev's SOCKS5
+        // dial to the main app's listener does NOT loop back through us.
+        // (iOS may special-case loopback here but explicit is safer.)
+        ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
+            NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
+        ]
         settings.ipv4Settings = ipv4
 
-        // No IPv6 settings at all. Server has no IPv6 egress; iOS apps
-        // fall back to v4 via Happy Eyeballs (~250 ms). Setting an
-        // ipv6Settings with empty includedRoutes might confuse iOS into
-        // thinking the tunnel is half-configured, which is a candidate
-        // root cause for the 50 s reaper. Pure v4 tunnel is unambiguous.
+        // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
         settings.ipv6Settings = nil
 
         let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
@@ -196,40 +269,60 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return settings
     }
 
-    private func startPacketReadLoop() {
-        packetFlow.readPackets { [weak self] packets, _ in
+    // MARK: – Logging (App Group file)
+
+    private func openLogSink() {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupID
+        ) else { return }
+        let logURL = containerURL.appendingPathComponent(Self.logFileName)
+        // Truncate per-session — the app reads the file from offset 0 on
+        // bridge start, so a fresh file per tunnel is what we want.
+        try? Data().write(to: logURL, options: .atomic)
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            try? h.seekToEnd()
+            swiftLogHandle = h
+        }
+    }
+
+    private func startSwiftHeartbeat() {
+        let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
-
-            for packet in packets {
-                var nsError: NSError?
-                SamizdatTunnelInjectPacket(packet, &nsError)
-                if let nsError {
-                    self.log.error("inject packet failed: \(nsError.localizedDescription, privacy: .public)")
-                }
-            }
-            self.startPacketReadLoop()
+            let avail = os_proc_available_memory()
+            var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
+            hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            self.appendExtLog(String(
+                format: "info: hb avail=%dKB hev tx=%d/%dKB rx=%d/%dKB",
+                avail / 1024,
+                tx_pkts, tx_bytes / 1024,
+                rx_pkts, rx_bytes / 1024
+            ))
         }
+        timer.resume()
+        swiftHeartbeatTimer = timer
     }
 
-    private func startPacketWriteLoop() {
-        pumpQueue.async { [weak self] in
-            guard let self else { return }
-            while self.isRunning {
-                guard let packet = SamizdatTunnelReadPacket(), !packet.isEmpty else {
-                    // Empty packet means the Go side returned (ctx done /
-                    // stack closed). Don't spin — yield briefly so we
-                    // don't pin the CPU if Go is in shutdown.
-                    Thread.sleep(forTimeInterval: 0.05)
-                    continue
-                }
-                self.packetFlow.writePackets([packet], withProtocols: [NSNumber(value: self.protocolFamily(for: packet))])
-            }
-        }
-    }
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
 
-    private func protocolFamily(for packet: Data) -> Int32 {
-        guard let first = packet.first else { return AF_INET }
-        return (first >> 4) == 6 ? AF_INET6 : AF_INET
+    private func appendExtLog(_ message: String) {
+        let stamp = Self.timeFormatter.string(from: Date())
+        let line = "\(stamp) \(message)\n"
+        log.info("\(message, privacy: .public)")
+        guard let h = swiftLogHandle else { return }
+        do {
+            try h.write(contentsOf: Data(line.utf8))
+            try h.synchronize()
+        } catch {
+            // best-effort
+        }
     }
 
     private func makeError(_ message: String) -> NSError {
