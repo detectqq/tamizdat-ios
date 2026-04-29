@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	core "github.com/getlantern/samizdat"
@@ -61,6 +62,14 @@ var rt = &runtimeState{
 	state:   StateDisconnected,
 	logsMax: 1000,
 }
+
+// Traffic counters — atomically incremented from forwarders.
+var (
+	bytesInjected   atomic.Uint64 // packets coming FROM iOS into our TUN endpoint
+	bytesEmitted    atomic.Uint64 // packets going TO iOS via packetFlow.writePackets
+	tcpStreamsAlive atomic.Int64
+	udpStreamsAlive atomic.Int64
+)
 
 // Connect is kept for the main app's lightweight smoke path. The real
 // full-device VPN path runs in PacketTunnelProvider via TunnelStart.
@@ -200,11 +209,12 @@ func TunnelStart(configBlob string) error {
 }
 
 func runtimeMetricsLoop(ctx context.Context) {
-	// 2s tick — fast enough to land 4-5 snapshots inside the few seconds
-	// between iOS killing the extension and us learning about it through
-	// the bridge poll, but slow enough not to spam the buffer.
-	t := time.NewTicker(2 * time.Second)
+	// 1 s tick: previous traces showed extension death within ~13 s after
+	// the last sample landed in the app's log buffer. Tighter ticker
+	// gives us closer time-to-death resolution.
+	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
+	var prevIn, prevOut uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -212,14 +222,21 @@ func runtimeMetricsLoop(ctx context.Context) {
 		case <-t.C:
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
-			// Sys is the closest go-runtime knob to iOS-visible RSS.
-			// Hit ~50 MB and the NEPacketTunnelProvider gets reaped.
+			in := bytesInjected.Load()
+			out := bytesEmitted.Load()
+			dIn := in - prevIn
+			dOut := out - prevOut
+			prevIn, prevOut = in, out
 			rt.appendLog(fmt.Sprintf(
-				"info: rt heap=%dKB sys=%dKB(<50MB cap) goroutines=%d numgc=%d",
-				ms.HeapAlloc/1024,
+				"info: rt sys=%dKB heap=%dKB g=%d gc=%d tcp=%d udp=%d in=%dKB/s out=%dKB/s",
 				ms.Sys/1024,
+				ms.HeapAlloc/1024,
 				runtime.NumGoroutine(),
 				ms.NumGC,
+				tcpStreamsAlive.Load(),
+				udpStreamsAlive.Load(),
+				dIn/1024,
+				dOut/1024,
 			))
 		}
 	}
@@ -397,6 +414,8 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 				return
 			}
 			defer remote.Close()
+			tcpStreamsAlive.Add(1)
+			defer tcpStreamsAlive.Add(-1)
 			relay(localConn, remote)
 		}()
 	})
@@ -439,12 +458,14 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 }
 
 func (t *packetTunnel) InjectPacket(packet []byte) error {
+	bytesInjected.Add(uint64(len(packet)))
 	return t.ep.InjectPacket(packet)
 }
 
 func (t *packetTunnel) ReadPacket() []byte {
 	select {
 	case pkt := <-t.ep.outbound:
+		bytesEmitted.Add(uint64(len(pkt)))
 		return pkt
 	case <-t.ctx.Done():
 		return nil
@@ -613,6 +634,8 @@ func forwardUDP(ctx context.Context, conn *gonet.UDPConn, dest string, client *c
 	}
 	remote, err := client.DialUDP(ctx, dest)
 	release()
+	udpStreamsAlive.Add(1)
+	defer udpStreamsAlive.Add(-1)
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: UDP dial %s: %v", dest, err))
 		return

@@ -8,6 +8,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
     private let pumpQueue = DispatchQueue(label: "com.anarki.samizdat-test.packet-writer")
     private var isRunning = false
+    private var iosMetricsTimer: DispatchSourceTimer?
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -47,16 +48,55 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.isRunning = true
             self.startPacketReadLoop()
             self.startPacketWriteLoop()
+            self.startIOSMetricsLoop()
             self.log.info("packet tunnel started")
             SamizdatAddLog("info: packet tunnel started")
             completionHandler(nil)
         }
     }
 
+    /// Polls iOS-reported available memory + thermal state every second.
+    /// `os_proc_available_memory()` returns the byte budget BEFORE the
+    /// process is reaped, which is the metric jetsam actually uses. If
+    /// this number drops to a few MB while our Go-side `sys` is still
+    /// modest, we know the kill is coming from jetsam (not our heap).
+    /// Also captures iOS sleep/wake transitions: if the extension is
+    /// suspended (`sleep` callback fires) and never wakes back, we know
+    /// the kill was a suspend-then-reap rather than memory pressure.
+    private func startIOSMetricsLoop() {
+        let timer = DispatchSource.makeTimerSource(queue: pumpQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isRunning else { return }
+            let avail = os_proc_available_memory()
+            let thermal = ProcessInfo.processInfo.thermalState.rawValue
+            let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0
+            SamizdatAddLog(String(
+                format: "info: ios avail=%dKB thermal=%d lowpwr=%d",
+                avail / 1024,
+                thermal,
+                lowPower
+            ))
+        }
+        timer.resume()
+        iosMetricsTimer = timer
+    }
+
+    override func sleep(completionHandler: @escaping () -> Void) {
+        SamizdatAddLog("warn: PacketTunnelProvider sleep() — iOS suspending extension")
+        completionHandler()
+    }
+
+    override func wake() {
+        SamizdatAddLog("info: PacketTunnelProvider wake() — iOS resumed extension")
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason,
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        iosMetricsTimer?.cancel()
+        iosMetricsTimer = nil
         SamizdatAddLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
         SamizdatTunnelStop()
         completionHandler()
@@ -124,6 +164,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             while self.isRunning {
                 guard let packet = SamizdatTunnelReadPacket(), !packet.isEmpty else {
+                    // Empty packet means the Go side returned (ctx done /
+                    // stack closed). Don't spin — yield briefly so we
+                    // don't pin the CPU if Go is in shutdown.
+                    Thread.sleep(forTimeInterval: 0.05)
                     continue
                 }
                 self.packetFlow.writePackets([packet], withProtocols: [NSNumber(value: self.protocolFamily(for: packet))])
