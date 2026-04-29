@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -188,7 +189,35 @@ func TunnelStart(configBlob string) error {
 	rt.state = StateConnected
 	rt.mu.Unlock()
 	rt.appendLog(fmt.Sprintf("info: packet tunnel active via %s:%d", cfg.ServerHost, cfg.ServerPort))
+
+	// Periodic runtime metrics — gives us a memory ceiling history so when
+	// iOS kills the NEPacketTunnelProvider extension (50 MB hard cap on
+	// recent iOS), we can read the last snapshot before death from the app
+	// side via SamizdatLogs.
+	go runtimeMetricsLoop(tun.ctx)
+
 	return nil
+}
+
+func runtimeMetricsLoop(ctx context.Context) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			rt.appendLog(fmt.Sprintf(
+				"info: rt heap=%dKB sys=%dKB goroutines=%d numgc=%d",
+				ms.HeapAlloc/1024,
+				ms.Sys/1024,
+				runtime.NumGoroutine(),
+				ms.NumGC,
+			))
+		}
+	}
 }
 
 func TunnelStop() {
@@ -306,7 +335,18 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 
 	tcpFwd := tcp.NewForwarder(s, 1048576, 65535, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
-		dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+		host := id.LocalAddress.String()
+		dest := net.JoinHostPort(host, strconv.Itoa(int(id.LocalPort)))
+		// Drop IPv6 destinations: production samizdat server has no IPv6
+		// uplink, so DialContext / DialUDP would just round-trip an HTTP/2
+		// CONNECT only to come back with 502 "dial failed". By RST-ing the
+		// stream immediately we make iOS apps fall back to IPv4 within
+		// 100-300 ms instead of waiting on tunnel timeouts.
+		if isIPv6Address(host) {
+			noteIPv6Drop("TCP", dest)
+			r.Complete(true)
+			return
+		}
 		var wq waiter.Queue
 		endpoint, tcpErr := r.CreateEndpoint(&wq)
 		if tcpErr != nil {
@@ -335,7 +375,13 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	// (QUIC, WireGuard, games) gets a long-lived bidirectional pump.
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
-		dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+		host := id.LocalAddress.String()
+		dest := net.JoinHostPort(host, strconv.Itoa(int(id.LocalPort)))
+		// Drop IPv6 — see TCP forwarder above for rationale.
+		if isIPv6Address(host) {
+			noteIPv6Drop("UDP", dest)
+			return false
+		}
 		var wq waiter.Queue
 		endpoint, udpErr := r.CreateEndpoint(&wq)
 		if udpErr != nil {
@@ -545,6 +591,33 @@ type streamAddr struct {
 
 func (a *streamAddr) Network() string { return a.network }
 func (a *streamAddr) String() string  { return a.address }
+
+func isIPv6Address(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.To4() == nil
+}
+
+// noteIPv6Drop logs the first IPv6 destination drop loudly and the rest at
+// 1-per-30s to keep the buffer readable when an iOS app sprays QUIC at a
+// dozen Google AAAAs.
+var ipv6DropMu sync.Mutex
+var ipv6DropCount int
+var ipv6DropLastLog time.Time
+
+func noteIPv6Drop(proto, dest string) {
+	ipv6DropMu.Lock()
+	first := ipv6DropCount == 0
+	ipv6DropCount++
+	throttled := !first && time.Since(ipv6DropLastLog) < 30*time.Second
+	if !throttled {
+		ipv6DropLastLog = time.Now()
+	}
+	count := ipv6DropCount
+	ipv6DropMu.Unlock()
+	if !throttled {
+		rt.appendLog(fmt.Sprintf("info: dropping IPv6 %s dest %s (server has no v6 uplink) [total=%d]", proto, dest, count))
+	}
+}
 
 func (r *runtimeState) setState(s string) {
 	r.mu.Lock()
