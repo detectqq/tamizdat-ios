@@ -23,6 +23,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let logFileName = "extension-log.txt"
 
+    /// Swift-side heartbeat into the App Group log file. Runs INDEPENDENT
+    /// of the Go runtime so we can tell whether a freeze is process-wide
+    /// (both heartbeats stop) or Go-only (Swift continues, Go stuck in cgo).
+    private var swiftHeartbeatTimer: DispatchSourceTimer?
+    private var swiftLogHandle: FileHandle?
+    private static let swiftHbFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -72,10 +84,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.isRunning = true
             self.startPacketReadLoop()
             self.startPacketWriteLoop()
+            self.startSwiftHeartbeat()
             self.log.info("packet tunnel started")
             SamizdatAddLog("info: packet tunnel started")
             completionHandler(nil)
         }
+    }
+
+    private func startSwiftHeartbeat() {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupID
+        ) else { return }
+        let logURL = containerURL.appendingPathComponent(Self.logFileName)
+        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+        try? handle.seekToEnd()
+        swiftLogHandle = handle
+
+        // userInitiated QoS so iOS does not throttle us first under load
+        // (the previous .utility timer was suspected of being a victim
+        // of Apple's QoS escalator on busy devices).
+        let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isRunning, let handle = self.swiftLogHandle else { return }
+            let avail = os_proc_available_memory()
+            let stamp = Self.swiftHbFormatter.string(from: Date())
+            let line = "\(stamp) info: swift-hb avail=\(avail / 1024)KB\n"
+            do {
+                try handle.write(contentsOf: Data(line.utf8))
+                try handle.synchronize()
+            } catch {
+                // Best effort.
+            }
+        }
+        timer.resume()
+        swiftHeartbeatTimer = timer
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
@@ -91,6 +135,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        swiftHeartbeatTimer?.cancel()
+        swiftHeartbeatTimer = nil
+        try? swiftLogHandle?.close()
+        swiftLogHandle = nil
         SamizdatAddLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
         SamizdatTunnelStop()
         // Detach the log sink so the next startTunnel reopens it. Keep the
@@ -134,15 +182,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         settings.ipv4Settings = ipv4
 
-        // No IPv6 default route — the upstream samizdat server has no IPv6
-        // egress so any v6 destination would just cost us a CONNECT
-        // round-trip and a 502. Without an included v6 route iOS won't
-        // send v6 packets to us at all; apps fall back to IPv4 via Happy
-        // Eyeballs in <300ms. We still set a placeholder v6 address so
-        // iOS doesn't reject the settings.
-        let ipv6 = NEIPv6Settings(addresses: ["fd00:7361:6d69::1"], networkPrefixLengths: [64])
-        // includedRoutes deliberately empty.
-        settings.ipv6Settings = ipv6
+        // No IPv6 settings at all. Server has no IPv6 egress; iOS apps
+        // fall back to v4 via Happy Eyeballs (~250 ms). Setting an
+        // ipv6Settings with empty includedRoutes might confuse iOS into
+        // thinking the tunnel is half-configured, which is a candidate
+        // root cause for the 50 s reaper. Pure v4 tunnel is unambiguous.
+        settings.ipv6Settings = nil
 
         let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
         dns.matchDomains = [""]

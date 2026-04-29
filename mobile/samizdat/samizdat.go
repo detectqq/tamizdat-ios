@@ -289,13 +289,21 @@ func runtimeMetricsLoop(ctx context.Context) {
 			dOut := out - prevOut
 			prevIn, prevOut = in, out
 			rt.appendLog(fmt.Sprintf(
-				"info: hb g=%d tcp=%d udp=%d in=%dKB/s out=%dKB/s",
+				"info: go-hb g=%d tcp=%d udp=%d in=%dKB/s out=%dKB/s",
 				runtime.NumGoroutine(),
 				tcpStreamsAlive.Load(),
 				udpStreamsAlive.Load(),
 				dIn/(1024*5),
 				dOut/(1024*5),
 			))
+			// fsync the log file so its contents are visible to the bridge
+			// poll AND survive a sudden process kill. Without this we get
+			// a 5-30 s tail of lost logs at the moment of death.
+			logSinkMu.Lock()
+			if logSink != nil {
+				_ = logSink.Sync()
+			}
+			logSinkMu.Unlock()
 		}
 	}
 }

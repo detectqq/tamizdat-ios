@@ -222,15 +222,17 @@ final class SamizdatBridge: ObservableObject {
         }
     }
 
-    /// If status is .connected but the extension hasn't appended a log line
-    /// in 10+ seconds, surface that. With the new 5 s heartbeat tick, two
-    /// missed beats means the extension is suspended/throttled/dead.
+    /// Swift heartbeat fires every 2 s; Go heartbeat every 5 s. If neither
+    /// has appended in 4 s while status is .connected, the extension is
+    /// in trouble — surface that immediately so it lands in the file
+    /// before the kill-flush window.
     private func checkFileStaleness() {
         guard state == .connected else { return }
         guard !didLogFileStale else { return }
-        if Date().timeIntervalSince(lastFileGrowth) > 12 {
+        let elapsed = Date().timeIntervalSince(lastFileGrowth)
+        if elapsed > 4 {
             didLogFileStale = true
-            appendBridgeEvent("log file stale 12s+ — extension suspended or dead")
+            appendBridgeEvent("log file stale \(Int(elapsed))s — extension suspended/throttled/dead")
         }
     }
 
