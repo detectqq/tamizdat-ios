@@ -280,17 +280,21 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	var shortID [8]byte
 	copy(shortID[:], shortIDBytes)
 
-	// Match the production server's defaults: BBCR on, both fragmenters on,
-	// noise frames on. We let the upstream applyDefaults() fill timeouts /
-	// pool sizes / churn rates by leaving them zero.
+	// MaxStreamsPerConn=1000 instead of upstream default 100. The default
+	// is right for desktop SOCKS5 but on iOS a Speedtest spawns 100-300
+	// parallel streams in seconds. With cap=100 the connpool spins up a
+	// fresh TCP+TLS+H2 every 100 streams, and uTLS Chrome handshakes on
+	// arm64 are CPU-expensive — the handshake storm blows the extension's
+	// memory budget AND the server starts rejecting new TLS sessions
+	// (EOF). One transport carrying 1000 H2 streams is much cheaper.
 	client, err := core.NewClient(core.ClientConfig{
-		ServerAddr:  net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
-		ServerName:  cfg.SNI,
-		PublicKey:   pubKeyBytes,
-		ShortID:     shortID,
-		Fingerprint: cfg.Fingerprint,
-		// EnableBBCR=nil → upstream defaults to true.
-		// TCPFragmentation/RecordFragmentation/NoiseFrames default to true.
+		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
+		ServerName:        cfg.SNI,
+		PublicKey:         pubKeyBytes,
+		ShortID:           shortID,
+		Fingerprint:       cfg.Fingerprint,
+		MaxStreamsPerConn: 1000,
+		// TCPFragmentation/RecordFragmentation default to true via applyDefaults.
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat client: %w", err)
@@ -372,7 +376,12 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 		localConn := gonet.NewTCPConn(&wq, endpoint)
 		go func() {
 			defer localConn.Close()
+			release, ok := acquireDial(ctx)
+			if !ok {
+				return // dial-cap dropped or ctx canceled
+			}
 			remote, dialErr := client.DialContext(ctx, "tcp", dest)
+			release()
 			if dialErr != nil {
 				rt.appendLog(fmt.Sprintf("error: TCP dial %s: %v", dest, dialErr))
 				return
@@ -403,9 +412,14 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 			return true
 		}
 		conn := gonet.NewUDPConn(&wq, endpoint)
+		isDNS := id.LocalPort == 53
 		go func() {
 			defer conn.Close()
-			forwardUDP(ctx, conn, dest, client)
+			if isDNS {
+				forwardDNS(ctx, conn, dest, client)
+			} else {
+				forwardUDP(ctx, conn, dest, client)
+			}
 		}()
 		return true
 	})
@@ -534,16 +548,61 @@ func relay(a, b net.Conn) {
 	b.Close()
 }
 
+// forwardDNS handles UDP/53 with a short-TTL response cache and a
+// single round-trip (no long-lived UDP-over-CONNECT — DNS queries are
+// one-shot, lingering streams just leak goroutines).
+func forwardDNS(ctx context.Context, conn *gonet.UDPConn, dest string, client *core.Client) {
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
+	}
+	query := buf[:n]
+
+	if cached := dnsCacheGet(query); cached != nil {
+		_, _ = conn.Write(cached)
+		return
+	}
+
+	release, ok := acquireDial(ctx)
+	if !ok {
+		return
+	}
+	remote, err := client.DialUDP(ctx, dest)
+	release()
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("error: DNS UDP dial %s: %v", dest, err))
+		return
+	}
+	defer remote.Close()
+
+	dummyAddr := &streamAddr{network: "udp", address: dest}
+	if _, err := remote.WriteTo(query, dummyAddr); err != nil {
+		return
+	}
+	if err := remote.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
+	}
+	resp := make([]byte, 4096)
+	rn, _, err := remote.ReadFrom(resp)
+	if err != nil || rn == 0 {
+		return
+	}
+	dnsCachePut(query, resp[:rn])
+	_, _ = conn.Write(resp[:rn])
+}
+
 // forwardUDP bridges a single iOS-side gVisor UDP "connection" (one
 // (clientIP, clientPort, destIP, destPort) tuple) to a samizdat
 // UDP-over-CONNECT stream. Datagrams are length-framed inside an H2
 // stream by the upstream samizdat client (see udp_packetconn.go).
-//
-// Phase B replaced the legacy DNS-over-TCP hack with real UDP, so this
-// path also serves DNS (port 53). The previous IPv6 "udp:" prefix bug
-// is gone — DialUDP takes a plain "host:port".
 func forwardUDP(ctx context.Context, conn *gonet.UDPConn, dest string, client *core.Client) {
+	release, ok := acquireDial(ctx)
+	if !ok {
+		return
+	}
 	remote, err := client.DialUDP(ctx, dest)
+	release()
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: UDP dial %s: %v", dest, err))
 		return
@@ -612,6 +671,106 @@ func (a *streamAddr) String() string  { return a.address }
 func isIPv6Address(host string) bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.To4() == nil
+}
+
+// dialSem caps parallel outbound dials across both TCP and UDP forwarders.
+// Without this, a Speedtest plus parallel iOS DNS resolutions can fan out
+// to 200-500 simultaneous H2 stream openings, which (a) blows past the
+// samizdat connpool's per-conn stream limit and triggers a TLS handshake
+// storm to spin up new transports, and (b) explodes goroutine count from
+// the baseline 250 to 800+ in 10 s — well past the iOS extension's RAM
+// budget. 48 is a deliberately conservative ceiling: typical browsing is
+// well under it, Speedtest peaks at ~16-32 real flows, and any dial that
+// sees the channel full just drops the request rather than queueing
+// behind a slow handshake.
+var dialSem = make(chan struct{}, 48)
+var dialDropCount int
+var dialDropLastLog time.Time
+var dialDropMu sync.Mutex
+
+// acquireDial blocks until a slot is free or the context cancels. Returns
+// (release, true) on success, (nil, false) on context cancel.
+func acquireDial(ctx context.Context) (func(), bool) {
+	select {
+	case dialSem <- struct{}{}:
+		return func() { <-dialSem }, true
+	case <-ctx.Done():
+		return nil, false
+	default:
+		// Channel full. Don't queue — the iOS app will retry naturally
+		// (DNS resolvers, TCP SYN-retransmits) and we want to shed load
+		// rather than build a goroutine queue.
+		dialDropMu.Lock()
+		first := dialDropCount == 0
+		dialDropCount++
+		throttled := !first && time.Since(dialDropLastLog) < 5*time.Second
+		if !throttled {
+			dialDropLastLog = time.Now()
+		}
+		count := dialDropCount
+		dialDropMu.Unlock()
+		if !throttled {
+			rt.appendLog(fmt.Sprintf("warn: dial-cap reached, dropping (in_flight=48, total_drops=%d)", count))
+		}
+		return nil, false
+	}
+}
+
+// dnsCache: short-TTL response cache so iOS doesn't re-tunnel the same
+// query 50 times in a Speedtest cascade.
+type dnsCacheEntry struct {
+	response []byte
+	expires  time.Time
+}
+
+var dnsCacheMu sync.Mutex
+var dnsCache = map[string]dnsCacheEntry{}
+
+const dnsCacheTTL = 30 * time.Second
+const dnsCacheMax = 256
+
+func dnsCacheGet(query []byte) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+	key := string(query[2:]) // skip transaction ID; questions+flags are stable
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	e, ok := dnsCache[key]
+	if !ok || time.Now().After(e.expires) {
+		return nil
+	}
+	// Splice the requester's transaction ID over the cached response.
+	resp := make([]byte, len(e.response))
+	copy(resp, e.response)
+	if len(resp) >= 2 {
+		resp[0] = query[0]
+		resp[1] = query[1]
+	}
+	return resp
+}
+
+func dnsCachePut(query, response []byte) {
+	if len(query) < 12 || len(response) < 12 {
+		return
+	}
+	key := string(query[2:])
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	if len(dnsCache) >= dnsCacheMax {
+		// Crude eviction — drop a random ~half. Keeps the map small
+		// without sorting all entries.
+		for k := range dnsCache {
+			delete(dnsCache, k)
+			if len(dnsCache) < dnsCacheMax/2 {
+				break
+			}
+		}
+	}
+	dnsCache[key] = dnsCacheEntry{
+		response: append([]byte(nil), response...),
+		expires:  time.Now().Add(dnsCacheTTL),
+	}
 }
 
 // noteIPv6Drop logs the first IPv6 destination drop loudly and the rest at
