@@ -7,24 +7,17 @@ import (
 	"net"
 	"sync"
 
-	"github.com/getlantern/samizdat/bbcr"
 	utls "github.com/refraction-networking/utls"
 )
 
 // Client dials connections through a Samizdat server. Multiple calls to
 // DialContext share the same underlying TLS+H2 connection via multiplexing.
 type Client struct {
-	config     ClientConfig
-	pool       *connPool
-	bbcr       *clientBBCR
-	dialGate   bbcr.DialGate
-	shaper     *Shaper
-	fragmenter *RecordFragmenter
-	// fingerprintChooser randomises the uTLS ClientHello per new TCP conn
-	// (P1.3). Nil when rotation is disabled. BBCR pins the first pick for
-	// every REBIND in the same session so uTLS fingerprints stay stable.
+	config             ClientConfig
+	pool               *connPool
+	shaper             *Shaper
+	fragmenter         *RecordFragmenter
 	fingerprintChooser *fingerprintRotator
-	bbcrHelloID        utls.ClientHelloID
 	mu                 sync.Mutex
 	closed             bool
 }
@@ -50,22 +43,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
 	c.fingerprintChooser = newFingerprintRotator(config.Fingerprint)
-	if config.EnableBBCR != nil && *config.EnableBBCR {
-		c.bbcrHelloID = c.fingerprintChooser.pick()
-	}
-	gate, err := bbcr.NewChurnDialGate(bbcr.ChurnConfig{Rate: config.BBCRChurnRate, Burst: config.BBCRChurnBurst})
-	if err != nil {
-		return nil, fmt.Errorf("creating BBCR churn gate: %w", err)
-	}
-	c.dialGate = gate
-
 	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, c.createTransport)
-	if config.EnableBBCR != nil && *config.EnableBBCR {
-		c.bbcr, err = newClientBBCR(c)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	return c, nil
 }
@@ -78,13 +56,6 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 		return nil, fmt.Errorf("client is closed")
 	}
 	c.mu.Unlock()
-
-	if c.config.EnableBBCR != nil && *c.config.EnableBBCR {
-		if c.bbcr == nil {
-			return nil, fmt.Errorf("BBCR enabled but session manager is not initialized")
-		}
-		return c.bbcr.dial(ctx, network, address)
-	}
 
 	transport, err := c.pool.getTransport(ctx)
 	if err != nil {
@@ -99,6 +70,32 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	return conn, nil
 }
 
+// DialUDP opens a UDP-tunneling stream to the destination through the server.
+// Returns a net.PacketConn that frames inner UDP datagrams as length-prefixed
+// records over the H2 stream. Single-target: WriteTo addresses other than the
+// CONNECT authority are rejected; ReadFrom always returns address as Addr.
+func (c *Client) DialUDP(ctx context.Context, address string) (net.PacketConn, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("client is closed")
+	}
+	c.mu.Unlock()
+
+	transport, err := c.pool.getTransport(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting transport: %w", err)
+	}
+
+	rwc, err := transport.openUDPTunnel(ctx, address)
+	if err != nil {
+		return nil, fmt.Errorf("opening UDP tunnel to %s: %w", address, err)
+	}
+
+	target := &streamAddr{network: "udp", address: address}
+	return newUDPFramedPacketConn(rwc, target), nil
+}
+
 // Close shuts down all connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -107,14 +104,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
-	var err error
-	if c.bbcr != nil {
-		err = c.bbcr.close()
-	}
-	if perr := c.pool.close(); err == nil {
-		err = perr
-	}
-	return err
+	return c.pool.close()
 }
 
 // createTransport creates a new TLS+H2 connection to the server with
@@ -122,15 +112,6 @@ func (c *Client) Close() error {
 func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	var tcpConn net.Conn
 	var err error
-
-	if c.dialGate != nil {
-		key := bbcr.DialKey{ServerIP: c.config.ServerAddr, SNI: c.config.ServerName}
-		if ctxIsForcedPrewarm(ctx) {
-			clientForcedPrewarmGateBypassed.Add(1)
-		} else if err := c.dialGate.Wait(ctx, key); err != nil {
-			return nil, fmt.Errorf("BBCR churn gate: %w", err)
-		}
-	}
 
 	if c.config.Dialer != nil {
 		tcpConn, err = c.config.Dialer(ctx, "tcp", c.config.ServerAddr)
@@ -154,9 +135,6 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	helloID := c.fingerprintChooser.pick()
-	if c.config.EnableBBCR != nil && *c.config.EnableBBCR {
-		helloID = c.bbcrHelloID
-	}
 	uConn := utls.UClient(conn, tlsConfig, helloID)
 
 	ephPriv, ephPub, err := GenerateEphemeralKeyPair()
@@ -196,7 +174,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		return nil, fmt.Errorf("expected h2, got %q", state.NegotiatedProtocol)
 	}
 
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.BytesPerFlowThreshold, c.config.BytesThresholdJitter, c.config.DrainTimeout, c.config.EnableBBCR != nil && *c.config.EnableBBCR)
+	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
@@ -205,7 +183,6 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	return transport, nil
 }
 
-// applyAuthToClientHello modifies the uTLS ClientHello to embed the auth SessionID and P0.3 keyshare extension.
 func (c *Client) applyAuthToClientHello(uConn *utls.UConn, sessionID []byte, keyShareExtension []byte) error {
 	if err := uConn.BuildHandshakeState(); err != nil {
 		return fmt.Errorf("building handshake state: %w", err)
@@ -250,8 +227,6 @@ func withoutSamizdatKeyShareExtension(exts []utls.TLSExtension) []utls.TLSExtens
 	return filtered
 }
 
-// tlsConnWrapper wraps utls.UConn to satisfy interfaces that expect
-// crypto/tls.Conn methods (e.g., http2.Transport).
 type tlsConnWrapper struct {
 	*utls.UConn
 }

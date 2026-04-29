@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -319,7 +318,7 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 		localConn := gonet.NewTCPConn(&wq, endpoint)
 		go func() {
 			defer localConn.Close()
-			remote, dialErr := dialWithBBCRRetry(ctx, client, dest)
+			remote, dialErr := client.DialContext(ctx, "tcp", dest)
 			if dialErr != nil {
 				rt.appendLog(fmt.Sprintf("error: TCP dial %s: %v", dest, dialErr))
 				return
@@ -330,28 +329,23 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// UDP forwarder: samizdat tunnels TCP only. We accept DNS (port 53) and
-	// proxy it as DNS-over-TCP via samizdat. All other UDP (QUIC/443,
-	// games, etc.) is dropped — modern browsers fall back to TCP/TLS.
-	//
-	// Returning false drops the packet without creating an endpoint, which
-	// dodges the IPv6 "too many colons" path entirely.
+	// UDP forwarder: Phase B server now supports UDP-over-CONNECT
+	// (Client.DialUDP), so we proxy ALL UDP. DNS uses a short-lived path
+	// since iOS resolvers send one-shot 4096-byte queries; non-DNS UDP
+	// (QUIC, WireGuard, games) gets a long-lived bidirectional pump.
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
-		if id.LocalPort != 53 {
-			return false
-		}
 		dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 		var wq waiter.Queue
 		endpoint, udpErr := r.CreateEndpoint(&wq)
 		if udpErr != nil {
-			rt.appendLog(fmt.Sprintf("error: UDP CreateEndpoint: %v", udpErr))
+			rt.appendLog(fmt.Sprintf("error: UDP CreateEndpoint %s: %v", dest, udpErr))
 			return true
 		}
 		conn := gonet.NewUDPConn(&wq, endpoint)
 		go func() {
 			defer conn.Close()
-			forwardDNS(ctx, conn, dest, client)
+			forwardUDP(ctx, conn, dest, client)
 		}()
 		return true
 	})
@@ -477,84 +471,80 @@ func relay(a, b net.Conn) {
 	b.Close()
 }
 
-func forwardDNS(ctx context.Context, conn *gonet.UDPConn, dest string, client *core.Client) {
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
-	query := buf[:n]
-
-	remote, err := dialWithBBCRRetry(ctx, client, dest)
+// forwardUDP bridges a single iOS-side gVisor UDP "connection" (one
+// (clientIP, clientPort, destIP, destPort) tuple) to a samizdat
+// UDP-over-CONNECT stream. Datagrams are length-framed inside an H2
+// stream by the upstream samizdat client (see udp_packetconn.go).
+//
+// Phase B replaced the legacy DNS-over-TCP hack with real UDP, so this
+// path also serves DNS (port 53). The previous IPv6 "udp:" prefix bug
+// is gone — DialUDP takes a plain "host:port".
+func forwardUDP(ctx context.Context, conn *gonet.UDPConn, dest string, client *core.Client) {
+	remote, err := client.DialUDP(ctx, dest)
 	if err != nil {
-		rt.appendLog(fmt.Sprintf("error: DNS TCP dial %s: %v", dest, err))
+		rt.appendLog(fmt.Sprintf("error: UDP dial %s: %v", dest, err))
 		return
 	}
 	defer remote.Close()
 
-	msg := make([]byte, 2+len(query))
-	msg[0] = byte(len(query) >> 8)
-	msg[1] = byte(len(query))
-	copy(msg[2:], query)
-	if _, err := remote.Write(msg); err != nil {
-		return
-	}
+	pumpCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(remote, lenBuf); err != nil {
-		return
-	}
-	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-	if respLen > 65535 {
-		return
-	}
-	resp := make([]byte, respLen)
-	if _, err := io.ReadFull(remote, resp); err != nil {
-		return
-	}
-	conn.Write(resp)
+	// samizdat's PacketConn is single-target; WriteTo accepts the bound
+	// remote unconditionally, but Go's net.Addr interface still demands
+	// a value here.
+	dummyAddr := &streamAddr{network: "udp", address: dest}
+
+	// Local (gVisor) → remote (samizdat).
+	go func() {
+		defer cancel()
+		buf := make([]byte, 65536)
+		for {
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if pumpCtx.Err() != nil {
+				return
+			}
+			if _, err := remote.WriteTo(buf[:n], dummyAddr); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Remote (samizdat) → local (gVisor).
+	go func() {
+		defer cancel()
+		buf := make([]byte, 65536)
+		for {
+			remote.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, _, err := remote.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if pumpCtx.Err() != nil {
+				return
+			}
+			if _, err := conn.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
+	<-pumpCtx.Done()
 }
 
-// dialWithBBCRRetry wraps client.DialContext with a small retry loop for
-// transient BBCR-session-not-yet-active errors. The BBCR session is async:
-// the first DialContext can race with the outer transport's transition from
-// Idle → Active, and parallel dials during outer rotation can briefly hit
-// "transport is not active" or "scheduler backpressure". Both are
-// recoverable on the order of tens to a few hundred ms, so we retry rather
-// than surface the failure to the iOS app.
-//
-// Real failures (TCP refused, TLS handshake, auth) bubble up immediately.
-func dialWithBBCRRetry(ctx context.Context, client *core.Client, dest string) (net.Conn, error) {
-	const overallTimeout = 8 * time.Second
-	deadline := time.Now().Add(overallTimeout)
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		conn, err := client.DialContext(ctx, "tcp", dest)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-		msg := err.Error()
-		transient := strings.Contains(msg, "transport is not active") ||
-			strings.Contains(msg, "scheduler backpressure")
-		if !transient {
-			return nil, err
-		}
-		if time.Now().After(deadline) || ctx.Err() != nil {
-			return nil, lastErr
-		}
-		// 50, 100, 200, 250, 250… ms backoff.
-		d := time.Duration(50<<attempt) * time.Millisecond
-		if d > 250*time.Millisecond {
-			d = 250 * time.Millisecond
-		}
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+// streamAddr is a minimal net.Addr — samizdat's PacketConn ignores the
+// remote address on WriteTo, but Go's interface still requires one.
+type streamAddr struct {
+	network string
+	address string
 }
+
+func (a *streamAddr) Network() string { return a.network }
+func (a *streamAddr) String() string  { return a.address }
 
 func (r *runtimeState) setState(s string) {
 	r.mu.Lock()

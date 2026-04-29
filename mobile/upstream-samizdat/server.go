@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/getlantern/samizdat/bbcr"
 	"golang.org/x/net/http2"
 )
 
@@ -39,7 +37,6 @@ type Server struct {
 	// response writes. P0.4 removes per-record jitter from this path.
 	shaper       *Shaper
 	fragmenter   *RecordFragmenter
-	bbcrSessions *bbcr.SessionManager
 
 	// Replay-protection: sliding window of recently-seen SessionID nonces
 	// (auth T5 finding - captured ClientHellos could be replayed forever).
@@ -94,7 +91,6 @@ func NewServer(config ServerConfig) (*Server, error) {
 		cachedCert:   cached,
 		shaper:       NewShaper(false, 0),
 		fragmenter:   NewRecordFragmenter(config.RecordFragmentation),
-		bbcrSessions: bbcr.NewSessionManager(bbcr.SessionManagerConfig{MaxSessionsPerIdentity: config.BBCRMaxSessionsPerIdentity, MaxStreamsPerSession: config.BBCRMaxStreamsPerSession, IdleTimeout: config.BBCRSessionIdleTimeout}),
 		replayGuard:  newReplayGuard(config.ReplayWindow),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -391,43 +387,35 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 	h2Server := &http2.Server{
 		MaxConcurrentStreams: uint32(s.config.MaxConcurrentStreams),
 	}
-	effectiveThreshold := randomizedBytesThreshold(s.config.BytesPerFlowThreshold, s.config.BytesThresholdJitter)
-	if s.config.EnableBBCR != nil && *s.config.EnableBBCR {
-		effectiveThreshold = math.MaxInt64
-	}
 	flow := &h2Transport{
-		tlsConn:            tlsConn,
-		maxStreams:         s.config.MaxConcurrentStreams,
-		effectiveThreshold: effectiveThreshold,
-		drainTimeout:       s.config.DrainTimeout,
+		tlsConn:      tlsConn,
+		maxStreams:   s.config.MaxConcurrentStreams,
+		drainTimeout: s.config.DrainTimeout,
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if flow.isDraining() {
-			http.Error(w, "connection draining", http.StatusServiceUnavailable)
-			return
-		}
 		if r.Method != http.MethodConnect {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if r.Host == bbcrSessionAuthority {
-			if s.config.EnableBBCR == nil || !*s.config.EnableBBCR {
-				http.Error(w, "BBCR disabled", http.StatusNotFound)
-				return
-			}
-			s.serveBBCRConnect(w, r, identity)
-			return
-		}
-		if s.config.EnableBBCR != nil && *s.config.EnableBBCR {
-			http.Error(w, "legacy CONNECT disabled", http.StatusNotFound)
 			return
 		}
 
 		destination := r.Host
 		if destination == "" {
 			http.Error(w, "No destination", http.StatusBadRequest)
+			return
+		}
+
+		// Branch on Samizdat-Protocol header to route UDP-over-CONNECT through
+		// the dedicated handler (udp_server.go). Empty / "tcp/1" is the default
+		// TCP CONNECT path.
+		switch proto := r.Header.Get(SamizdatProtocolHeader); proto {
+		case "", "tcp/1":
+			// fallthrough to TCP CONNECT handler below
+		case SamizdatProtocolUDP:
+			s.handleUDPCONNECT(w, r, destination)
+			return
+		default:
+			http.Error(w, "unsupported samizdat-protocol", http.StatusBadRequest)
 			return
 		}
 
@@ -665,9 +653,16 @@ func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) 
 		host = destination
 		port = "443"
 	}
-	_ = host
 
-	targetConn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
+	// CRIT-0: validate destination and dial the resolved IP directly. Defeats
+	// SSRF (RFC1918/loopback/cloud-metadata/CGNAT) and the DNS-rebinding TOCTOU
+	// window between validation and net.Dial's own resolver.
+	target, err := ResolveAndValidateDestination(ctx, host, port)
+	if err != nil {
+		return
+	}
+
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		return
 	}
@@ -687,6 +682,11 @@ func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) 
 	go func() {
 		defer wg.Done()
 		io.Copy(conn, targetConn)
+		// HIGH-6: when target sends EOF, propagate write-close to the H2 stream
+		// so the client's blocking Read(s) on its side can wake up cleanly.
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
 	}()
 
 	wg.Wait()

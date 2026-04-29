@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -53,21 +52,16 @@ type h2Transport struct {
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, bytesThreshold int, thresholdJitter float64, drainTimeout time.Duration, enableBBCR bool) (*h2Transport, error) {
-	effectiveThreshold := randomizedBytesThreshold(bytesThreshold, thresholdJitter)
-	if enableBBCR {
-		effectiveThreshold = math.MaxInt64
-	}
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration) (*h2Transport, error) {
 	t := &h2Transport{
-		tlsConn:            tlsConn,
-		serverAddr:         serverAddr,
-		localAddr:          tlsConn.LocalAddr(),
-		remoteAddr:         tlsConn.RemoteAddr(),
-		maxStreams:         maxStreams,
-		shaper:             shaper,
-		fragmenter:         fragmenter,
-		effectiveThreshold: effectiveThreshold,
-		drainTimeout:       drainTimeout,
+		tlsConn:      tlsConn,
+		serverAddr:   serverAddr,
+		localAddr:    tlsConn.LocalAddr(),
+		remoteAddr:   tlsConn.RemoteAddr(),
+		maxStreams:   maxStreams,
+		shaper:       shaper,
+		fragmenter:   fragmenter,
+		drainTimeout: drainTimeout,
 	}
 	wrappedConn := t.wrapClientConn(tlsConn)
 	h2t := &http2.Transport{
@@ -160,6 +154,7 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		pw.Close()
+		tunnelCancel()
 		return nil, fmt.Errorf("CONNECT to %s returned status %d", destination, resp.StatusCode)
 	}
 
@@ -182,6 +177,67 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	)
 
 	return conn, nil
+}
+
+
+// openUDPTunnel issues an HTTP/2 CONNECT request with the Samizdat-Protocol
+// header set to udp/1. Server bridges this stream to a UDP socket targeting
+// `destination`. The returned io.ReadWriteCloser carries length-prefixed UDP
+// datagrams (uint16 BE length || payload, see udp_packetconn.go MaxUDPDatagram).
+// Wrapped by Client.DialUDP into a net.PacketConn for callers.
+func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io.ReadWriteCloser, error) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errors.New("transport closed")
+	}
+	if t.isDraining() {
+		t.mu.Unlock()
+		return nil, errors.New("transport draining")
+	}
+	t.mu.Unlock()
+	t.touch()
+
+	pr, pw := io.Pipe()
+
+	tunnelCtx, tunnelCancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, func() { tunnelCancel() })
+
+	req, err := http.NewRequestWithContext(tunnelCtx, http.MethodConnect, "https://"+t.serverAddr, pr)
+	if err != nil {
+		stop()
+		tunnelCancel()
+		pw.Close()
+		return nil, fmt.Errorf("creating UDP CONNECT request: %w", err)
+	}
+	req.Host = destination
+	req.Header.Set(SamizdatProtocolHeader, SamizdatProtocolUDP)
+
+	resp, err := t.h2Roundtrip.RoundTrip(req)
+	if err != nil {
+		stop()
+		tunnelCancel()
+		pw.Close()
+		return nil, fmt.Errorf("UDP CONNECT to %s: %w", destination, err)
+	}
+
+	stop()
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		pw.Close()
+		tunnelCancel()
+		return nil, fmt.Errorf("UDP CONNECT to %s returned status %d", destination, resp.StatusCode)
+	}
+
+	t.activeStreams.Add(1)
+
+	return &h2StreamRWC{
+		reader:       resp.Body,
+		writer:       pw,
+		transport:    t,
+		tunnelCancel: tunnelCancel,
+	}, nil
 }
 
 // hasCapacity returns true if the transport can accept more streams.
