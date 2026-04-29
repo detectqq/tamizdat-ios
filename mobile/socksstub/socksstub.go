@@ -28,15 +28,19 @@ package socksstub
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	samizdat "github.com/getlantern/samizdat"
 )
 
 const (
@@ -54,16 +58,17 @@ const (
 )
 
 type runtimeState struct {
-	mu          sync.Mutex
-	listener    net.Listener
-	cancel      context.CancelFunc
-	ctx         context.Context
-	socketPath  string
-	logs        []string
-	logsMax     int
-	samizdat    string // empty → direct dial mode
-	connsActive atomic.Int64
-	connsTotal  atomic.Uint64
+	mu             sync.Mutex
+	listener       net.Listener
+	cancel         context.CancelFunc
+	ctx            context.Context
+	socketPath     string
+	logs           []string
+	logsMax        int
+	samizdatBlob   string           // empty → direct dial mode
+	samizdatClient *samizdat.Client // nil unless SetSamizdatConfig succeeded
+	connsActive    atomic.Int64
+	connsTotal     atomic.Uint64
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -198,22 +203,127 @@ func ConnectionsTotal() int64 {
 // string) and samizdat mode (samizdat:// URL). The next accepted SOCKS5
 // connection will use the new mode.
 //
-// POC stage 1 of Path 3 uses empty string only — direct dial — and
-// validates that the architecture survives the iOS extension memory wall.
-// Stage 2 will swap in the samizdat client implementation.
+// On a samizdat:// URL we instantiate a *samizdat.Client up-front so the
+// (potentially expensive) uTLS+H2 handshake to the upstream proxy server
+// happens once, lazily, on the first dial — instead of every dial.
 func SetSamizdatConfig(blob string) error {
-	// Stage 1 placeholder: only direct mode is supported. We accept the
-	// call to keep the gomobile API stable so the app can call it without
-	// caring which stage we're at.
-	rt.mu.Lock()
-	rt.samizdat = blob
-	rt.mu.Unlock()
 	if blob == "" {
+		rt.mu.Lock()
+		oldClient := rt.samizdatClient
+		rt.samizdatBlob = ""
+		rt.samizdatClient = nil
+		rt.mu.Unlock()
+		if oldClient != nil {
+			_ = oldClient.Close()
+		}
 		rt.appendLog("info: dial mode = direct")
-	} else {
-		rt.appendLog("warn: samizdat mode requested but not yet wired (POC stage 1 = direct)")
+		return nil
 	}
+
+	cfg, err := parseSamizdatURL(blob)
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig parse: %v", err))
+		return err
+	}
+	pubKey, err := hex.DecodeString(cfg.PubkeyHex)
+	if err != nil || len(pubKey) != 32 {
+		rt.appendLog("error: SetSamizdatConfig pubkey must be 64 hex chars")
+		return errors.New("pubkey: 64 hex chars required")
+	}
+	shortIDBytes, err := hex.DecodeString(cfg.ShortIDHex)
+	if err != nil || len(shortIDBytes) != 8 {
+		rt.appendLog("error: SetSamizdatConfig shortid must be 16 hex chars")
+		return errors.New("shortid: 16 hex chars required")
+	}
+	var shortID [8]byte
+	copy(shortID[:], shortIDBytes)
+
+	client, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
+		ServerName:        cfg.SNI,
+		PublicKey:         pubKey,
+		ShortID:           shortID,
+		Fingerprint:       cfg.Fingerprint,
+		MaxStreamsPerConn: 200,
+		IdleTimeout:       30 * time.Second,
+		// Path 3: heavy security work runs in the main-app process which
+		// has no jetsam cap, so it's fine to leave defaults on (TCP/Record
+		// fragmentation, NoiseFrames). The CPU cost we feared in IPA-B
+		// no longer hits the extension.
+	})
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig samizdat.NewClient: %v", err))
+		return err
+	}
+
+	rt.mu.Lock()
+	old := rt.samizdatClient
+	rt.samizdatBlob = blob
+	rt.samizdatClient = client
+	rt.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	rt.appendLog(fmt.Sprintf("info: dial mode = samizdat → %s:%d (sni=%s)", cfg.ServerHost, cfg.ServerPort, cfg.SNI))
 	return nil
+}
+
+type samizdatConfig struct {
+	ServerHost  string
+	ServerPort  int
+	SNI         string
+	PubkeyHex   string
+	ShortIDHex  string
+	Fingerprint string
+}
+
+// parseSamizdatURL parses a samizdat://host:port/?sni=…&pubkey=…&shortid=…&fp=…
+// blob. Mirrors mobile/samizdat/samizdat.go's parser shape.
+func parseSamizdatURL(blob string) (*samizdatConfig, error) {
+	u, err := url.Parse(blob)
+	if err != nil {
+		return nil, fmt.Errorf("not a URL: %w", err)
+	}
+	if u.Scheme != "samizdat" {
+		return nil, fmt.Errorf("scheme must be samizdat:// (got %q)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, errors.New("missing host")
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		return nil, errors.New("missing port")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %q", portStr)
+	}
+	q := u.Query()
+	sni := q.Get("sni")
+	if sni == "" {
+		return nil, errors.New("missing sni")
+	}
+	pub := q.Get("pubkey")
+	if len(pub) != 64 {
+		return nil, errors.New("pubkey must be 64 hex chars")
+	}
+	sid := q.Get("shortid")
+	if len(sid) != 16 {
+		return nil, errors.New("shortid must be 16 hex chars")
+	}
+	fp := q.Get("fp")
+	if fp == "" {
+		fp = "chrome"
+	}
+	return &samizdatConfig{
+		ServerHost:  host,
+		ServerPort:  port,
+		SNI:         sni,
+		PubkeyHex:   pub,
+		ShortIDHex:  sid,
+		Fingerprint: fp,
+	}, nil
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.
@@ -379,18 +489,15 @@ func sendReply(client net.Conn, code byte) error {
 // dialUpstream is the swap-point: stage 1 = direct, stage 2 = samizdat.
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	rt.mu.Lock()
-	mode := rt.samizdat
+	client := rt.samizdatClient
 	rt.mu.Unlock()
-	if mode == "" {
-		// Direct dial. iOS allows TCP outbound from a foreground app.
+	if client == nil {
+		// Direct dial — POC stage 1 / fallback when no config set.
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", dest)
 	}
-	// TODO(stage 2): samizdat client.DialContext(ctx, "tcp", dest)
-	// For now, fall through to direct so partial config doesn't break.
-	rt.appendLog("warn: samizdat mode set but not yet wired; using direct")
-	var d net.Dialer
-	return d.DialContext(ctx, "tcp", dest)
+	// Stage 2: route through the samizdat H2 CONNECT tunnel.
+	return client.DialContext(ctx, "tcp", dest)
 }
 
 // relay copies bytes between two duplex streams until either side closes.

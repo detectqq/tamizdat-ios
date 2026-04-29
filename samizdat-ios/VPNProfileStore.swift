@@ -43,6 +43,17 @@ final class VPNProfileStore {
 
     func startTunnel(configBlob: String) async throws {
         SamizdatAddLog("info: preparing VPN profile")
+        // Path 3: hand the samizdat config to the in-process SocksStub
+        // BEFORE we ask iOS to bring up the extension. Once the extension's
+        // hev forwards its first flow to 127.0.0.1:18443, SocksStub's
+        // dialUpstream tunnels via samizdat. This decouples extension
+        // boot from samizdat handshake — the H2 CONNECT happens inside
+        // the main app's process where there is no jetsam cap.
+        var nsErr: NSError?
+        SocksstubSetSamizdatConfig(configBlob, &nsErr)
+        if let nsErr {
+            SamizdatAddLog("warn: SocksstubSetSamizdatConfig: \(nsErr.localizedDescription) (falling back to direct)")
+        }
         let serverIP = await resolvedIPv4Address(from: configBlob)
         let engineConfigBlob = configBlobWithConnectEndpoint(serverIP, in: configBlob) ?? configBlob
         if let serverIP {
