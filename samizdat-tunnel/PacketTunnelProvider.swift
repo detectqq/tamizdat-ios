@@ -1,18 +1,27 @@
 import Foundation
 import NetworkExtension
 import OSLog
+import os
 import SamizdatClient
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
     private let pumpQueue = DispatchQueue(label: "com.anarki.samizdat-test.packet-writer")
-    /// Dedicated queue for the iOS metrics timer. Cannot share pumpQueue:
-    /// the packet-writer pumps a tight loop most of the time and would
-    /// starve our 1 Hz timer events queued behind it.
-    private let metricsQueue = DispatchQueue(label: "com.anarki.samizdat-test.ios-metrics", qos: .utility)
-    private var isRunning = false
-    private var iosMetricsTimer: DispatchSourceTimer?
+
+    /// Lifecycle flag read from three different queues (NE callback queue
+    /// for packetFlow.readPackets, our pumpQueue for the write loop, and
+    /// stopTunnel from yet another queue). Plain `Bool` had a torn-write
+    /// race; on Swift 6 it would be a compile error. OSAllocatedUnfairLock
+    /// keeps writes/reads atomic without the cost of a serial queue.
+    private let runningState = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private var isRunning: Bool {
+        get { runningState.withLock { $0 } }
+        set { runningState.withLock { $0 = newValue } }
+    }
+
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let logFileName = "extension-log.txt"
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -20,6 +29,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
               let configBlob = proto.providerConfiguration?["configBlob"] as? String else {
             completionHandler(makeError("missing samizdat config"))
             return
+        }
+
+        // Point the Go shim's log sink at the App Group container BEFORE
+        // anything else, so even early-startup messages land in the file
+        // the main app reads. The file survives extension death — it's
+        // our "last words" trail for diagnosing iOS reaps.
+        if let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupID
+        ) {
+            let logURL = containerURL.appendingPathComponent(Self.logFileName)
+            SamizdatSetLogSink(logURL.path)
         }
 
         SamizdatAddLog("info: PacketTunnelProvider startTunnel")
@@ -52,38 +72,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.isRunning = true
             self.startPacketReadLoop()
             self.startPacketWriteLoop()
-            self.startIOSMetricsLoop()
             self.log.info("packet tunnel started")
             SamizdatAddLog("info: packet tunnel started")
             completionHandler(nil)
         }
-    }
-
-    /// Polls iOS-reported available memory + thermal state every second.
-    /// `os_proc_available_memory()` returns the byte budget BEFORE the
-    /// process is reaped, which is the metric jetsam actually uses. If
-    /// this number drops to a few MB while our Go-side `sys` is still
-    /// modest, we know the kill is coming from jetsam (not our heap).
-    /// Also captures iOS sleep/wake transitions: if the extension is
-    /// suspended (`sleep` callback fires) and never wakes back, we know
-    /// the kill was a suspend-then-reap rather than memory pressure.
-    private func startIOSMetricsLoop() {
-        let timer = DispatchSource.makeTimerSource(queue: metricsQueue)
-        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
-        timer.setEventHandler { [weak self] in
-            guard let self, self.isRunning else { return }
-            let avail = os_proc_available_memory()
-            let thermal = ProcessInfo.processInfo.thermalState.rawValue
-            let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0
-            SamizdatAddLog(String(
-                format: "info: ios avail=%dKB thermal=%d lowpwr=%d",
-                avail / 1024,
-                thermal,
-                lowPower
-            ))
-        }
-        timer.resume()
-        iosMetricsTimer = timer
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
@@ -99,10 +91,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
-        iosMetricsTimer?.cancel()
-        iosMetricsTimer = nil
         SamizdatAddLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
         SamizdatTunnelStop()
+        // Detach the log sink so the next startTunnel reopens it. Keep the
+        // file content though — main app may still want to read it.
+        SamizdatSetLogSink("")
         completionHandler()
     }
 
@@ -128,7 +121,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func makeNetworkSettings(configBlob: String, serverIP: String?) -> NEPacketTunnelNetworkSettings {
         let remoteAddress = serverIP ?? "127.0.0.1"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
-        settings.mtu = 1500
+        // 1280 is the IPv6 minimum and gives plenty of headroom for our
+        // outer overhead: TLS + H2 frame header + inner TCP/UDP. The old
+        // 1500 left only ~1391 effective bytes after overhead, which iOS
+        // would split with PMTU-sized writePackets calls under load.
+        settings.mtu = 1280
 
         let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
@@ -137,8 +134,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         settings.ipv4Settings = ipv4
 
+        // No IPv6 default route — the upstream samizdat server has no IPv6
+        // egress so any v6 destination would just cost us a CONNECT
+        // round-trip and a 502. Without an included v6 route iOS won't
+        // send v6 packets to us at all; apps fall back to IPv4 via Happy
+        // Eyeballs in <300ms. We still set a placeholder v6 address so
+        // iOS doesn't reject the settings.
         let ipv6 = NEIPv6Settings(addresses: ["fd00:7361:6d69::1"], networkPrefixLengths: [64])
-        ipv6.includedRoutes = [NEIPv6Route.default()]
+        // includedRoutes deliberately empty.
         settings.ipv6Settings = ipv6
 
         let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])

@@ -1,8 +1,7 @@
 package samizdat
 
 import (
-	"crypto/rand"
-	"math/big"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -198,12 +197,20 @@ func (f *Fragmenter) SetReadDeadline(t time.Time) error   { return f.conn.SetRea
 func (f *Fragmenter) SetWriteDeadline(t time.Time) error  { return f.conn.SetWriteDeadline(t) }
 
 // randomInt returns a random int in [min, max).
+//
+// iOS-vendor patch: was crypto/rand on every call. crypto/rand on iOS is
+// getentropy() — tens of microseconds per call plus a syscall. With ~50K
+// fragments/sec under Speedtest the cumulative cost was significant CPU
+// (and arguably a contributor to the iOS extension watchdog reaping us).
+// Switched to math/rand/v2 (PCG, seeded from crypto/rand at startup), which
+// is ~10ns/call and lock-free per-goroutine. The randomness is only used
+// to confuse passive packet-counters / DPI heuristics; cryptographic
+// quality is not required.
 func randomInt(min, max int) int {
 	if min >= max {
 		return min
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
-	return min + int(n.Int64())
+	return min + mrand.IntN(max-min)
 }
 
 // randomDuration returns a random duration in [min, max).
@@ -211,6 +218,5 @@ func randomDuration(min, max time.Duration) time.Duration {
 	if min >= max {
 		return min
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
-	return min + time.Duration(n.Int64())
+	return min + time.Duration(mrand.Int64N(int64(max-min)))
 }

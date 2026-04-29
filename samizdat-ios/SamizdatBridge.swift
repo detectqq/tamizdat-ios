@@ -8,6 +8,21 @@ import SamizdatClient // gomobile-generated framework
 /// raw `Samizdat…()` C-bridge functions.
 ///
 /// State is published; ContentView observes it and re-renders.
+///
+/// Architecture (post-Phase-1 rework):
+///
+///  - **Status** comes from `NEVPNStatusDidChange` notifications (push), with
+///    a 5-second safety re-poll. We no longer hammer the system at 4 Hz, which
+///    used to mean ~16 XPC roundtrips per second to `nesessionmanager` (each
+///    `loadAllFromPreferences` is a real XPC call) and was the most plausible
+///    reason iOS was reaping the extension at 35-60 s as "high non-tunnel
+///    work".
+///
+///  - **Logs** are read directly from the App Group log file the extension
+///    writes to (`extension-log.txt`). The bridge tails it via a 1 Hz file-
+///    size poll on the app side, completely decoupled from the extension's
+///    XPC. This also means the file survives extension death — its last
+///    lines are the "last words" trail iOS denied us elsewhere.
 @MainActor
 final class SamizdatBridge: ObservableObject {
 
@@ -20,25 +35,63 @@ final class SamizdatBridge: ObservableObject {
     @Published private(set) var socksAddr: String = ""
     @Published private(set) var logs: [String] = []
 
-    private var pollTask: Task<Void, Never>?
-    private var lastExtensionLogPoll = Date.distantPast
-    private var extensionLogDump = ""
     /// Synthetic events the Bridge wants to surface in the unified log
-    /// (state transitions, extension-not-responding). Capped FIFO. Appears
-    /// on its own line in the LogView, prefixed `bridge:` so the user can
-    /// distinguish it from Go-shim logs.
+    /// (state transitions, file-stale warnings). Capped FIFO.
     private var bridgeEvents: [String] = []
     private let bridgeEventsCap = 200
     private var previousNEStatus: String = "init"
-    private var lastSuccessfulExtensionPoll = Date.distantPast
-    private var didLogExtensionLoss = false
+
+    /// Lines accumulated from the App Group log file. Capped FIFO.
+    private var fileLogLines: [String] = []
+    private let fileLogLinesCap = 1000
+
+    private var statusObserver: NSObjectProtocol?
+    private var safetyPollTask: Task<Void, Never>?
+
+    private let logFileURL: URL?
+    private var logFileOffset: UInt64 = 0
+    private var lastFileGrowth = Date.distantPast
+    private var didLogFileStale = false
+    private var logFileTimer: DispatchSourceTimer?
+
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let logFileName = "extension-log.txt"
 
     init() {
-        startPolling()
+        let containerURL = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: SamizdatBridge.appGroupID)
+        self.logFileURL = containerURL?.appendingPathComponent(SamizdatBridge.logFileName)
+
+        statusObserver = NotificationCenter.default.addObserver(
+            forName: .NEVPNStatusDidChange,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.refreshStatus() }
+        }
+
+        // Safety re-poll: NEVPNStatusDidChange fires reliably for our own
+        // start/stop, but in rare cases (e.g. iOS reaping the extension
+        // between us seeing .connected and the system flipping to
+        // .disconnected) we want a slow ground-truth check. 5 s is cheap
+        // because connectionStatus() now uses the cached manager.
+        safetyPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await self?.refreshStatus()
+            }
+        }
+
+        Task { @MainActor in await refreshStatus() }
+        startLogFileWatcher()
     }
 
     deinit {
-        pollTask?.cancel()
+        if let observer = statusObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        safetyPollTask?.cancel()
+        logFileTimer?.cancel()
     }
 
     // MARK: – Public API
@@ -55,7 +108,12 @@ final class SamizdatBridge: ObservableObject {
         state = .connecting
         lastError = ""
         try await VPNProfileStore.shared.startTunnel(configBlob: blob)
-        await refresh()
+        // Truncate any prior session's log file so the next dump shows
+        // only this session's lines.
+        truncateLogFile()
+        logFileOffset = 0
+        fileLogLines.removeAll(keepingCapacity: true)
+        await refreshStatus()
     }
 
     func disconnect() {
@@ -64,30 +122,20 @@ final class SamizdatBridge: ObservableObject {
     }
 
     func clearLogs() {
-        SamizdatClearLogs()
-        extensionLogDump = ""
-        Task {
-            await VPNProfileStore.shared.clearExtensionLogs()
-        }
-        logs = []
+        bridgeEvents.removeAll(keepingCapacity: true)
+        fileLogLines.removeAll(keepingCapacity: true)
+        truncateLogFile()
+        logFileOffset = 0
+        rebuildUnifiedLogs()
     }
 
     var version: String {
         SamizdatVersion()
     }
 
-    // MARK: – Polling
+    // MARK: – Status
 
-    private func startPolling() {
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(nanoseconds: 250_000_000) // 4 Hz
-            }
-        }
-    }
-
-    private func refresh() async {
+    private func refreshStatus() async {
         let raw = await VPNProfileStore.shared.connectionStatus()
         let rawName = neStatusName(raw)
         let newState: State
@@ -107,50 +155,98 @@ final class SamizdatBridge: ObservableObject {
         if rawName != previousNEStatus {
             appendBridgeEvent("status \(previousNEStatus) → \(rawName)")
             previousNEStatus = rawName
-            // Reset death-detection on every transition that brings the
-            // tunnel back up.
             if raw == .connected || raw == .connecting {
-                didLogExtensionLoss = false
+                didLogFileStale = false
+                lastFileGrowth = Date()
             }
         }
 
-        var err = SamizdatLastError()
-        let socks = ""
-        var dump = SamizdatLogs(0)
-
-        if Date().timeIntervalSince(lastExtensionLogPoll) >= 1 {
-            lastExtensionLogPoll = Date()
-            let extensionDump = await VPNProfileStore.shared.extensionLogs()
-            if let extensionDump, !extensionDump.isEmpty {
-                extensionLogDump = extensionDump
-                lastSuccessfulExtensionPoll = Date()
-                didLogExtensionLoss = false
-                if err.isEmpty,
-                   let lastErrorLine = extensionDump.components(separatedBy: "\n").last(where: { $0.contains(" error:") }) {
-                    err = lastErrorLine
-                }
-            } else if raw == .connected,
-                      !didLogExtensionLoss,
-                      Date().timeIntervalSince(lastSuccessfulExtensionPoll) > 3 {
-                // Status says connected but we cannot reach the extension's
-                // log RPC for >3s. Almost always means iOS killed the
-                // extension (memory cap, watchdog) and is about to flip
-                // status. Surface it loudly, once, so the next dump shows
-                // the moment of death.
-                didLogExtensionLoss = true
-                appendBridgeEvent("extension log RPC stopped responding (extension likely killed by iOS)")
-            }
-        }
-
-        dump = [dump, extensionLogDump, bridgeEvents.joined(separator: "\n")]
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        let lines = dump.isEmpty ? [] : dump.components(separatedBy: "\n")
-
+        let err = SamizdatLastError()
         if state != newState { state = newState }
         if lastError != err { lastError = err }
-        if socksAddr != socks { socksAddr = socks }
-        if logs != lines { logs = lines }
+        if !socksAddr.isEmpty { socksAddr = "" }
+        rebuildUnifiedLogs()
+    }
+
+    // MARK: – Log file watcher
+
+    private func startLogFileWatcher() {
+        guard let _ = logFileURL else { return }
+        // 1 Hz file-size poll on a background queue. Reads only when the
+        // file has grown. No XPC, no roundtrip to the extension.
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor in self?.readNewLogLines() }
+        }
+        timer.resume()
+        logFileTimer = timer
+    }
+
+    private func readNewLogLines() {
+        guard let url = logFileURL else { return }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? UInt64 else {
+            // File may not exist yet (extension hasn't started) — silent.
+            return
+        }
+        if size < logFileOffset {
+            // File was truncated externally (e.g. our clearLogs).
+            logFileOffset = 0
+        }
+        if size == logFileOffset {
+            checkFileStaleness()
+            return
+        }
+
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seek(toOffset: logFileOffset)
+            let data = handle.availableData
+            logFileOffset += UInt64(data.count)
+            lastFileGrowth = Date()
+            didLogFileStale = false
+
+            if let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                let trimmed = text.hasSuffix("\n") ? String(text.dropLast()) : text
+                let parts = trimmed.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                fileLogLines.append(contentsOf: parts)
+                if fileLogLines.count > fileLogLinesCap {
+                    fileLogLines.removeFirst(fileLogLines.count - fileLogLinesCap)
+                }
+                rebuildUnifiedLogs()
+            }
+        } catch {
+            // Best-effort.
+        }
+    }
+
+    /// If status is .connected but the extension hasn't appended a log line
+    /// in 10+ seconds, surface that. With the new 5 s heartbeat tick, two
+    /// missed beats means the extension is suspended/throttled/dead.
+    private func checkFileStaleness() {
+        guard state == .connected else { return }
+        guard !didLogFileStale else { return }
+        if Date().timeIntervalSince(lastFileGrowth) > 12 {
+            didLogFileStale = true
+            appendBridgeEvent("log file stale 12s+ — extension suspended or dead")
+        }
+    }
+
+    private func truncateLogFile() {
+        guard let url = logFileURL else { return }
+        try? Data().write(to: url, options: .atomic)
+    }
+
+    // MARK: – Helpers
+
+    private func rebuildUnifiedLogs() {
+        // Bridge events appear inline at the end so the user sees the
+        // status transitions and stale-file warnings in chronological
+        // order with the file content.
+        let combined = fileLogLines + bridgeEvents
+        if logs != combined { logs = combined }
     }
 
     private func appendBridgeEvent(_ message: String) {

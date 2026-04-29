@@ -69,8 +69,12 @@ func (c *ClientConfig) applyDefaults() {
 		c.DrainTimeout = 10 * time.Second
 	}
 	if !c.DisableDefaultSecurity {
-		c.TCPFragmentation = c.TCPFragmentation || true
-		c.RecordFragmentation = c.RecordFragmentation || true
+		// iOS-vendor patch: original was `c.TCPFragmentation = c.TCPFragmentation || true`
+		// which is always true, silently overriding any caller-supplied
+		// `false`. Force-on is the intended behaviour, so just write it
+		// directly. (The boolean tautology was upstream code rot.)
+		c.TCPFragmentation = true
+		c.RecordFragmentation = true
 	}
 }
 

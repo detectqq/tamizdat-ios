@@ -9,7 +9,37 @@ final class VPNProfileStore {
     private let providerBundleIdentifier = "com.anarki.samizdat-test.tunnel"
     private let localizedDescription = "Samizdat Test"
 
-    private init() {}
+    /// Cache of the loaded NETunnelProviderManager. Each
+    /// loadAllFromPreferences call is an XPC roundtrip to nesessionmanager,
+    /// which under load can take 5-50 ms. The previous design called it
+    /// from connectionStatus() and extensionLogs() at 4 Hz combined =
+    /// ~16 XPC/sec to a daemon already busy with our active VPN. iOS
+    /// flagged the extension as "high non-tunnel work" and reaped it.
+    /// With the cache + NEVPNConfigurationChange listener the daemon
+    /// is hit at most on actual config edits.
+    private var cachedManager: NETunnelProviderManager?
+    private var cacheLock = NSLock()
+    private var configChangeObserver: NSObjectProtocol?
+
+    private init() {
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .NEVPNConfigurationChange,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            // Force a reload on the next access — config edited under us
+            // (e.g. user toggled VPN in Settings).
+            self?.cacheLock.lock()
+            self?.cachedManager = nil
+            self?.cacheLock.unlock()
+        }
+    }
+
+    deinit {
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     func startTunnel(configBlob: String) async throws {
         SamizdatAddLog("info: preparing VPN profile")
@@ -34,13 +64,29 @@ final class VPNProfileStore {
 
     func stopTunnel() {
         Task {
-            guard let manager = try? await loadExistingManager() else { return }
+            guard let manager = await currentManager() else { return }
             manager.connection.stopVPNTunnel()
         }
     }
 
+    /// Returns the manager from cache if present, otherwise loads it once
+    /// from preferences (XPC). Subsequent calls are O(1).
+    func currentManager() async -> NETunnelProviderManager? {
+        cacheLock.lock()
+        if let m = cachedManager {
+            cacheLock.unlock()
+            return m
+        }
+        cacheLock.unlock()
+        guard let m = try? await loadExistingManager() else { return nil }
+        cacheLock.lock()
+        cachedManager = m
+        cacheLock.unlock()
+        return m
+    }
+
     func connectionStatus() async -> NEVPNStatus {
-        guard let manager = try? await loadExistingManager() else { return .disconnected }
+        guard let manager = await currentManager() else { return .disconnected }
         return manager.connection.status
     }
 
@@ -55,7 +101,7 @@ final class VPNProfileStore {
     @discardableResult
     private func ensureProfile(configBlob: String, engineConfigBlob: String, serverIP: String?) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager
-        if let existingManager = try await loadExistingManager() {
+        if let existingManager = await currentManager() {
             manager = existingManager
         } else {
             manager = NETunnelProviderManager()
@@ -63,6 +109,13 @@ final class VPNProfileStore {
         configure(manager, configBlob: configBlob, engineConfigBlob: engineConfigBlob, serverIP: serverIP)
         try await save(manager)
         try await load(manager)
+        // Save can succeed but trigger NEVPNConfigurationChange, which our
+        // observer reacts to by clearing the cache. Re-pin the saved
+        // manager here so subsequent currentManager() calls don't roundtrip
+        // to nesessionmanager again.
+        cacheLock.lock()
+        cachedManager = manager
+        cacheLock.unlock()
         return manager
     }
 
@@ -131,7 +184,7 @@ final class VPNProfileStore {
     }
 
     private func sendProviderMessage(_ message: String) async throws -> String {
-        guard let manager = try await loadExistingManager(),
+        guard let manager = await currentManager(),
               let session = manager.connection as? NETunnelProviderSession else {
             return ""
         }

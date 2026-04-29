@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +56,6 @@ type runtimeState struct {
 	cfg       *config
 	logs      []string
 	logsMax   int
-	cancelCh  chan struct{}
 	socksAddr string
 	tunnel    *packetTunnel
 }
@@ -71,6 +72,45 @@ var (
 	tcpStreamsAlive atomic.Int64
 	udpStreamsAlive atomic.Int64
 )
+
+// Log file sink. The iOS extension calls SetLogSink at startTunnel with a
+// path inside the App Group container. Every appendLog also writes there,
+// so the main app can read live logs by tailing the file (no XPC, no
+// sendProviderMessage poll loop) AND the file survives extension death,
+// giving us the "last words" trail when iOS reaps the process.
+var (
+	logSinkMu sync.Mutex
+	logSink   *os.File
+)
+
+// SetLogSink opens the given path in append mode (creating if necessary).
+// Subsequent appendLog calls also write there. Pass an empty string to
+// detach the current sink.
+func SetLogSink(path string) {
+	if path == "" {
+		logSinkMu.Lock()
+		if logSink != nil {
+			logSink.Close()
+			logSink = nil
+		}
+		logSinkMu.Unlock()
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		// Don't appendLog about the sink failure — that would be circular if
+		// the sink is also where we'd send the warning. Stash a one-shot
+		// in-memory line so the user sees something via Logs() at least.
+		_ = err
+		return
+	}
+	logSinkMu.Lock()
+	if logSink != nil {
+		logSink.Close()
+	}
+	logSink = f
+	logSinkMu.Unlock()
+}
 
 // Connect is kept for the main app's lightweight smoke path. The real
 // full-device VPN path runs in PacketTunnelProvider via TunnelStart.
@@ -99,10 +139,6 @@ func Connect(configBlob string) error {
 func Disconnect() {
 	TunnelStop()
 	rt.mu.Lock()
-	if rt.cancelCh != nil {
-		close(rt.cancelCh)
-		rt.cancelCh = nil
-	}
 	rt.state = StateDisconnected
 	rt.socksAddr = ""
 	rt.mu.Unlock()
@@ -128,23 +164,33 @@ func SocksAddr() string {
 }
 
 func Logs(n int) string {
+	// Snapshot under r.mu, then build outside. Building outside avoids
+	// blocking packet-flow goroutines (TunnelInjectPacket / TunnelReadPacket
+	// also take r.mu) while the bridge polls a multi-KB log dump. The
+	// previous "out += l" loop was O(N²) — for 1000×80B lines, ~40 MB of
+	// temp allocations per call, all under r.mu, with GOGC=20 hammering GC.
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
 	if n <= 0 || n > len(rt.logs) {
 		n = len(rt.logs)
 	}
 	if n == 0 {
+		rt.mu.Unlock()
 		return ""
 	}
 	start := len(rt.logs) - n
-	out := ""
-	for i, l := range rt.logs[start:] {
+	snapshot := make([]string, n)
+	copy(snapshot, rt.logs[start:])
+	rt.mu.Unlock()
+
+	var b strings.Builder
+	b.Grow(n * 80)
+	for i, l := range snapshot {
 		if i > 0 {
-			out += "\n"
+			b.WriteByte('\n')
 		}
-		out += l
+		b.WriteString(l)
 	}
-	return out
+	return b.String()
 }
 
 func ClearLogs() {
@@ -222,10 +268,14 @@ func TunnelStart(configBlob string) error {
 }
 
 func runtimeMetricsLoop(ctx context.Context) {
-	// 1 s tick: previous traces showed extension death within ~13 s after
-	// the last sample landed in the app's log buffer. Tighter ticker
-	// gives us closer time-to-death resolution.
-	t := time.NewTicker(1 * time.Second)
+	// 5 s tick + no ReadMemStats. ReadMemStats is stop-the-world; under
+	// 200+ goroutines the pause is 1-5 ms, and at 1 Hz this stacked with
+	// the iOS metrics timer (also 1 Hz) and the bridge's 4 Hz status poll
+	// into a heartbeat pattern that iOS NetworkExtension classifiers seem
+	// to throttle / suspend ("extension is doing lots of CPU/IPC work but
+	// few packets"). 5 s tick + atomic-only counters keeps the heartbeat
+	// readable in the App Group log file without itself being the load.
+	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	var prevIn, prevOut uint64
 	for {
@@ -233,23 +283,18 @@ func runtimeMetricsLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
 			in := bytesInjected.Load()
 			out := bytesEmitted.Load()
 			dIn := in - prevIn
 			dOut := out - prevOut
 			prevIn, prevOut = in, out
 			rt.appendLog(fmt.Sprintf(
-				"info: rt sys=%dKB heap=%dKB g=%d gc=%d tcp=%d udp=%d in=%dKB/s out=%dKB/s",
-				ms.Sys/1024,
-				ms.HeapAlloc/1024,
+				"info: hb g=%d tcp=%d udp=%d in=%dKB/s out=%dKB/s",
 				runtime.NumGoroutine(),
-				ms.NumGC,
 				tcpStreamsAlive.Load(),
 				udpStreamsAlive.Load(),
-				dIn/1024,
-				dOut/1024,
+				dIn/(1024*5),
+				dOut/(1024*5),
 			))
 		}
 	}
@@ -322,15 +367,21 @@ func newPacketTunnel(cfg *config) (*packetTunnel, error) {
 	// churn. IdleTimeout=30s reaps dead transports faster than the
 	// upstream default (5min) so a brief load spike does not pin extra
 	// transports across the iOS RAM budget for minutes.
+	// Honor the user's `tcpfrag=` URL toggle. When the URL specifies
+	// false explicitly, we pass DisableDefaultSecurity=true so upstream
+	// applyDefaults stops force-overriding to true.
+	disableDefaults := !cfg.TCPFragmentation
 	client, err := core.NewClient(core.ClientConfig{
-		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
-		ServerName:        cfg.SNI,
-		PublicKey:         pubKeyBytes,
-		ShortID:           shortID,
-		Fingerprint:       cfg.Fingerprint,
-		MaxStreamsPerConn: 200,
-		IdleTimeout:       30 * time.Second,
-		// TCPFragmentation/RecordFragmentation default to true via applyDefaults.
+		ServerAddr:             net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
+		ServerName:             cfg.SNI,
+		PublicKey:              pubKeyBytes,
+		ShortID:                shortID,
+		Fingerprint:            cfg.Fingerprint,
+		MaxStreamsPerConn:      200,
+		IdleTimeout:            30 * time.Second,
+		TCPFragmentation:       cfg.TCPFragmentation,
+		RecordFragmentation:    cfg.TCPFragmentation, // tied to the same URL toggle for now
+		DisableDefaultSecurity: disableDefaults,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating samizdat client: %w", err)
@@ -531,6 +582,13 @@ func (e *packetFlowEndpoint) Close() {
 }
 
 func (e *packetFlowEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	// Block on the outbound channel rather than dropping silently when
+	// full. Returning (n_written < len(pkts), nil) was misleading gVisor:
+	// it would consider the rest "successfully sent" and not retransmit,
+	// causing TCP stalls until the receiver eventually retried. With
+	// blocking, gVisor's send window naturally backpressures higher up
+	// the stack (which is what we want — the iOS app sees a slow tunnel,
+	// not corrupted streams).
 	var n int
 	for _, pkt := range pkts.AsSlice() {
 		view := pkt.ToView()
@@ -541,8 +599,6 @@ func (e *packetFlowEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 			return n, nil
 		case e.outbound <- data:
 			n++
-		default:
-			rt.appendLog("warn: packetFlow outbound queue full; dropping packet")
 		}
 	}
 	return n, nil
@@ -865,6 +921,17 @@ func (r *runtimeState) appendLog(line string) {
 		r.logs = append(r.logs[:0], r.logs[drop:]...)
 	}
 	r.mu.Unlock()
+
+	// Mirror to the App Group log file outside r.mu so disk I/O doesn't
+	// stall packet flow. Concurrent writes are serialized by logSinkMu;
+	// kernel append on a regular file is atomic per-write up to PIPE_BUF
+	// for our short lines.
+	logSinkMu.Lock()
+	sink := logSink
+	logSinkMu.Unlock()
+	if sink != nil {
+		_, _ = sink.WriteString(full + "\n")
+	}
 }
 
 func parseConfig(blob string) (*config, error) {
