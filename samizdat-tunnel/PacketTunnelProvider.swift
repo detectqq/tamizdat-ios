@@ -4,6 +4,7 @@ import OSLog
 import os
 import Darwin
 import HevSocks5Tunnel
+import SamizdatClient
 
 /// Path 3 PacketTunnelProvider — pure C/lwIP via hev-socks5-tunnel, no Go
 /// runtime in the extension. The heavy lifting (Go SOCKS5 listener,
@@ -61,6 +62,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
 
+        // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
+        // of the loopback bridge live in this extension, so there is no
+        // cross-process sandbox issue and the listener can never get
+        // host-app-suspended out from under us.
+        appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
+        if !Self.startInProcessSocks(configBlob: configBlob, log: appendExtLog) {
+            completionHandler(makeError("SocksStub failed to start"))
+            return
+        }
+
         let settings = makeNetworkSettings(serverIP: serverIP)
         appendExtLog("info: applying packet tunnel network settings")
         setTunnelNetworkSettings(settings) { [weak self] error in
@@ -72,6 +83,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             self.startHev(configBlob: configBlob, completionHandler: completionHandler)
         }
+    }
+
+    /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
+    /// run inside this extension process. Returns true on success.
+    private static func startInProcessSocks(configBlob: String, log: (String) -> Void) -> Bool {
+        // Mirror Go-shim logs to the App Group file so the bridge sees them
+        // alongside extension logs.
+        if let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupID
+        ) {
+            let logURL = containerURL.appendingPathComponent(logFileName)
+            SocksstubSetLogSink(logURL.path)
+        }
+        var startErr: NSError?
+        SocksstubStart("127.0.0.1:\(socksPort)", &startErr)
+        if let startErr {
+            // "already listening" is fine on a hot-restart of the tunnel
+            // — surface but don't fail.
+            let msg = startErr.localizedDescription
+            if msg.contains("already listening") {
+                log("info: SocksStub: already listening, reusing")
+            } else {
+                log("error: SocksstubStart: \(msg)")
+                return false
+            }
+        }
+        var cfgErr: NSError?
+        SocksstubSetSamizdatConfig(configBlob, &cfgErr)
+        if let cfgErr {
+            log("error: SocksstubSetSamizdatConfig: \(cfgErr.localizedDescription)")
+            return false
+        }
+        return true
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
@@ -108,9 +152,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // bounded session count. socks5 endpoint = our main-app SOCKS5
         // listener on localhost. UDP-over-TCP keeps memory bounded for
         // QUIC-heavy traffic.
+        // Notes from the Path 3 audit:
+        //   - lwIP needs an explicit ipv4 in the tunnel block on some
+        //     code paths, otherwise it silently drops packets.
+        //   - connect-timeout 2 s (down from 5) — first DNS query
+        //     should not stall 5 s on a brief startup race.
         let yaml = """
 tunnel:
   mtu: 1280
+  ipv4: '198.18.0.1'
 
 socks5:
   port: \(Self.socksPort)
@@ -120,7 +170,7 @@ socks5:
 misc:
   task-stack-size: 24576
   log-level: 'warn'
-  connect-timeout: 5000
+  connect-timeout: 2000
   read-write-timeout: 60000
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
@@ -163,11 +213,13 @@ misc:
 
     // MARK: – utun fd discovery
 
-    /// Enumerates open file descriptors and returns the one that points at
-    /// the utun control socket NEPacketTunnelProvider opened for us.
-    /// Pattern from EbrahimTahernejad/Tun2SocksKit; works on every iOS
-    /// version since 13 because the kernel tags utun with a specific
-    /// AF_SYSTEM control name.
+    /// Enumerates open file descriptors and returns the highest-numbered
+    /// utun fd. NEPacketTunnelProvider mints a fresh utun for each
+    /// `startTunnel`; on devices with stale utun fds (multiple proxy
+    /// apps, hot-restarts), the FIRST matching fd may be a dead one.
+    /// Audit recommendation: take the largest fd that matches, since
+    /// kernel allocation is monotonic per session and the freshest
+    /// utun is what NEPacketTunnelProvider just opened for us.
     private static func findTunnelFileDescriptor() -> Int32? {
         var ctlInfo = ctl_info()
         withUnsafeMutablePointer(to: &ctlInfo.ctl_name) {
@@ -175,6 +227,7 @@ misc:
                 _ = strcpy($0, "com.apple.net.utun_control")
             }
         }
+        var best: Int32 = -1
         for fd: Int32 in 0...1024 {
             var addr = sockaddr_ctl()
             var ret: Int32 = -1
@@ -194,10 +247,12 @@ misc:
                 }
             }
             if addr.sc_id == ctlInfo.ctl_id {
-                return fd
+                if fd > best {
+                    best = fd
+                }
             }
         }
-        return nil
+        return best >= 0 ? best : nil
     }
 
     /// Best-effort TCP probe to see if the main app's SOCKS5 listener is up

@@ -51,10 +51,14 @@ targets:
           - $(PROJECT_DIR)/Frameworks
 
   # ── PacketTunnel network-extension target ───────────────────────────────
-  # Path 3: extension carries only HevSocks5Tunnel.xcframework (C/lwIP).
-  # No Go runtime, no gVisor, no samizdat client. Heavy proxy work lives
-  # in the main app's SocksStub Go listener (still bundled via
-  # SamizdatClient.xcframework but only on the main-app target).
+  # Path 3 final: extension carries hev (lwIP tun2socks, ~5-10 MB RSS)
+  # AND SamizdatClient.xcframework (Go runtime + samizdat H2 client +
+  # socksstub SOCKS5 bridge). hev forwards every flow to a
+  # 127.0.0.1:18443 SOCKS5 listener that the SocksStub Go code runs in
+  # this same process — eliminating the cross-process / app-suspend
+  # problem that an earlier "Go in main app" architecture had on iOS.
+  # Without gVisor (replaced by hev's lwIP), expected extension RSS is
+  # ~25-30 MB sustained, well under the iOS 50 MB cap.
   samizdat-tunnel:
     type: app-extension
     platform: iOS
@@ -66,6 +70,9 @@ targets:
           - "Bridging-Header.h"
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
+        embed: true
+        codeSign: true
+      - framework: Frameworks/SamizdatClient.xcframework
         embed: true
         codeSign: true
     settings:
