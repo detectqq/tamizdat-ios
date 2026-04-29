@@ -52,6 +52,14 @@ jobs:
             ./samizdat
           ls -la "${{ env.FRAMEWORK_OUT }}"
 
+      - name: Build HevSocks5Tunnel.xcframework
+        run: |
+          chmod +x scripts/build-hev-xcframework.sh
+          OUT_DIR="${{ github.workspace }}/Frameworks" \
+          WORK_DIR="${{ github.workspace }}/build/hev-build" \
+          scripts/build-hev-xcframework.sh
+          ls -la Frameworks/HevSocks5Tunnel.xcframework
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
