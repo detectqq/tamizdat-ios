@@ -339,15 +339,26 @@ misc:
         // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
         settings.ipv6Settings = nil
 
-        // Audit fix (final): do NOT install dnsSettings with matchDomains=[""].
-        // That would catch every DNS query into the tunnel; combined with
-        // hev's `udp: 'tcp'` (which expects a SOCKS5 UDP-ASSOCIATE handler
-        // we do not implement), DNS would be silently dropped and the
-        // user would see "VPN connects but nothing loads". Letting iOS
-        // resolve via the carrier/Wi-Fi default keeps DNS working; the
-        // tunnel still captures TCP traffic to resolved IPs because the
-        // ipv4 default route routes them through the utun.
-        settings.dnsSettings = nil
+        // IPA-J: force DNS through the tunnel.
+        //
+        // Earlier (IPA-F) we set dnsSettings = nil on the theory that iOS
+        // mDNSResponder would scope DNS queries to the underlying Wi-Fi
+        // interface (IP_BOUND_IF) and bypass the tunnel. On iOS 17/18 with
+        // a default-route VPN, this is not what happens: with no
+        // dnsSettings installed, iOS treats name resolution as broken
+        // ("iPhone не подключен к интернету"), the captive-portal probe
+        // to captive.apple.com fails, and Safari refuses to load even
+        // direct-IP URLs.
+        //
+        // Now that IPA-I added cmd=0x05 / FWD_UDP support in SocksStub
+        // backed by samizdat.Client.DialUDP, we can safely force DNS
+        // (UDP/53) through the tunnel: hev wraps it as cmd=0x05, our
+        // SocksStub opens a samizdat UDP tunnel to 1.1.1.1:53 / 8.8.8.8:53,
+        // and the response comes back the same way. matchDomains=[""]
+        // catches every domain (the empty-string match-all sentinel).
+        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
+        dns.matchDomains = [""]
+        settings.dnsSettings = dns
 
         return settings
     }
