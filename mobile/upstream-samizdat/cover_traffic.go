@@ -41,15 +41,24 @@ type coverDriver struct {
 	once    sync.Once
 }
 
-// defaultCoverTargets returns a set of common cover destinations. Used when
-// ClientConfig.CoverTargets is empty. All in RKN whitelist (never blocked).
+// defaultCoverTargets returns a diversified set of cover destinations that
+// mimics the background traffic mix a real RU browser produces while a user
+// is on a homepage: small-flow analytics beacons, medium-flow ad and CDN
+// fetches, short API calls. Compared to a homogeneous list of homepages
+// (compass v2 §5.6), this gives the H2 stream-size distribution a believable
+// shape and breaks the "5 identical hits to ok.ru/vk.com/mail.ru/..." pattern
+// that a passive collector could otherwise pin. All targets are RKN-whitelist
+// RU CDN/analytics endpoints that are never blocked.
 func defaultCoverTargets() []string {
 	return []string{
-		"ok.ru:443",
-		"vk.com:443",
-		"mail.ru:443",
-		"yandex.ru:443",
-		"dzen.ru:443",
+		"mc.yandex.ru:443",       // analytics beacon (~1-2 KB)
+		"an.yandex.ru:443",       // ad network (~5-15 KB)
+		"yastatic.net:443",       // CDN: fonts, scripts (~10-50 KB)
+		"top-fwz1.mail.ru:443",   // tracking pixel (~tiny)
+		"clck.yandex.ru:443",     // click counter (~tiny)
+		"sun9-1.userapi.com:443", // VK content CDN (~medium)
+		"api-maps.yandex.ru:443", // API endpoint (~small)
+		"id.vk.com:443",          // VK SSO (~small)
 	}
 }
 

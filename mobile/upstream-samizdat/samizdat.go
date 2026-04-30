@@ -94,12 +94,23 @@ func (c *ClientConfig) applyDefaults() {
 	if c.DrainTimeout == 0 {
 		c.DrainTimeout = 10 * time.Second
 	}
-	if c.MinTransports < 1 {
-		c.MinTransports = 1
-	}
+	// Security defaults are ON by default (compass v2/v3): callers must opt
+	// out via DisableDefaultSecurity (e.g. tests). The block below makes the
+	// URI form minimal -- a samizdat:// URI does not need to carry mintr/cap/
+	// cover/tcpfrag/recfrag fields; library forces the safe values.
 	if !c.DisableDefaultSecurity {
-		c.TCPFragmentation = c.TCPFragmentation || true
-		c.RecordFragmentation = c.RecordFragmentation || true
+		c.TCPFragmentation = true
+		c.RecordFragmentation = true
+		c.CoverTrafficEnabled = true
+		if c.MinTransports < 2 {
+			c.MinTransports = 2
+		}
+		if c.BytesPerTransportSoftCap == 0 {
+			c.BytesPerTransportSoftCap = 13312 // ~13 KiB, before TSPU #490 ~15-20 KB shaping
+		}
+	} else if c.MinTransports < 1 {
+		// even with security disabled, MinTransports must be >=1
+		c.MinTransports = 1
 	}
 }
 

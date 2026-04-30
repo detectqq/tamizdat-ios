@@ -194,6 +194,11 @@ func TestSamizdatConfigParse(t *testing.T) {
 		{"samizdat://shortie@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok", "shortid must be 16 hex chars"},
 		// neither pbk nor pubkey -> error.
 		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?sni=ok", "pubkey must be 64 hex chars"},
+
+		// IPA-N (URI scheme v2): v1-only tuning keys (mintr/cap/cover/cpool/
+		// tcpfrag/recfrag/idle/conn/drain/mstreams) are silently ignored.
+		// Forward-compat: parser accepts any unknown query key without error.
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok&mintr=2&cap=13312&cover=1&cpool=ok.ru,vk.com&tcpfrag=1&recfrag=1&idle=300000&conn=15000&drain=10000&mstreams=100&future_unknown_key=hello", ""},
 	}
 	for _, tc := range cases {
 		_, err := parseSamizdatURL(tc.blob)

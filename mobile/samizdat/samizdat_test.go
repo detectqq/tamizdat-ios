@@ -102,6 +102,7 @@ func TestParseConfig_XrayStyle(t *testing.T) {
 		{"xray with public-key-hex alias", "samizdat://" + sid + "@h:778?public-key-hex=" + pub + "&sni=ok.ru"},
 		{"xray with snipool", "samizdat://" + sid + "@h:778?pbk=" + pub + "&snipool=ok.ru,vk.com,mail.ru"},
 		{"userinfo OVERRIDES shortid= when both set", "samizdat://" + sid + "@h:777?pbk=" + pub + "&sni=x&shortid=" + strings.Repeat("c", 16)},
+		{"v1 keys silently ignored", "samizdat://" + sid + "@h:777?pbk=" + pub + "&sni=ok.ru&mintr=2&cap=13312&cover=1&cpool=a,b&tcpfrag=1&recfrag=1&idle=300000&conn=15000&drain=10000&mstreams=100&future_unknown=hello"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -340,15 +340,20 @@ func SetSamizdatConfig(blob string) error {
 	return nil
 }
 
+// samizdatConfig is the iOS-side view of a parsed samizdat:// URI.
+// Per URI-SCHEME.md v2 the URI carries only the four user-facing fields
+// (pbk, sni, snipool, fp); all tuning knobs (MinTransports, cover,
+// fragmentation, timeouts, ...) live in samizdat.ClientConfig defaults
+// via applyDefaults() and are not user-tunable from the string.
 type samizdatConfig struct {
-	ServerHost   string
-	ServerPort   int
-	SNI          string   // primary SNI (first of pool, kept for legacy code paths)
-	SNIPool      []string // optional rotation pool; empty = single-SNI mode
-	PubkeyHex    string
-	ShortIDHex   string   // primary shortID (first of pool)
-	ShortIDsHex  []string // optional rotation pool
-	Fingerprint  string
+	ServerHost  string
+	ServerPort  int
+	SNI         string   // primary SNI (first of pool, kept for legacy code paths)
+	SNIPool     []string // optional rotation pool; empty = single-SNI mode
+	PubkeyHex   string
+	ShortIDHex  string   // primary shortID (first of pool)
+	ShortIDsHex []string // optional rotation pool (always ≥1 entry)
+	Fingerprint string   // default "chrome"
 }
 
 // parseSamizdatURL parses both URL formats:
