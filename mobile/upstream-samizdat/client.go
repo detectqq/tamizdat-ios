@@ -2,13 +2,53 @@ package samizdat
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
 
 	utls "github.com/refraction-networking/utls"
 )
+
+
+
+// pickServerName returns a randomly-chosen SNI from the configured pool.
+// Falls back to legacy single ServerName when no pool is configured.
+// Per-transport rotation breaks the "all clients of one IP share one SNI"
+// behavioural correlation flagged by compass P1.1.
+func (c *Client) pickServerName() string {
+	pool := c.config.ServerNames
+	if len(pool) == 0 {
+		return c.config.ServerName
+	}
+	if len(pool) == 1 {
+		return pool[0]
+	}
+	var idx [8]byte
+	_, _ = rand.Read(idx[:])
+	i := int(binary.BigEndian.Uint64(idx[:])>>1) % len(pool)
+	return pool[i]
+}
+
+// pickShortID returns a randomly-chosen shortID from the configured pool. If
+// no pool is configured, falls back to the legacy single ShortID. Per-transport
+// rotation breaks the "fixed 8-byte SessionID prefix per server IP" signal.
+func (c *Client) pickShortID() [8]byte {
+	pool := c.config.ShortIDs
+	if len(pool) == 0 {
+		return c.config.ShortID
+	}
+	if len(pool) == 1 {
+		return pool[0]
+	}
+	var idx [8]byte
+	_, _ = rand.Read(idx[:])
+	i := int(binary.BigEndian.Uint64(idx[:])>>1) % len(pool) // >>1 avoids sign issues
+	return pool[i]
+}
 
 // Client dials connections through a Samizdat server. Multiple calls to
 // DialContext share the same underlying TLS+H2 connection via multiplexing.
@@ -18,6 +58,9 @@ type Client struct {
 	shaper             *Shaper
 	fragmenter         *RecordFragmenter
 	fingerprintChooser *fingerprintRotator
+	cover              *coverDriver
+	coverCtx           context.Context
+	coverCancel        context.CancelFunc
 	mu                 sync.Mutex
 	closed             bool
 }
@@ -43,7 +86,12 @@ func NewClient(config ClientConfig) (*Client, error) {
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
 	c.fingerprintChooser = newFingerprintRotator(config.Fingerprint)
-	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, c.createTransport)
+	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.BytesPerTransportSoftCap, c.createTransport)
+
+	if config.CoverTrafficEnabled {
+		c.coverCtx, c.coverCancel = context.WithCancel(context.Background())
+		c.cover = c.startCoverTraffic(c.coverCtx, config.CoverTrafficTargets)
+	}
 
 	return c, nil
 }
@@ -104,6 +152,12 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.coverCancel != nil {
+		c.coverCancel()
+	}
+	if c.cover != nil {
+		c.cover.close()
+	}
 	return c.pool.close()
 }
 
@@ -124,12 +178,17 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	var conn net.Conn = tcpConn
+	var fragmenter *Fragmenter
 	if c.config.TCPFragmentation {
-		conn = NewFragmenter(tcpConn, true)
+		// #7 adaptive Geneva: bandit picks strategy per server (host:port).
+		// Outcome reported below after handshake completes.
+		fragmenter = NewFragmenterWithStrategy(tcpConn, true, c.config.ServerAddr, "")
+		conn = fragmenter
 	}
 
+	sni := c.pickServerName()
 	tlsConfig := &utls.Config{
-		ServerName:         c.config.ServerName,
+		ServerName:         sni,
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2"},
 	}
@@ -137,41 +196,77 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	helloID := c.fingerprintChooser.pick()
 	uConn := utls.UClient(conn, tlsConfig, helloID)
 
-	ephPriv, ephPub, err := GenerateEphemeralKeyPair()
+	// compass v2 §5.1 Approach A (Reality-style): instead of generating a
+	// separate ephemeral X25519 keypair and stuffing the pub into a private
+	// extension 0xFE0C, we piggy-back on the X25519 keypair uTLS ALREADY
+	// generates for the standard TLS-1.3 key_share extension. Result: zero
+	// JA4-fingerprintable extensions appear in our ClientHello.
+	if err := uConn.BuildHandshakeState(); err != nil {
+		uConn.Close()
+		return nil, fmt.Errorf("building uTLS handshake state: %w", err)
+	}
+	ksk := uConn.HandshakeState.State13.KeyShareKeys
+	if ksk == nil || ksk.Ecdhe == nil {
+		uConn.Close()
+		return nil, fmt.Errorf("uTLS did not allocate X25519 KeyShareKeys (need standalone X25519 in client_shares)")
+	}
+	ephPub := ksk.Ecdhe.PublicKey().Bytes()
+	if len(ephPub) != x25519KeyLen {
+		uConn.Close()
+		return nil, fmt.Errorf("uTLS Ecdhe pubkey length %d, want %d", len(ephPub), x25519KeyLen)
+	}
+	shortID := c.pickShortID()
+
+	// Compute samizdat ECDH using uTLS's Ecdhe priv against the server's static pub.
+	serverStaticPub, err := ecdh.X25519().NewPublicKey(c.config.PublicKey)
 	if err != nil {
 		uConn.Close()
-		return nil, fmt.Errorf("generating ephemeral keypair: %w", err)
+		return nil, fmt.Errorf("parsing server static pub: %w", err)
 	}
-	psk, err := DeriveClientPSK(ephPriv, c.config.PublicKey, c.config.ShortID)
+	shared, err := ksk.Ecdhe.ECDH(serverStaticPub)
 	if err != nil {
 		uConn.Close()
-		return nil, fmt.Errorf("deriving ECDH PSK: %w", err)
+		return nil, fmt.Errorf("ECDH(uTLS Ecdhe priv, server static pub): %w", err)
 	}
-	sessionID, err := BuildSessionIDv1(psk, c.config.ShortID, ephPub, nil)
+	psk, err := DerivePSKFromSharedSecret(shared, shortID)
+	if err != nil {
+		uConn.Close()
+		return nil, fmt.Errorf("deriving samizdat PSK from shared secret: %w", err)
+	}
+	sessionID, err := BuildSessionIDv1(psk, shortID, ephPub, nil)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("building session ID v1: %w", err)
 	}
-	keyShareExt, err := MarshalKeyShareExtension(ephPub)
-	if err != nil {
-		uConn.Close()
-		return nil, fmt.Errorf("marshaling keyshare extension: %w", err)
-	}
 
-	if err := c.applyAuthToClientHello(uConn, sessionID[:], keyShareExt); err != nil {
+	// Inject SessionID into the (already-built) handshake state and re-marshal.
+	// No 0xFE0C extension is added -- server reads the pubkey from the standard
+	// key_share extension instead.
+	uConn.HandshakeState.Hello.SessionId = make([]byte, len(sessionID))
+	copy(uConn.HandshakeState.Hello.SessionId, sessionID[:])
+	if err := uConn.MarshalClientHello(); err != nil {
 		uConn.Close()
-		return nil, fmt.Errorf("applying auth: %w", err)
+		return nil, fmt.Errorf("re-marshaling ClientHello after SessionID inject: %w", err)
 	}
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
+		if fragmenter != nil {
+			fragmenter.ReportOutcome(false)
+		}
 		uConn.Close()
 		return nil, fmt.Errorf("TLS handshake: %w", err)
 	}
 
 	state := uConn.ConnectionState()
 	if state.NegotiatedProtocol != "h2" {
+		if fragmenter != nil {
+			fragmenter.ReportOutcome(false)
+		}
 		uConn.Close()
 		return nil, fmt.Errorf("expected h2, got %q", state.NegotiatedProtocol)
+	}
+	if fragmenter != nil {
+		fragmenter.ReportOutcome(true)
 	}
 
 	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout)
@@ -181,50 +276,6 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	return transport, nil
-}
-
-func (c *Client) applyAuthToClientHello(uConn *utls.UConn, sessionID []byte, keyShareExtension []byte) error {
-	if err := uConn.BuildHandshakeState(); err != nil {
-		return fmt.Errorf("building handshake state: %w", err)
-	}
-	uConn.HandshakeState.Hello.SessionId = make([]byte, len(sessionID))
-	copy(uConn.HandshakeState.Hello.SessionId, sessionID)
-	if len(keyShareExtension) > 0 {
-		if len(keyShareExtension) < 4 {
-			return fmt.Errorf("keyshare extension too short: %d", len(keyShareExtension))
-		}
-		extPayload := make([]byte, len(keyShareExtension)-4)
-		copy(extPayload, keyShareExtension[4:])
-		uConn.Extensions = withoutSamizdatKeyShareExtension(uConn.Extensions)
-		uConn.Extensions = append(uConn.Extensions, &utls.GenericExtension{
-			Id:   SamizdatKeyShareExtensionType,
-			Data: extPayload,
-		})
-	}
-	if err := uConn.MarshalClientHello(); err != nil {
-		return fmt.Errorf("marshaling client hello: %w", err)
-	}
-	return nil
-}
-
-func withoutSamizdatKeyShareExtension(exts []utls.TLSExtension) []utls.TLSExtension {
-	if len(exts) == 0 {
-		return exts
-	}
-	filtered := exts[:0]
-	for _, ext := range exts {
-		if ext == nil || ext.Len() < 2 {
-			filtered = append(filtered, ext)
-			continue
-		}
-		buf := make([]byte, ext.Len())
-		n, _ := ext.Read(buf)
-		if n >= 2 && uint16(buf[0])<<8|uint16(buf[1]) == SamizdatKeyShareExtensionType {
-			continue
-		}
-		filtered = append(filtered, ext)
-	}
-	return filtered
 }
 
 type tlsConnWrapper struct {

@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"context"
+	"os"
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
@@ -52,6 +53,14 @@ type Server struct {
 	debugMu       sync.Mutex
 	debugListener net.Listener
 	debugServer   *http.Server
+
+	// MED-4: track in-flight TCP connections so Server.Close can actively
+	// terminate them. Without this, h2Server.ServeConn parks on tlsConn.Read
+	// and wg.Wait() blocks forever, breaking systemd graceful-shutdown.
+	activeConns sync.Map // map[net.Conn]struct{}
+
+	// Per-IP rate-limiter on masquerade forwards (compass v2 §3.11 DoS protection).
+	masqLimiter *masqueradeRateLimiter
 }
 
 // NewServer creates a new Samizdat server.
@@ -96,6 +105,23 @@ func NewServer(config ServerConfig) (*Server, error) {
 		cancel:       cancel,
 	}
 
+	// Aparecium audit fix: pad cert chain to ~3.5 KB extra so encrypted
+	// Certificate flight in TLS 1.3 handshake matches the size of a real
+	// CDN cert chain (e.g. ok.ru â GlobalSign chain ~4 KB DER). Without
+	// padding our self-signed single cert (~1 KB) gives a passive size-based
+	// detector signal even though TLS 1.3 encrypts cert content.
+	if cached != nil && len(cached.Certificate) > 0 {
+		padded, perr := padCertChain(cached.Certificate, 4200, 3)
+		if perr == nil {
+			cached.Certificate = padded
+		}
+		// On padding failure (rsa.GenerateKey error etc.) we silently keep
+		// the un-padded chain rather than fail server startup. Detection
+		// risk degrades gracefully.
+	}
+
+	s.masqLimiter = newMasqueradeRateLimiter()
+
 	if config.MasqueradeDomain != "" {
 		s.masquerade = NewMasquerade(
 			config.MasqueradeDomain,
@@ -126,6 +152,7 @@ func (s *Server) logf(format string, args ...any) {
 }
 
 func (s *Server) startDebugExpvar() error {
+	initTelemetry()
 	initReplayExpvars()
 	addr := s.config.DebugListenAddr
 	if addr == "" {
@@ -216,6 +243,18 @@ func (s *Server) Close() error {
 			err = derr
 		}
 	}
+	// MED-4: actively terminate in-flight TCP connections so handleConnection
+	// goroutines unblock from Read and wg.Wait() can return. Without this,
+	// SIGINT-driven shutdown hangs until every TCP peer FINs (or never).
+	s.activeConns.Range(func(k, _ any) bool {
+		if c, ok := k.(net.Conn); ok {
+			_ = c.Close()
+		}
+		return true
+	})
+	if s.masqLimiter != nil {
+		s.masqLimiter.close()
+	}
 	s.wg.Wait()
 	return err
 }
@@ -237,6 +276,10 @@ func (s *Server) Addr() net.Addr {
 // 3. If auth passes: complete TLS handshake, enter H2 proxy mode
 // 4. If auth fails or replayed: masquerade (forward to real domain)
 func (s *Server) handleConnection(conn net.Conn) {
+	// MED-4: register this conn so Close() can terminate it.
+	s.activeConns.Store(conn, struct{}{})
+	defer s.activeConns.Delete(conn)
+	safeIntAdd(connectTotal, 1)
 	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -252,9 +295,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	keyShareExt, ok := extractSamizdatKeyShareFromClientHello(handshakeMsg)
-	if !ok {
-		s.logf("[samizdat] missing or malformed P0.3 keyshare extension")
+	// Standard TLS-1.3 key_share auth (compass v2 §5.1 fully migrated; legacy
+	// 0xFE0C extension path removed in compass v3 cleanup -- 24h+ soak passed).
+	ephPub, err := ExtractX25519FromKeyShare(handshakeMsg)
+	if err != nil {
+		s.logf("[samizdat] ephemeral pubkey extraction failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
@@ -270,9 +315,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	psk, ephPub, err := DerivePSKFromExtension(s.config.PrivateKey, keyShareExt, shortID)
+	psk, err := DeriveServerPSK(s.config.PrivateKey, ephPub[:], shortID)
 	if err != nil {
-		s.logf("[samizdat] deriving P0.3 PSK failed: %v", err)
+		s.logf("[samizdat] deriving PSK failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
@@ -291,23 +336,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		var replayKey [replayKeyLen]byte
 		copy(replayKey[:], digest.Sum(nil)[:replayKeyLen])
 		if !s.replayGuard.checkV1(replayKey) {
+			safeIntAdd(connectReplay, 1)
 			s.doMasquerade(conn, clientHelloRecord)
 			return
 		}
 	}
 
+	safeIntAdd(connectAuthOK, 1)
 	s.handleAuthenticated(conn, clientHelloRecord, verifiedShortID)
-}
-
-// extractSamizdatKeyShareFromClientHello returns the full P0.3 samizdat_keyshare
-// extension wire image from a TLS ClientHello. Absent, malformed, or unsupported
-// extensions all return false so callers can uniformly fork to masquerade.
-func extractSamizdatKeyShareFromClientHello(clientHello []byte) ([]byte, bool) {
-	ext, err := ExtractSamizdatKeyShareExtension(clientHello)
-	if err != nil {
-		return nil, false
-	}
-	return ext, true
 }
 
 // doMasquerade forwards the connection to the real masquerade domain.
@@ -315,7 +351,26 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 	if s.masquerade == nil {
 		return
 	}
-	s.masquerade.ProxyConnection(conn, clientHelloRecord)
+	// compass v2 §3.11: per-IP rate-limit on masquerade forwards.
+	if !s.masqLimiter.allow(extractRemoteIP(conn)) {
+		safeIntAdd(masqRateLimited, 1)
+		return
+	}
+	safeIntAdd(connectMasquerade, 1)
+	// Cover-SNI rotation (compass P1.1): parse SNI from buffered ClientHello,
+	// look up matching origin in MasqueradePool. Empty/unknown SNI → default.
+	originDomain := ""
+	if len(s.config.MasqueradePool) > 0 {
+		// clientHelloRecord includes 5-byte TLS record header; strip it for handshake parser.
+		if len(clientHelloRecord) > 5 {
+			if sni, err := parseSNIFromClientHello(clientHelloRecord[5:]); err == nil && sni != "" {
+				if origin, ok := s.config.MasqueradePool[sni]; ok && origin != "" {
+					originDomain = origin
+				}
+			}
+		}
+	}
+	s.masquerade.ProxyConnectionWithOrigin(conn, clientHelloRecord, originDomain)
 }
 
 // shadowDialOrigin absorbs the masquerade origin TCP dial RTT on the
@@ -366,14 +421,26 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, id
 		Certificates: []tls.Certificate{*s.cachedCert},
 		NextProtos:   []string{"h2"},
 		MinVersion:   tls.VersionTLS13,
+		// Aparecium NST mitigation v2 (compass deep-research v2 finding):
+		// Earlier probe with OpenSSL ClientHello to ok.ru returned 0 NST, but
+		// re-probe with real Chrome ClientHello (utls.HelloChrome_Auto) returns
+		// ~40 bytes post-handshake = 1 small NST. Since samizdat uses utls
+		// Chrome by default, the matching origin-pattern is Go's default 1 NST,
+		// not zero. Leave SessionTicketsDisabled=false (default) so Go emits 1
+		// NewSessionTicket after ClientFinished -- closes the Aparecium PoC's
+		// "no NST after ClientFinished" detector.
+		SessionTicketsDisabled: false,
 	}
 
 	tlsConn := tls.Server(replayConn, tlsConfig)
+	hsStart := time.Now()
 	if err := tlsConn.HandshakeContext(s.ctx); err != nil {
 		tlsConn.Close()
 		return
 	}
 
+	handshakeDurationNanosSum.Add(int64(time.Since(hsStart)))
+	handshakeDurationNanosCount.Add(1)
 	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
 		tlsConn.Close()
 		return
@@ -386,6 +453,19 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, id
 func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 	h2Server := &http2.Server{
 		MaxConcurrentStreams: uint32(s.config.MaxConcurrentStreams),
+		// OPT-2: server-side H2 PING keepalive. golang.org/x/net/http2 server
+		// sends PING after IdleTimeout of inactivity; if no PONG within
+		// PingTimeout, server tears down the connection. Defends symmetrically
+		// against NAT-table eviction and detects half-open connections.
+		IdleTimeout: 60 * time.Second,
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     10 * time.Second,
+		// OPT-1: per-stream initial upload window so client uploads aren't
+		// capped at default 64 KB. Also bump connection-level via
+		// MaxUploadBufferPerConnection. Matches NaiveProxy/Hysteria tuning.
+		MaxUploadBufferPerConnection: 16 << 20, // 16 MiB
+		MaxUploadBufferPerStream:     4 << 20,  //  4 MiB
+		MaxReadFrameSize:             1 << 20,  //  1 MiB
 	}
 	flow := &h2Transport{
 		tlsConn:      tlsConn,
@@ -533,11 +613,25 @@ type serverStreamConn struct {
 	debug      bool
 	closed     atomic.Bool
 	mu         sync.Mutex
+
+	// HIGH-2: deadline enforcement to satisfy net.Conn contract.
+	// rd / wd store the deadline as Unix nanos (0 = no deadline). Read/Write
+	// check before blocking; rdTimer/wdTimer fire reader.Close() when the
+	// deadline elapses while a Read is parked, which propagates io.EOF to
+	// the blocked goroutine.
+	rd      atomic.Int64
+	wd      atomic.Int64
+	dlMu    sync.Mutex
+	rdTimer *time.Timer
+	wdTimer *time.Timer
 }
 
 func (sc *serverStreamConn) Read(b []byte) (int, error) {
 	if sc.closed.Load() {
 		return 0, net.ErrClosed
+	}
+	if t := sc.rd.Load(); t != 0 && t <= time.Now().UnixNano() {
+		return 0, os.ErrDeadlineExceeded
 	}
 	return sc.reader.Read(b)
 }
@@ -611,9 +705,79 @@ func (sc *serverStreamConn) CloseWrite() error {
 
 func (sc *serverStreamConn) LocalAddr() net.Addr                { return &streamAddr{"tcp", "server"} }
 func (sc *serverStreamConn) RemoteAddr() net.Addr               { return &streamAddr{"tcp", "client"} }
-func (sc *serverStreamConn) SetDeadline(t time.Time) error      { return nil }
-func (sc *serverStreamConn) SetReadDeadline(t time.Time) error  { return nil }
-func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error { return nil }
+// SetDeadline sets both read and write deadlines. Implements net.Conn contract:
+// blocked Read/Write returns os.ErrDeadlineExceeded after t; t.IsZero() clears.
+func (sc *serverStreamConn) SetDeadline(t time.Time) error {
+	_ = sc.SetReadDeadline(t)
+	_ = sc.SetWriteDeadline(t)
+	return nil
+}
+
+func (sc *serverStreamConn) SetReadDeadline(t time.Time) error {
+	sc.dlMu.Lock()
+	defer sc.dlMu.Unlock()
+	if sc.rdTimer != nil {
+		sc.rdTimer.Stop()
+		sc.rdTimer = nil
+	}
+	if t.IsZero() {
+		sc.rd.Store(0)
+		return nil
+	}
+	sc.rd.Store(t.UnixNano())
+	d := time.Until(t)
+	if d <= 0 {
+		// Already past: close reader so any in-flight Read returns immediately.
+		_ = sc.reader.Close()
+		return nil
+	}
+	sc.rdTimer = time.AfterFunc(d, func() {
+		// Re-check the stored deadline in case it was reset to a later time
+		// before the timer fired. If it was, do nothing.
+		now := time.Now().UnixNano()
+		if cur := sc.rd.Load(); cur != 0 && cur <= now {
+			_ = sc.reader.Close()
+		}
+	})
+	return nil
+}
+
+func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error {
+	sc.dlMu.Lock()
+	defer sc.dlMu.Unlock()
+	if sc.wdTimer != nil {
+		sc.wdTimer.Stop()
+		sc.wdTimer = nil
+	}
+	if t.IsZero() {
+		sc.wd.Store(0)
+		return nil
+	}
+	sc.wd.Store(t.UnixNano())
+	d := time.Until(t)
+	if d <= 0 {
+		// Already past: shut down the write side so in-flight Writes fail fast.
+		_ = sc.shutdownWriteSide()
+		return nil
+	}
+	sc.wdTimer = time.AfterFunc(d, func() {
+		now := time.Now().UnixNano()
+		if cur := sc.wd.Load(); cur != 0 && cur <= now {
+			_ = sc.shutdownWriteSide()
+		}
+	})
+	return nil
+}
+
+// shutdownWriteSide is a best-effort: closes the underlying reader (which
+// drives the H2 stream lifecycle); the H2 framer will propagate RST_STREAM,
+// failing any subsequent Write.
+func (sc *serverStreamConn) shutdownWriteSide() error {
+	if sc.closed.Swap(true) {
+		return nil
+	}
+	return sc.reader.Close()
+}
 
 // syncReader serializes concurrent reads with a mutex.
 type syncReader struct {
@@ -647,6 +811,10 @@ func (fw flushWriter) Flush() {
 // proxies data bidirectionally.
 func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) {
 	defer conn.Close()
+	safeIntAdd(tunnelsTCPOpened, 1)
+	defer safeIntAdd(tunnelsTCPClosed, 1)
+	var flowBytes int64
+	defer func() { observeFlowBytes(flowBytes) }()
 
 	host, port, err := net.SplitHostPort(destination)
 	if err != nil {
@@ -659,6 +827,7 @@ func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) 
 	// window between validation and net.Dial's own resolver.
 	target, err := ResolveAndValidateDestination(ctx, host, port)
 	if err != nil {
+		safeIntAdd(ssrfRejectedTCP, 1)
 		return
 	}
 
@@ -673,7 +842,9 @@ func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) 
 
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, conn)
+		n, _ := io.Copy(targetConn, conn)
+		atomic.AddInt64(&flowBytes, n)
+		bytesClientToTarget.Add(n)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -681,7 +852,9 @@ func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) 
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, targetConn)
+		n, _ := io.Copy(conn, targetConn)
+		atomic.AddInt64(&flowBytes, n)
+		bytesTargetToClient.Add(n)
 		// HIGH-6: when target sends EOF, propagate write-close to the H2 stream
 		// so the client's blocking Read(s) on its side can wake up cleanly.
 		if cw, ok := conn.(interface{ CloseWrite() error }); ok {

@@ -69,13 +69,38 @@ func (c *idleConn) readDeadline() time.Time {
 // ProxyConnection forwards a non-authenticated connection to the real domain.
 // clientHello contains the buffered raw ClientHello bytes that triggered the
 // auth check failure. conn is the raw TCP connection from the probe (pre-TLS).
+// ProxyConnectionWithOrigin is the SNI-aware variant. originDomain overrides
+// m.OriginDomain when non-empty (cover-SNI rotation -- compass P1.1). If
+// originDomain is empty, falls back to default m.OriginDomain. originAddr
+// is recomputed from originDomain unless explicitly overridden.
+func (m *Masquerade) ProxyConnectionWithOrigin(conn net.Conn, clientHello []byte, originDomain string) error {
+	var addr string
+	switch {
+	case originDomain == "" || originDomain == m.OriginDomain:
+		// Default origin — honour MasqueradeAddr override if set.
+		addr = m.OriginAddr
+		if addr == "" {
+			addr = net.JoinHostPort(m.OriginDomain, "443")
+		}
+	default:
+		// Pool entry — resolve via DNS to its own :443.
+		addr = net.JoinHostPort(originDomain, "443")
+	}
+	return m.proxyTo(conn, clientHello, addr)
+}
+
 func (m *Masquerade) ProxyConnection(conn net.Conn, clientHello []byte) error {
-	// Resolve origin address if needed
 	addr := m.OriginAddr
 	if addr == "" {
 		addr = net.JoinHostPort(m.OriginDomain, "443")
 	}
+	return m.proxyTo(conn, clientHello, addr)
+}
 
+// proxyTo carries the actual TCP-level forward to a resolved address.
+// Shared between ProxyConnection (default) and ProxyConnectionWithOrigin
+// (SNI-routed pool).
+func (m *Masquerade) proxyTo(conn net.Conn, clientHello []byte, addr string) error {
 	// Connect to the real domain
 	originConn, err := net.DialTimeout("tcp", addr, m.DialTimeout)
 	if err != nil {
@@ -109,7 +134,8 @@ func (m *Masquerade) ProxyConnection(conn net.Conn, clientHello []byte) error {
 	// probe -> origin
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(originIdleConn, clientConn)
+		n, err := io.Copy(originIdleConn, clientConn)
+		masqueradeBytesForwarded.Add(n)
 		if err != nil {
 			errOnce.Do(func() { copyErr = err })
 		}
@@ -122,7 +148,8 @@ func (m *Masquerade) ProxyConnection(conn net.Conn, clientHello []byte) error {
 	// origin -> probe
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(clientConn, originIdleConn)
+		n, err := io.Copy(clientConn, originIdleConn)
+		masqueradeBytesForwarded.Add(n)
 		if err != nil {
 			errOnce.Do(func() { copyErr = err })
 		}

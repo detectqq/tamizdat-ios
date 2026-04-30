@@ -41,6 +41,10 @@ type h2Transport struct {
 	// transport from BytesPerFlowThreshold ± BytesThresholdJitter. draining
 	// makes connpool skip this flow for new streams; existing streams finish.
 	effectiveThreshold int64
+	// bytesSoftCap > 0: marks draining when bytesSent >= cap. Independent of
+	// effectiveThreshold (which stays MaxInt64 in the post-BBCR design).
+	// Set by connpool from ClientConfig.BytesPerTransportSoftCap.
+	bytesSoftCap int64
 	drainTimeout       time.Duration
 	draining           atomic.Bool
 	drainCloseStarted  atomic.Bool
@@ -70,6 +74,19 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		},
 		AllowHTTP:          false,
 		DisableCompression: true,
+		// OPT-2 + compass v2 §5.8 H2 SETTINGS Chrome-mimicry. Stock Go h2.Transport
+		// can't control everything Chrome sends (initial-window-size in SETTINGS
+		// frame is hard-coded; SETTINGS frame ordering can't be customized; full
+		// Akamai/JA4H parity would require forking x/net/http2). Within stock Go
+		// we tune what's exposed:
+		//   - HEADER_TABLE_SIZE = 65536   (Chrome matches)
+		//   - MAX_HEADER_LIST_SIZE = 262144 (Chrome matches)
+		//   - ENABLE_PUSH = 0             (Go default, matches Chrome)
+		//   - MAX_FRAME_SIZE = (default)  (Chrome client also doesn't set this)
+		ReadIdleTimeout:           30 * time.Second,
+		PingTimeout:               10 * time.Second,
+		MaxDecoderHeaderTableSize: 1 << 16, // 65536, Chrome
+		MaxHeaderListSize:         262144,  // Chrome
 	}
 	t.h2Roundtrip = h2t
 	t.touch()
@@ -99,6 +116,12 @@ func (t *h2Transport) addBytesSent(n int) {
 	}
 	total := t.bytesSent.Add(estimatedOuterWireBytes(n))
 	if t.effectiveThreshold > 0 && total >= t.effectiveThreshold {
+		t.markDraining()
+	}
+	// #6 multi-conn fallback: per-transport soft cap. When set, drain this
+	// transport so connpool round-robins to siblings; reaper spawns a fresh
+	// replacement. Used to evict transports approaching #490 byte threshold.
+	if t.bytesSoftCap > 0 && total >= t.bytesSoftCap {
 		t.markDraining()
 	}
 }
@@ -149,7 +172,15 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
 
-	stop()
+	// MED-2: if stop() returns false, the AfterFunc already fired (or is firing),
+	// meaning ctx was cancelled before/during RoundTrip. The success-looking
+	// resp is racy -- treat the dial as cancelled.
+	if !stop() {
+		resp.Body.Close()
+		pw.Close()
+		tunnelCancel()
+		return nil, fmt.Errorf("CONNECT to %s: caller context cancelled mid-dial", destination)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -158,7 +189,9 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("CONNECT to %s returned status %d", destination, resp.StatusCode)
 	}
 
-	t.activeStreams.Add(1)
+	// activeStreams already incremented by reserveStreamSlot in connpool.getTransport.
+	// (Belt-and-braces: if caller used the public API directly w/o reservation,
+	// stream count drift is bounded by maxStreams+1 -- next reserveStreamSlot retries.)
 
 	rwc := &h2StreamRWC{
 		reader:       resp.Body,
@@ -221,7 +254,13 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 		return nil, fmt.Errorf("UDP CONNECT to %s: %w", destination, err)
 	}
 
-	stop()
+	// MED-2: stop() race -- see openTunnel for the rationale.
+	if !stop() {
+		resp.Body.Close()
+		pw.Close()
+		tunnelCancel()
+		return nil, fmt.Errorf("UDP CONNECT to %s: caller context cancelled mid-dial", destination)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -230,7 +269,9 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 		return nil, fmt.Errorf("UDP CONNECT to %s returned status %d", destination, resp.StatusCode)
 	}
 
-	t.activeStreams.Add(1)
+	// activeStreams already incremented by reserveStreamSlot in connpool.getTransport.
+	// (Belt-and-braces: if caller used the public API directly w/o reservation,
+	// stream count drift is bounded by maxStreams+1 -- next reserveStreamSlot retries.)
 
 	return &h2StreamRWC{
 		reader:       resp.Body,
@@ -241,8 +282,35 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 }
 
 // hasCapacity returns true if the transport can accept more streams.
+// Read-only -- racy by design. Use reserveStreamSlot for atomic claim.
 func (t *h2Transport) hasCapacity() bool {
 	return !t.isDraining() && int(t.activeStreams.Load()) < t.maxStreams
+}
+
+// reserveStreamSlot atomically increments activeStreams iff the transport
+// is not draining/closed and is under maxStreams. Returns true on success.
+// HIGH-4: prevents the TOCTOU oversubscription where two callers each pass
+// hasCapacity() at activeStreams=99 and then both Add(1) -> 101 > 100.
+func (t *h2Transport) reserveStreamSlot() bool {
+	for {
+		if t.isClosed() || t.isDraining() {
+			return false
+		}
+		cur := t.activeStreams.Load()
+		if int(cur) >= t.maxStreams {
+			return false
+		}
+		if t.activeStreams.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+		// CAS lost; retry
+	}
+}
+
+// releaseStreamSlot decrements activeStreams. Pair with reserveStreamSlot
+// when openTunnel fails after reservation succeeded.
+func (t *h2Transport) releaseStreamSlot() {
+	t.activeStreams.Add(-1)
 }
 
 // streamCount returns the number of active streams.
@@ -300,22 +368,21 @@ func (s *h2StreamRWC) Close() error {
 	s.once.Do(func() {
 		closeErr = s.closeWriter()
 
-		// iOS-vendor patch: don't spawn a 5s drain goroutine.
-		// On the iOS NEPacketTunnelProvider with its 50 MB cap, the
-		// upstream's "drain reader for HTTP semantics" goroutine adds
-		// hundreds of leaked goroutines under Speedtest churn (one per
-		// closed stream, alive up to 5s). For a CONNECT/UDP tunnel the
-		// drain has no semantic meaning — the wrapped relay() side has
-		// already returned, both halves of the duplex are torn down.
-		// Synchronous close is enough.
-		_ = s.reader.Close()
-		if s.tunnelCancel != nil {
-			s.tunnelCancel()
-		}
-		remaining := s.transport.activeStreams.Add(-1)
-		if remaining == 0 && s.transport.isDraining() {
-			_ = s.transport.close()
-		}
+		go func() {
+			timer := time.AfterFunc(5*time.Second, func() {
+				s.reader.Close()
+			})
+			io.Copy(io.Discard, s.reader)
+			timer.Stop()
+			s.reader.Close()
+			if s.tunnelCancel != nil {
+				s.tunnelCancel()
+			}
+			remaining := s.transport.activeStreams.Add(-1)
+			if remaining == 0 && s.transport.isDraining() {
+				_ = s.transport.close()
+			}
+		}()
 	})
 	return closeErr
 }

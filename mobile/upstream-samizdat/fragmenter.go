@@ -1,7 +1,8 @@
 package samizdat
 
 import (
-	mrand "math/rand/v2"
+	"crypto/rand"
+	"math/big"
 	"net"
 	"sync"
 	"time"
@@ -18,19 +19,45 @@ type Fragmenter struct {
 	tcpFragment   bool
 	minDelay      time.Duration
 	maxDelay      time.Duration
+	// #7 adaptive Geneva: per-conn picked strategy + server key for bandit reporting.
+	strategyName string
+	serverAddr   string
 }
 
 // NewFragmenter creates a fragmenter that wraps the given connection.
 // If tcpFragment is true, the first write (ClientHello) will be split
-// across multiple TCP segments.
+// across multiple TCP segments using the default strategy.
 func NewFragmenter(conn net.Conn, tcpFragment bool) *Fragmenter {
-	return &Fragmenter{
-		conn:        conn,
-		firstWrite:  true,
-		tcpFragment: tcpFragment,
-		minDelay:    1 * time.Millisecond,
-		maxDelay:    20 * time.Millisecond,
+	return NewFragmenterWithStrategy(conn, tcpFragment, "", "")
+}
+
+// NewFragmenterWithStrategy is the adaptive-Geneva variant: serverAddr is
+// the bandit key (host:port) and strategy is the picked name (empty =
+// the bandit picks now). Outcome of the subsequent handshake feeds back
+// into the bandit via Fragmenter.ReportOutcome.
+func NewFragmenterWithStrategy(conn net.Conn, tcpFragment bool, serverAddr, strategy string) *Fragmenter {
+	if strategy == "" && serverAddr != "" {
+		strategy = globalGenevaBandit.pick(serverAddr)
 	}
+	return &Fragmenter{
+		conn:         conn,
+		firstWrite:   true,
+		tcpFragment:  tcpFragment,
+		minDelay:     1 * time.Millisecond,
+		maxDelay:     20 * time.Millisecond,
+		strategyName: strategy,
+		serverAddr:   serverAddr,
+	}
+}
+
+// ReportOutcome reports the success or failure of the handshake that used
+// this fragmenter. Called by client.createTransport once it knows whether
+// the TLS handshake succeeded.
+func (f *Fragmenter) ReportOutcome(won bool) {
+	if f.serverAddr == "" || f.strategyName == "" {
+		return
+	}
+	globalGenevaBandit.reportOutcome(f.serverAddr, f.strategyName, won)
 }
 
 // Write implements net.Conn.Write. The first call fragments the ClientHello;
@@ -51,9 +78,19 @@ func (f *Fragmenter) Write(b []byte) (int, error) {
 // Strategy: find the SNI extension boundary and split there, with an
 // additional random split point for robustness.
 func (f *Fragmenter) fragmentClientHello(data []byte) (int, error) {
+	// MED-8: defensive min-size gate -- skip fragmentation for unrealistic
+	// tiny payloads to avoid degenerate split sizes.
+	if len(data) < 40 {
+		return f.conn.Write(data)
+	}
+
+	// #7 adaptive Geneva: if the bandit picked a named strategy, dispatch
+	// to it. Otherwise fall through to the legacy SNI-split path below.
+	if f.strategyName != "" {
+		return f.writeSegments(strategyByName(f.strategyName)(data))
+	}
 	splitPoint := f.findSNISplitPoint(data)
 	if splitPoint <= 0 || splitPoint >= len(data) {
-		// Fallback: split at a random point in the first half
 		splitPoint = randomInt(20, len(data)/2)
 	}
 
@@ -100,6 +137,24 @@ func (f *Fragmenter) fragmentClientHello(data []byte) (int, error) {
 // findSNISplitPoint scans the ClientHello for the SNI extension and returns
 // a split point at the beginning of the SNI value (the domain name bytes).
 // This forces the DPI to reassemble TCP segments to extract the SNI.
+
+// writeSegments writes a slice of byte segments sequentially with a randomized
+// inter-segment delay. Returns total bytes written + first error (if any).
+func (f *Fragmenter) writeSegments(segs [][]byte) (int, error) {
+	total := 0
+	for i, seg := range segs {
+		if i > 0 {
+			f.randomDelay()
+		}
+		n, err := f.conn.Write(seg)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 func (f *Fragmenter) findSNISplitPoint(data []byte) int {
 	// Look for the TLS record header
 	if len(data) < 5 {
@@ -197,20 +252,12 @@ func (f *Fragmenter) SetReadDeadline(t time.Time) error   { return f.conn.SetRea
 func (f *Fragmenter) SetWriteDeadline(t time.Time) error  { return f.conn.SetWriteDeadline(t) }
 
 // randomInt returns a random int in [min, max).
-//
-// iOS-vendor patch: was crypto/rand on every call. crypto/rand on iOS is
-// getentropy() — tens of microseconds per call plus a syscall. With ~50K
-// fragments/sec under Speedtest the cumulative cost was significant CPU
-// (and arguably a contributor to the iOS extension watchdog reaping us).
-// Switched to math/rand/v2 (PCG, seeded from crypto/rand at startup), which
-// is ~10ns/call and lock-free per-goroutine. The randomness is only used
-// to confuse passive packet-counters / DPI heuristics; cryptographic
-// quality is not required.
 func randomInt(min, max int) int {
 	if min >= max {
 		return min
 	}
-	return min + mrand.IntN(max-min)
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
+	return min + int(n.Int64())
 }
 
 // randomDuration returns a random duration in [min, max).
@@ -218,5 +265,6 @@ func randomDuration(min, max time.Duration) time.Duration {
 	if min >= max {
 		return min
 	}
-	return min + time.Duration(mrand.Int64N(int64(max-min)))
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
+	return min + time.Duration(n.Int64())
 }

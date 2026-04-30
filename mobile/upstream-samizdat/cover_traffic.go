@@ -1,0 +1,136 @@
+package samizdat
+
+import (
+	"context"
+	"encoding/binary"
+	"crypto/rand"
+	"io"
+	"net"
+	"sync"
+	"time"
+)
+
+// startCoverTraffic spawns a goroutine that periodically opens H2 CONNECT
+// streams to cover-site URLs through the samizdat tunnel. The goal: make
+// per-IP H2-stream-distribution look like "real browser to ok.ru with side
+// streams" instead of "every stream is user-driven samizdat traffic".
+//
+// Compass v2 §5.6 + USENIX Sec 2024 (Xue et al.): random fragmentation
+// alone doesn't fully defeat encapsulated-TLS-handshake fingerprinting;
+// mixing real cover requests on the same H2 session is the actually-effective
+// counter.
+//
+// Each cover request opens a CONNECT to one of the cover targets (ok.ru:443,
+// vk.com:443, mail.ru:443 -- all in RKN whitelist), reads a small amount,
+// closes. Frequency: random 30-90s gap. Cover targets cycle so distribution
+// matches the SNI rotation pool.
+//
+// Stops when ctx is cancelled (Client.Close).
+
+const (
+	coverGapMin       = 30 * time.Second
+	coverGapMax       = 90 * time.Second
+	coverReadBudget   = 4096
+	coverReadDeadline = 3 * time.Second
+)
+
+type coverDriver struct {
+	c       *Client
+	targets []string
+	stop    chan struct{}
+	once    sync.Once
+}
+
+// defaultCoverTargets returns a set of common cover destinations. Used when
+// ClientConfig.CoverTargets is empty. All in RKN whitelist (never blocked).
+func defaultCoverTargets() []string {
+	return []string{
+		"ok.ru:443",
+		"vk.com:443",
+		"mail.ru:443",
+		"yandex.ru:443",
+		"dzen.ru:443",
+	}
+}
+
+func (c *Client) startCoverTraffic(ctx context.Context, targets []string) *coverDriver {
+	if len(targets) == 0 {
+		targets = defaultCoverTargets()
+	}
+	d := &coverDriver{
+		c:       c,
+		targets: targets,
+		stop:    make(chan struct{}),
+	}
+	go d.run(ctx)
+	return d
+}
+
+func (d *coverDriver) run(ctx context.Context) {
+	for {
+		gap := coverGapMin + time.Duration(coverRandUint64n(uint64(coverGapMax-coverGapMin)))
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.stop:
+			return
+		case <-time.After(gap):
+		}
+		// Pick a target at random.
+		idx := int(coverRandUint64n(uint64(len(d.targets))))
+		target := d.targets[idx]
+		d.coverOnce(ctx, target)
+	}
+}
+
+// coverOnce opens a single H2 CONNECT to `target` via the tunnel and reads
+// up to coverReadBudget bytes. Errors are swallowed; cover is best-effort.
+func (d *coverDriver) coverOnce(parent context.Context, target string) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+
+	conn, err := d.c.DialContext(ctx, "tcp", target)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// Small "browser-like" TLS-ClientHello-shaped opening write so the H2
+	// stream sees activity. We don't actually negotiate inner TLS; just the
+	// first record-shaped 5-byte header + a few random bytes (enough that
+	// the encapsulated-TLS-handshake classifier sees a "TLS-init"-like
+	// pattern matching real cover traffic to ok.ru).
+	hdr := []byte{0x16, 0x03, 0x01, 0x00, 0x00}
+	binary.BigEndian.PutUint16(hdr[3:5], 32) // record body length 32
+	body := make([]byte, 32)
+	_, _ = rand.Read(body)
+	_, _ = conn.Write(append(hdr, body...))
+
+	// Read up to budget bytes, then close.
+	_ = conn.SetReadDeadline(time.Now().Add(coverReadDeadline))
+	io.CopyN(io.Discard, conn, coverReadBudget)
+}
+
+func (d *coverDriver) close() {
+	d.once.Do(func() {
+		close(d.stop)
+	})
+}
+
+// coverRandUint64n returns a uniform random number in [0, n).
+func coverRandUint64n(n uint64) uint64 {
+	if n == 0 {
+		return 0
+	}
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	x := uint64(0)
+	for i := 0; i < 8; i++ {
+		x = (x << 8) | uint64(b[i])
+	}
+	return x % n
+}
+
+// Make sure the wider package imports satisfy: net is used elsewhere
+// implicitly through Conn typing.
+var _ = net.Conn(nil)

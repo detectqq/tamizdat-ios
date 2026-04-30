@@ -20,13 +20,12 @@ func newFingerprintRotator(mode string) *fingerprintRotator {
 	var pool []utls.ClientHelloID
 	switch mode {
 	case "", "mix", "auto", "rotate":
-		// IPA-K: only current fingerprints. ANY 2022-era preset
+		// IPA-L: only current fingerprints. ANY 2022-era preset
 		// (Chrome 100/106, Safari 16, Edge 106) gets DPI-flagged as
 		// "stale browser" on Russian mobile carriers and the handshake
-		// is dropped. We don't have a use case for backward-compat with
-		// old browser identities -- the actual iOS device running this
-		// is on iOS 17+ with Safari that auto-updates; pretending to be
-		// 3-year-old browsers is net negative.
+		// is dropped. The 0xFE0C extension fix removed our biggest DPI
+		// signal but Chrome 100 in 2026 is still a strong "stale browser"
+		// signature; keeping pool aggressively current.
 		pool = []utls.ClientHelloID{
 			utls.HelloChrome_Auto, // Chrome 133, ML-KEM-768 in supported_groups
 			utls.HelloChrome_131,
@@ -35,32 +34,20 @@ func newFingerprintRotator(mode string) *fingerprintRotator {
 			utls.HelloFirefox_120,
 		}
 	case "firefox":
-		// Firefox_120 is the most recent uTLS preset (Dec 2023). Older
-		// Firefox 102/105 dropped -- 2022-era fingerprints get flagged.
 		pool = []utls.ClientHelloID{utls.HelloFirefox_120}
 	case "safari":
-		// Safari 16 (Sept 2022) is the freshest Safari preset uTLS has;
-		// pair it with Chrome_Auto so we don't pin a single stale ID.
-		// iOS 13/14 (2019/2020!) explicitly dropped -- those would be
-		// reading as a 6-year-old iPhone, instant DPI flag.
 		pool = []utls.ClientHelloID{
 			utls.HelloChrome_Auto, // primary
-			utls.HelloSafari_16_0, // single 2022 preset, weighted via duplicate Chrome_Auto above
+			utls.HelloSafari_16_0, // single 2022 preset, weighted via Chrome_Auto above
 		}
 	case "edge":
-		// Same problem as safari: only stale Edge presets exist in uTLS.
-		// Mix Chrome_Auto in heavily.
 		pool = []utls.ClientHelloID{utls.HelloChrome_Auto, utls.HelloEdge_106}
 	case "ios":
-		// uTLS only has iOS 12/13/14 -- all 5+ years old. Use Chrome_Auto
-		// instead; on iOS the actual Safari TLS stack matches Chrome more
-		// closely than these stale presets do anyway.
 		pool = []utls.ClientHelloID{utls.HelloChrome_Auto}
-	default: // "chrome" and any unrecognised value: default to Chrome family
-		// IPA-K: same modernisation as the mix pool above -- the previous
-		// pool included Chrome 100 (April 2022) and Chrome 106 (September
-		// 2022) which Russian mobile DPI flags. Most existing samizdat://
-		// URLs carry fp=chrome literal, so this case MUST stay current.
+	default: // "chrome" and any unrecognised value: default to modern Chrome only
+		// IPA-L: dropped HelloChrome_100/106_Shuffle/115_PQ from the
+		// default chrome case. Most existing samizdat:// URLs carry
+		// fp=chrome literal and would otherwise hit 2022-era presets.
 		pool = []utls.ClientHelloID{
 			utls.HelloChrome_Auto,
 			utls.HelloChrome_131,

@@ -130,35 +130,6 @@ func DeriveServerPSK(serverPrivateKey, ephemeralPublicKey []byte, shortID [short
 	return derivePSK(shared, shortID)
 }
 
-// BuildSessionID constructs a legacy 32-byte TLS SessionID that embeds an
-// authentication tag. Deprecated: ECDH-C will replace client/server callers
-// with BuildSessionIDv1, which binds the tag to the ephemeral public key.
-func BuildSessionID(serverPubKey []byte, shortID [shortIDLen]byte) ([sessionIDLen]byte, error) {
-	var sessionID [sessionIDLen]byte
-
-	psk, err := derivePSK(serverPubKey, shortID)
-	if err != nil {
-		return sessionID, err
-	}
-
-	// Place shortID in [0:8]
-	copy(sessionID[:shortIDLen], shortID[:])
-
-	// Generate random nonce in [8:16]
-	nonce := sessionID[shortIDLen : shortIDLen+nonceLen]
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return sessionID, fmt.Errorf("generating nonce: %w", err)
-	}
-
-	// Legacy binding: HMAC-SHA256(PSK, nonce) truncated to 16 bytes.
-	mac := hmac.New(sha256.New, psk)
-	mac.Write(nonce)
-	tag := mac.Sum(nil)[:hmacTagLen]
-	copy(sessionID[shortIDLen+nonceLen:], tag)
-
-	return sessionID, nil
-}
-
 // BuildSessionIDv1 constructs a P0.3 SessionID.
 // Layout: shortID(8) || nonce(8) || hmac_tag(16), where
 // hmac_tag = HMAC-SHA256(PSK, version || shortID || nonce || eph_pub)[:16].
@@ -188,54 +159,6 @@ func BuildSessionIDv1(psk []byte, shortID [shortIDLen]byte, ephemeralPublicKey [
 	tag := sessionIDTagV1(psk, shortID, nonceDst, ephemeralPublicKey)
 	copy(sessionID[shortIDLen+nonceLen:], tag)
 	return sessionID, nil
-}
-
-// VerifySessionID checks whether the given 32-byte legacy SessionID contains a valid
-// authentication tag for any of the allowed short IDs. Deprecated for P0.3.
-//
-// serverPubKey is the server's X25519 public key (legacy IKM placeholder until ECDH-C).
-func VerifySessionID(sessionID []byte, serverPubKey []byte, allowedShortIDs [][shortIDLen]byte) ([shortIDLen]byte, bool, error) {
-	var zero [shortIDLen]byte
-
-	if len(sessionID) != sessionIDLen {
-		return zero, false, nil
-	}
-
-	// Extract fields from SessionID
-	var candidateShortID [shortIDLen]byte
-	copy(candidateShortID[:], sessionID[:shortIDLen])
-	nonce := sessionID[shortIDLen : shortIDLen+nonceLen]
-	tag := sessionID[shortIDLen+nonceLen:]
-
-	// Check if the candidateShortID is in the allowed list
-	found := false
-	for _, allowed := range allowedShortIDs {
-		if candidateShortID == allowed {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return zero, false, nil
-	}
-
-	// Derive the same PSK
-	psk, err := derivePSK(serverPubKey, candidateShortID)
-	if err != nil {
-		return zero, false, err
-	}
-
-	// Compute expected legacy HMAC
-	mac := hmac.New(sha256.New, psk)
-	mac.Write(nonce)
-	expectedTag := mac.Sum(nil)[:hmacTagLen]
-
-	// Constant-time comparison
-	if !hmac.Equal(tag, expectedTag) {
-		return zero, false, nil
-	}
-
-	return candidateShortID, true, nil
 }
 
 // VerifySessionIDv1 checks whether a P0.3 SessionID contains a valid tag bound
@@ -287,7 +210,7 @@ func VerifySessionIDv1WithServerKey(sessionID []byte, serverPrivateKey []byte, e
 
 func sessionIDTagV1(psk []byte, shortID [shortIDLen]byte, nonce []byte, ephemeralPublicKey []byte) []byte {
 	mac := hmac.New(sha256.New, psk)
-	mac.Write([]byte{samizdatKeyShareVersion})
+	mac.Write([]byte{0x01}) // SessionIDv1 version byte
 	mac.Write(shortID[:])
 	mac.Write(nonce)
 	mac.Write(ephemeralPublicKey)

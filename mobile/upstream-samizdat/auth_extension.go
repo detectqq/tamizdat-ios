@@ -6,209 +6,9 @@ import (
 	"fmt"
 )
 
-const (
-	// SamizdatKeyShareExtensionType is the private-use TLS extension type for P0.3. Go 1.24 treats 0xFE0D as ECH, so integration uses adjacent private-use 0xFE0C.
-	SamizdatKeyShareExtensionType uint16 = 0xFE0C
-
-	samizdatKeyShareVersion     byte = 0x01
-	samizdatKeyShareCurveX25519 byte = 0x01
-	samizdatKeySharePayloadLen       = 1 + 1 + 2 + x25519KeyLen
-	samizdatKeyShareWireLen          = 4 + samizdatKeySharePayloadLen
-)
-
-// BuildSamizdatKeyShareExtension marshals the P0.3 samizdat_keyshare TLS extension.
-func BuildSamizdatKeyShareExtension(ephemeralPublicKey []byte) ([]byte, error) {
-	return MarshalKeyShareExtension(ephemeralPublicKey)
-}
-
-// MarshalKeyShareExtension marshals the full TLS extension wire image:
-// type(2) || length(2) || version(1) || curve(1) || reserved(2) || eph_pub(32).
-func MarshalKeyShareExtension(ephemeralPublicKey []byte) ([]byte, error) {
-	if len(ephemeralPublicKey) != x25519KeyLen {
-		return nil, fmt.Errorf("ephemeral public key length %d, want %d", len(ephemeralPublicKey), x25519KeyLen)
-	}
-	ext := make([]byte, samizdatKeyShareWireLen)
-	binary.BigEndian.PutUint16(ext[0:2], SamizdatKeyShareExtensionType)
-	binary.BigEndian.PutUint16(ext[2:4], samizdatKeySharePayloadLen)
-	ext[4] = samizdatKeyShareVersion
-	ext[5] = samizdatKeyShareCurveX25519
-	// ext[6:8] reserved bytes are zero in v1.
-	copy(ext[8:], ephemeralPublicKey)
-	return ext, nil
-}
-
-// UnmarshalKeyShareExtension parses the full samizdat_keyshare TLS extension
-// and returns the embedded X25519 ephemeral public key.
-func UnmarshalKeyShareExtension(extension []byte) ([x25519KeyLen]byte, error) {
-	var ephPub [x25519KeyLen]byte
-	if len(extension) < 4 {
-		return ephPub, errors.New("samizdat_keyshare extension too short for header")
-	}
-	if typ := binary.BigEndian.Uint16(extension[0:2]); typ != SamizdatKeyShareExtensionType {
-		return ephPub, fmt.Errorf("unexpected TLS extension type 0x%04x", typ)
-	}
-	payloadLen := int(binary.BigEndian.Uint16(extension[2:4]))
-	if payloadLen != samizdatKeySharePayloadLen {
-		return ephPub, fmt.Errorf("samizdat_keyshare payload length %d, want %d", payloadLen, samizdatKeySharePayloadLen)
-	}
-	if len(extension) != 4+payloadLen {
-		return ephPub, fmt.Errorf("samizdat_keyshare wire length %d, want %d", len(extension), 4+payloadLen)
-	}
-	payload := extension[4:]
-	if payload[0] != samizdatKeyShareVersion {
-		return ephPub, fmt.Errorf("unsupported samizdat_keyshare version 0x%02x", payload[0])
-	}
-	if payload[1] != samizdatKeyShareCurveX25519 {
-		return ephPub, fmt.Errorf("unsupported samizdat_keyshare curve 0x%02x", payload[1])
-	}
-	if payload[2] != 0 || payload[3] != 0 {
-		return ephPub, errors.New("samizdat_keyshare reserved bytes must be zero")
-	}
-	copy(ephPub[:], payload[4:])
-	return ephPub, nil
-}
-
-// DerivePSKFromExtension parses a full samizdat_keyshare TLS extension and
-// derives the server-side P0.3 PSK using the server static private key.
-func DerivePSKFromExtension(serverPrivateKey []byte, extension []byte, shortID [shortIDLen]byte) ([]byte, [x25519KeyLen]byte, error) {
-	ephPub, err := UnmarshalKeyShareExtension(extension)
-	if err != nil {
-		return nil, ephPub, err
-	}
-	psk, err := DeriveServerPSK(serverPrivateKey, ephPub[:], shortID)
-	if err != nil {
-		return nil, ephPub, err
-	}
-	return psk, ephPub, nil
-}
-
-// ExtractSamizdatKeyShareExtension extracts the full P0.3 samizdat_keyshare
-// TLS extension wire image from raw ClientHello bytes. It accepts a TLS record,
-// a handshake message, or a bare ClientHello body.
-func ExtractSamizdatKeyShareExtension(clientHello []byte) ([]byte, error) {
-	body, err := clientHelloBody(clientHello)
-	if err != nil {
-		return nil, err
-	}
-
-	pos := 2 + 32 // legacy_version + random
-	if len(body) < pos+1 {
-		return nil, errors.New("ClientHello too short for session_id length")
-	}
-	sessionIDLen := int(body[pos])
-	pos++
-	if len(body) < pos+sessionIDLen+2 {
-		return nil, errors.New("ClientHello too short for cipher_suites length")
-	}
-	pos += sessionIDLen
-
-	cipherSuitesLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
-	pos += 2
-	if len(body) < pos+cipherSuitesLen+1 {
-		return nil, errors.New("ClientHello too short for compression_methods length")
-	}
-	pos += cipherSuitesLen
-
-	compressionMethodsLen := int(body[pos])
-	pos++
-	if len(body) < pos+compressionMethodsLen {
-		return nil, errors.New("ClientHello compression_methods exceeds data")
-	}
-	pos += compressionMethodsLen
-	if len(body) == pos {
-		return nil, errors.New("ClientHello has no extensions")
-	}
-	if len(body) < pos+2 {
-		return nil, errors.New("ClientHello too short for extensions length")
-	}
-	extensionsLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
-	pos += 2
-	if len(body) < pos+extensionsLen {
-		return nil, errors.New("ClientHello extensions exceed data")
-	}
-
-	end := pos + extensionsLen
-	for pos < end {
-		if pos+4 > end {
-			return nil, errors.New("ClientHello truncated TLS extension header")
-		}
-		extLen := int(binary.BigEndian.Uint16(body[pos+2 : pos+4]))
-		if pos+4+extLen > end {
-			return nil, errors.New("ClientHello TLS extension length exceeds block")
-		}
-		if binary.BigEndian.Uint16(body[pos:pos+2]) == SamizdatKeyShareExtensionType {
-			ext := make([]byte, 4+extLen)
-			copy(ext, body[pos:pos+4+extLen])
-			return ext, nil
-		}
-		pos += 4 + extLen
-	}
-	return nil, errors.New("samizdat_keyshare extension not found")
-}
-
-// ExtractSamizdatKeyShare extracts the P0.3 ephemeral public key from raw
-// ClientHello bytes. It accepts a TLS record, a handshake message, or a bare
-// ClientHello body.
-func ExtractSamizdatKeyShare(clientHello []byte) ([x25519KeyLen]byte, error) {
-	var zero [x25519KeyLen]byte
-	body, err := clientHelloBody(clientHello)
-	if err != nil {
-		return zero, err
-	}
-
-	pos := 2 + 32 // legacy_version + random
-	if len(body) < pos+1 {
-		return zero, errors.New("ClientHello too short for session_id length")
-	}
-	sessionIDLen := int(body[pos])
-	pos++
-	if len(body) < pos+sessionIDLen+2 {
-		return zero, errors.New("ClientHello too short for cipher_suites length")
-	}
-	pos += sessionIDLen
-
-	cipherSuitesLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
-	pos += 2
-	if len(body) < pos+cipherSuitesLen+1 {
-		return zero, errors.New("ClientHello too short for compression_methods length")
-	}
-	pos += cipherSuitesLen
-
-	compressionMethodsLen := int(body[pos])
-	pos++
-	if len(body) < pos+compressionMethodsLen {
-		return zero, errors.New("ClientHello compression_methods exceeds data")
-	}
-	pos += compressionMethodsLen
-	if len(body) == pos {
-		return zero, errors.New("ClientHello has no extensions")
-	}
-	if len(body) < pos+2 {
-		return zero, errors.New("ClientHello too short for extensions length")
-	}
-	extensionsLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
-	pos += 2
-	if len(body) < pos+extensionsLen {
-		return zero, errors.New("ClientHello extensions exceed data")
-	}
-
-	end := pos + extensionsLen
-	for pos < end {
-		if pos+4 > end {
-			return zero, errors.New("ClientHello truncated TLS extension header")
-		}
-		extLen := int(binary.BigEndian.Uint16(body[pos+2 : pos+4]))
-		if pos+4+extLen > end {
-			return zero, errors.New("ClientHello TLS extension length exceeds block")
-		}
-		if binary.BigEndian.Uint16(body[pos:pos+2]) == SamizdatKeyShareExtensionType {
-			return UnmarshalKeyShareExtension(body[pos : pos+4+extLen])
-		}
-		pos += 4 + extLen
-	}
-	return zero, errors.New("samizdat_keyshare extension not found")
-}
-
+// clientHelloBody returns the ClientHello body (after the handshake header)
+// from either a TLS record (starts with 0x16) or a raw handshake message
+// (starts with 0x01). Used by ExtractX25519FromKeyShare for both code paths.
 func clientHelloBody(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("ClientHello empty")
@@ -239,4 +39,106 @@ func clientHelloBody(data []byte) ([]byte, error) {
 		return data[4 : 4+handshakeLen], nil
 	}
 	return data, nil
+}
+
+
+// ExtractX25519FromKeyShare parses the standard TLS 1.3 key_share extension
+// (type 0x0033) from a buffered ClientHello *payload* (bytes after the 5-byte
+// record header) and returns the X25519 (group 0x001D) entry's pubkey. This
+// is the compass v2 §5.1 fix: instead of carrying samizdat's ephemeral pub
+// in a private extension 0xFE0C, we use the X25519 keypair uTLS already
+// generated for the standard TLS-1.3 ECDH. Reality does the same.
+//
+// Returns the 32-byte X25519 pubkey on success. Errors if no key_share or
+// no standalone X25519 entry is present (real Chrome 131+ always sends one
+// even alongside X25519MLKEM768 hybrid).
+func ExtractX25519FromKeyShare(payload []byte) ([x25519KeyLen]byte, error) {
+	var zero [x25519KeyLen]byte
+	body, err := clientHelloBody(payload)
+	if err != nil {
+		return zero, err
+	}
+
+	// Walk: legacy_version(2) + random(32) + session_id(1+) + cipher_suites(2+) +
+	// compression_methods(1+) + extensions(2+ length-prefixed)
+	if len(body) < 34 {
+		return zero, fmt.Errorf("clientHello body truncated (header)")
+	}
+	body = body[34:]
+
+	if len(body) < 1 {
+		return zero, fmt.Errorf("clientHello: missing session_id length")
+	}
+	sidLen := int(body[0])
+	if len(body) < 1+sidLen {
+		return zero, fmt.Errorf("clientHello: session_id truncated")
+	}
+	body = body[1+sidLen:]
+
+	if len(body) < 2 {
+		return zero, fmt.Errorf("clientHello: missing cipher_suites length")
+	}
+	csLen := int(body[0])<<8 | int(body[1])
+	if len(body) < 2+csLen {
+		return zero, fmt.Errorf("clientHello: cipher_suites truncated")
+	}
+	body = body[2+csLen:]
+
+	if len(body) < 1 {
+		return zero, fmt.Errorf("clientHello: missing compression length")
+	}
+	cmLen := int(body[0])
+	if len(body) < 1+cmLen {
+		return zero, fmt.Errorf("clientHello: compression truncated")
+	}
+	body = body[1+cmLen:]
+
+	if len(body) < 2 {
+		return zero, fmt.Errorf("clientHello: missing extensions length")
+	}
+	extLen := int(body[0])<<8 | int(body[1])
+	if len(body) < 2+extLen {
+		return zero, fmt.Errorf("clientHello: extensions truncated")
+	}
+	exts := body[2 : 2+extLen]
+
+	for len(exts) >= 4 {
+		extType := uint16(exts[0])<<8 | uint16(exts[1])
+		eLen := int(exts[2])<<8 | int(exts[3])
+		if len(exts) < 4+eLen {
+			return zero, fmt.Errorf("extension truncated")
+		}
+		extBody := exts[4 : 4+eLen]
+		exts = exts[4+eLen:]
+		if extType != 0x0033 { // key_share
+			continue
+		}
+		// key_share body for ClientHello: client_shares list, prefixed with 2-byte length.
+		if len(extBody) < 2 {
+			return zero, fmt.Errorf("key_share extension empty")
+		}
+		listLen := int(extBody[0])<<8 | int(extBody[1])
+		if len(extBody) < 2+listLen {
+			return zero, fmt.Errorf("key_share list truncated")
+		}
+		list := extBody[2 : 2+listLen]
+		for len(list) >= 4 {
+			group := uint16(list[0])<<8 | uint16(list[1])
+			keLen := int(list[2])<<8 | int(list[3])
+			if len(list) < 4+keLen {
+				return zero, fmt.Errorf("key_share entry truncated")
+			}
+			keyExchange := list[4 : 4+keLen]
+			list = list[4+keLen:]
+			if group == 0x001D && len(keyExchange) == x25519KeyLen {
+				// Standalone X25519 found.
+				var out [x25519KeyLen]byte
+				copy(out[:], keyExchange)
+				return out, nil
+			}
+			// Skip MLKEM hybrid (group 0x11EC); compass v2 §5.1 edge case.
+		}
+		return zero, fmt.Errorf("key_share has no standalone X25519 entry")
+	}
+	return zero, fmt.Errorf("key_share extension not present")
 }

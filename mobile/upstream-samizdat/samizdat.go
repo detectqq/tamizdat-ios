@@ -23,12 +23,17 @@ type ConnHandler func(ctx context.Context, conn net.Conn, destination string)
 // ClientConfig configures the Samizdat client.
 type ClientConfig struct {
 	// Server connection
-	ServerAddr string
-	ServerName string
+	ServerAddr  string
+	ServerName  string   // legacy single SNI; if ServerNames empty this is used
+	ServerNames []string // pool of SNIs; client picks random per fresh transport
 
-	// Authentication
+	// Authentication. Provide either a single ShortID (legacy) or a pool via
+	// ShortIDs (recommended) — client picks random per fresh transport, which
+	// breaks the "all clients of one IP have identical 8-byte SessionID prefix"
+	// signal flagged by compass deep-research P1.1.
 	PublicKey []byte
-	ShortID   [8]byte
+	ShortID   [8]byte    // legacy single ID; if ShortIDs is empty this is used
+	ShortIDs  [][8]byte  // pool of allowed IDs; client picks random
 
 	// TLS fingerprint
 	Fingerprint string
@@ -47,6 +52,27 @@ type ClientConfig struct {
 	IdleTimeout       time.Duration
 	ConnectTimeout    time.Duration
 	DrainTimeout      time.Duration
+
+	// Cover/decoy traffic (compass v2 §5.6): periodic background CONNECTs
+	// through the tunnel to cover sites. Defeats encapsulated-TLS-handshake
+	// fingerprinting by mixing "browser-like" side streams with user traffic
+	// on the same H2 session. Default disabled.
+	CoverTrafficEnabled bool
+	CoverTrafficTargets []string // empty = defaults
+
+	// Multi-conn fallback against #490 (compass deep-research P1.2):
+	// MinTransports pre-warms N parallel TLS+H2 transports up-front; new
+	// streams round-robin across them so no single transport carries the
+	// whole user traffic. If TSPU shapes one TCP after ~15 KB, the others
+	// stay healthy and traffic continues. Default 1 = legacy behaviour
+	// (single lazy transport).
+	MinTransports int
+
+	// BytesPerTransportSoftCap, if >0, marks a transport draining once its
+	// cumulative outbound bytes cross the cap (typical 12-15 KB to trigger
+	// just before TSPU detector #490 fires). New streams flow to other
+	// transports; pool reaper spawns a replacement. 0 = disabled.
+	BytesPerTransportSoftCap int64
 
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
@@ -68,13 +94,12 @@ func (c *ClientConfig) applyDefaults() {
 	if c.DrainTimeout == 0 {
 		c.DrainTimeout = 10 * time.Second
 	}
+	if c.MinTransports < 1 {
+		c.MinTransports = 1
+	}
 	if !c.DisableDefaultSecurity {
-		// iOS-vendor patch: original was `c.TCPFragmentation = c.TCPFragmentation || true`
-		// which is always true, silently overriding any caller-supplied
-		// `false`. Force-on is the intended behaviour, so just write it
-		// directly. (The boolean tautology was upstream code rot.)
-		c.TCPFragmentation = true
-		c.RecordFragmentation = true
+		c.TCPFragmentation = c.TCPFragmentation || true
+		c.RecordFragmentation = c.RecordFragmentation || true
 	}
 }
 
@@ -88,8 +113,14 @@ type ServerConfig struct {
 	CertPEM []byte
 	KeyPEM  []byte
 
-	MasqueradeDomain      string
-	MasqueradeAddr        string
+	MasqueradeDomain      string            // default origin if SNI not in pool
+	MasqueradeAddr        string            // default origin IP override
+	// MasqueradePool maps client-presented SNI -> origin host:port. Allows
+	// cover-SNI rotation (compass P1.1): client picks a random SNI from a
+	// pool, server forwards auth-failed probes to the matching real origin
+	// so the cert/handshake behaviour matches the SNI claim. Empty string
+	// value means "use MasqueradeDomain". Unknown SNI falls back to default.
+	MasqueradePool        map[string]string
 	MasqueradeIdleTimeout time.Duration
 	MasqueradeMaxDuration time.Duration
 

@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"context"
+	"sync/atomic"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -31,6 +32,7 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 	}
 	target, err := ResolveAndValidateDestination(r.Context(), host, port)
 	if err != nil {
+		safeIntAdd(ssrfRejectedUDP, 1)
 		s.logf("[samizdat-udp] rejected destination %s: %v", destination, err)
 		http.Error(w, "destination rejected", http.StatusBadRequest)
 		return
@@ -50,6 +52,10 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 		return
 	}
 	defer udpConn.Close()
+	safeIntAdd(tunnelsUDPOpened, 1)
+	defer safeIntAdd(tunnelsUDPClosed, 1)
+	var flowBytes int64
+	defer func() { observeFlowBytes(flowBytes) }()
 
 	// Send 200 OK to signal client the tunnel is ready.
 	w.WriteHeader(http.StatusOK)
@@ -126,6 +132,8 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 				s.logf("[samizdat-udp] dn-write %s: %v", destination, err)
 				return
 			}
+			atomic.AddInt64(&flowBytes, int64(len(buf)))
+			bytesClientToTarget.Add(int64(len(buf)))
 			select {
 			case idleResetCh <- struct{}{}:
 			default:
@@ -167,6 +175,8 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 		if _, err := w.Write(rbuf[:n]); err != nil {
 			return
 		}
+		atomic.AddInt64(&flowBytes, int64(n))
+		bytesTargetToClient.Add(int64(n))
 		if flusher != nil {
 			flusher.Flush()
 		}

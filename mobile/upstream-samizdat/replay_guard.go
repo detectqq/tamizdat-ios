@@ -10,7 +10,12 @@ import (
 const (
 	replayKeyLen        = 16
 	defaultReplayWindow = 5 * time.Minute
-	replayHardCap       = 4096
+	// replayHardCap (compass v2 §3.12 / §5.14): bumped from 4096 to 65536 so
+	// a high-traffic Lantern server (1k auth/s) doesn't push out legitimate
+	// new-client entries within the 5-minute window. Memory cost: 64K *
+	// (16-byte key + ~32-byte time.Time map entry) = ~3 MB worst-case --
+	// negligible vs server RSS (~10MB binary).
+	replayHardCap = 65536
 )
 
 var (
