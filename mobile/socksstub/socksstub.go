@@ -26,6 +26,7 @@
 package socksstub
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -48,6 +49,16 @@ const (
 	socksVersion5      = 0x05
 	socksMethodNoAuth  = 0x00
 	socksCmdConnect    = 0x01
+	socksCmdUDPAssoc   = 0x03
+	// socksCmdFwdUDP is hev-socks5-tunnel's custom command for
+	// "UDP-in-TCP" forwarding (HEV_SOCKS5_REQ_CMD_FWD_UDP). It is what
+	// hev sends when the YAML has `socks5.udp: 'tcp'`. After the SOCKS5
+	// reply, the same TCP connection carries length-prefixed UDP
+	// datagrams, each with its own destination address (multi-target).
+	// Wire format per packet:
+	//   datlen (2 BE) | hdrlen (1) | atype (1) | addr (4/16/var) | port (2 BE) | data
+	// where hdrlen == 3 + addrlen-incl-atype-and-port.
+	socksCmdFwdUDP     = 0x05
 	socksAtypIPv4      = 0x01
 	socksAtypDomain    = 0x03
 	socksAtypIPv6      = 0x04
@@ -481,58 +492,70 @@ func handleSocks(ctx context.Context, client net.Conn, idx uint64) {
 		rt.appendLog(fmt.Sprintf("warn: conn#%d req bad version 0x%02x", idx, req[0]))
 		return
 	}
-	if req[1] != socksCmdConnect {
-		// IPA-G: surface this. If hev's `udp: 'tcp'` is sending
-		// UDP-ASSOCIATE (cmd=0x03), we need to know — and that's
-		// when DNS via tunnel would silently die.
-		rt.appendLog(fmt.Sprintf("warn: conn#%d unsupported cmd 0x%02x (only CONNECT supported)", idx, req[1]))
-		_ = sendReply(client, socksReplyCmdNoSup)
-		return
-	}
-
-	var host string
-	switch req[3] {
-	case socksAtypIPv4:
-		buf := make([]byte, 4)
-		if _, err := io.ReadFull(client, buf); err != nil {
-			rt.appendLog(fmt.Sprintf("warn: conn#%d ipv4 read: %v", idx, err))
-			return
-		}
-		host = net.IPv4(buf[0], buf[1], buf[2], buf[3]).String()
-	case socksAtypDomain:
-		ln := make([]byte, 1)
-		if _, err := io.ReadFull(client, ln); err != nil {
-			rt.appendLog(fmt.Sprintf("warn: conn#%d domain-len read: %v", idx, err))
-			return
-		}
-		buf := make([]byte, int(ln[0]))
-		if _, err := io.ReadFull(client, buf); err != nil {
-			rt.appendLog(fmt.Sprintf("warn: conn#%d domain read: %v", idx, err))
-			return
-		}
-		host = string(buf)
-	case socksAtypIPv6:
-		buf := make([]byte, 16)
-		if _, err := io.ReadFull(client, buf); err != nil {
-			rt.appendLog(fmt.Sprintf("warn: conn#%d ipv6 read: %v", idx, err))
-			return
-		}
-		host = "[" + net.IP(buf).String() + "]"
-	default:
-		rt.appendLog(fmt.Sprintf("warn: conn#%d bad atyp 0x%02x", idx, req[3]))
+	host, port, err := readSocksAddr(client, req[3])
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d addr read: %v", idx, err))
 		_ = sendReply(client, socksReplyAtypNo)
 		return
 	}
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(client, portBuf); err != nil {
-		rt.appendLog(fmt.Sprintf("warn: conn#%d port read: %v", idx, err))
-		return
-	}
-	port := binary.BigEndian.Uint16(portBuf)
 	dest := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	_ = client.SetReadDeadline(time.Time{})
 
+	switch req[1] {
+	case socksCmdConnect:
+		handleConnect(ctx, client, idx, dest)
+	case socksCmdFwdUDP:
+		// IPA-I: hev's UDP-in-TCP. The initial dest is a placeholder
+		// (often 0.0.0.0:0); each datagram on the stream carries its
+		// own real target address.
+		handleFwdUDP(ctx, client, idx)
+	default:
+		rt.appendLog(fmt.Sprintf("warn: conn#%d unsupported cmd 0x%02x", idx, req[1]))
+		_ = sendReply(client, socksReplyCmdNoSup)
+	}
+}
+
+// readSocksAddr reads ATYP-dependent host + port from a SOCKS5 stream.
+// `atyp` is the byte already consumed from the request header.
+func readSocksAddr(r io.Reader, atyp byte) (string, uint16, error) {
+	var host string
+	switch atyp {
+	case socksAtypIPv4:
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", 0, fmt.Errorf("ipv4: %w", err)
+		}
+		host = net.IPv4(buf[0], buf[1], buf[2], buf[3]).String()
+	case socksAtypDomain:
+		ln := make([]byte, 1)
+		if _, err := io.ReadFull(r, ln); err != nil {
+			return "", 0, fmt.Errorf("domain-len: %w", err)
+		}
+		buf := make([]byte, int(ln[0]))
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", 0, fmt.Errorf("domain: %w", err)
+		}
+		host = string(buf)
+	case socksAtypIPv6:
+		buf := make([]byte, 16)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", 0, fmt.Errorf("ipv6: %w", err)
+		}
+		host = "[" + net.IP(buf).String() + "]"
+	default:
+		return "", 0, fmt.Errorf("bad atyp 0x%02x", atyp)
+	}
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(r, portBuf); err != nil {
+		return "", 0, fmt.Errorf("port: %w", err)
+	}
+	return host, binary.BigEndian.Uint16(portBuf), nil
+}
+
+// handleConnect handles SOCKS5 cmd=0x01 (CONNECT) — TCP tunnel. Caller
+// has already consumed the request header AND the addr/port.
+func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string) {
 	rt.appendLog(fmt.Sprintf("info: conn#%d dial → %s", idx, dest))
 	dialStart := time.Now()
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -540,7 +563,6 @@ func handleSocks(ctx context.Context, client net.Conn, idx uint64) {
 	cancel()
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: conn#%d dial %s failed after %dms: %v", idx, dest, time.Since(dialStart).Milliseconds(), err))
-		// Map common errors to SOCKS reply codes for client benefit.
 		code := byte(socksReplyHostUnk)
 		var oerr *net.OpError
 		if errors.As(err, &oerr) && oerr.Err != nil {
@@ -558,7 +580,6 @@ func handleSocks(ctx context.Context, client net.Conn, idx uint64) {
 		rt.appendLog(fmt.Sprintf("warn: conn#%d success-reply write: %v", idx, err))
 		return
 	}
-
 	relay(client, upstream)
 	rt.appendLog(fmt.Sprintf("info: conn#%d closed (lifetime %dms)", idx, time.Since(dialStart).Milliseconds()))
 }
@@ -582,6 +603,199 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	}
 	// Stage 2: route through the samizdat H2 CONNECT tunnel.
 	return client.DialContext(ctx, "tcp", dest)
+}
+
+// dialUpstreamUDP returns a net.PacketConn bound to a single target,
+// either via the samizdat UDP-over-H2 tunnel or a direct UDP socket.
+func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+	rt.mu.Lock()
+	client := rt.samizdatClient
+	rt.mu.Unlock()
+	if client == nil {
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "udp", dest)
+		if err != nil {
+			return nil, err
+		}
+		// Wrap a connected UDP socket as PacketConn-like (writes go to
+		// dest; ReadFrom returns dest as Addr).
+		return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
+	}
+	return client.DialUDP(ctx, dest)
+}
+
+// connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
+// net.PacketConn with the connected peer as the constant remote addr.
+type connectedUDPAdapter struct {
+	conn   *net.UDPConn
+	target net.Addr
+}
+
+func newConnectedUDPAdapter(c *net.UDPConn, dest string) *connectedUDPAdapter {
+	return &connectedUDPAdapter{conn: c, target: &udpDestAddr{s: dest}}
+}
+
+func (a *connectedUDPAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := a.conn.Read(p)
+	return n, a.target, err
+}
+
+func (a *connectedUDPAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return a.conn.Write(p)
+}
+func (a *connectedUDPAdapter) Close() error                       { return a.conn.Close() }
+func (a *connectedUDPAdapter) LocalAddr() net.Addr                { return a.conn.LocalAddr() }
+func (a *connectedUDPAdapter) SetDeadline(t time.Time) error      { return a.conn.SetDeadline(t) }
+func (a *connectedUDPAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
+func (a *connectedUDPAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
+
+type udpDestAddr struct{ s string }
+
+func (a *udpDestAddr) Network() string { return "udp" }
+func (a *udpDestAddr) String() string  { return a.s }
+
+// handleFwdUDP services hev's `socks5.udp: 'tcp'` mode (cmd=0x05). The
+// initial CONNECT-style addr in the request is a placeholder; each
+// datagram on the wire carries its own destination via:
+//
+//	datlen (2 BE) | hdrlen (1) | atype (1) | addr (4/16/var) | port (2 BE) | data
+//
+// where hdrlen == 3 + addrlen-incl-atype-and-port.
+//
+// We open ONE samizdat UDP tunnel per unique (host, port) target,
+// cache it for the lifetime of this hev TCP conn, and funnel reverse-
+// path datagrams from all tunnels back to the same hev TCP stream.
+func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
+	if err := sendReply(client, socksReplySuccess); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
+		return
+	}
+	rt.appendLog(fmt.Sprintf("info: udp#%d FWD_UDP session open", idx))
+
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type pcKey struct {
+		host string
+		port uint16
+	}
+	type pcEntry struct {
+		pc          net.PacketConn
+		atyp        byte // remember the atyp for the reverse frame header
+		addrEncoded []byte // pre-encoded addr+port bytes (without atyp)
+	}
+	var (
+		pcMu     sync.Mutex
+		pcs      = make(map[pcKey]*pcEntry)
+		writeMu  sync.Mutex // serialize TCP writes back to hev
+		datagrams atomic.Uint64
+	)
+
+	closeAll := func() {
+		pcMu.Lock()
+		for _, e := range pcs {
+			_ = e.pc.Close()
+		}
+		pcs = nil
+		pcMu.Unlock()
+	}
+	defer closeAll()
+
+	startReverse := func(key pcKey, e *pcEntry) {
+		go func() {
+			buf := make([]byte, 64*1024)
+			for {
+				n, _, err := e.pc.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				// Frame: datlen | hdrlen | atype | addr | port | data
+				addrLen := len(e.addrEncoded) // includes port (no atyp)
+				hdrLen := 3 + 1 + addrLen     // 3 = datlen+hdrlen; +1 for atyp
+				frame := make([]byte, hdrLen+n)
+				binary.BigEndian.PutUint16(frame[0:2], uint16(n))
+				frame[2] = byte(hdrLen)
+				frame[3] = e.atyp
+				copy(frame[4:], e.addrEncoded)
+				copy(frame[hdrLen:], buf[:n])
+
+				writeMu.Lock()
+				_, werr := client.Write(frame)
+				writeMu.Unlock()
+				if werr != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	// Forward path: read framed datagrams from hev, look up / open
+	// PacketConn for the target, write the payload.
+	for {
+		var hdr [3]byte
+		if _, err := io.ReadFull(client, hdr[:]); err != nil {
+			rt.appendLog(fmt.Sprintf("info: udp#%d session end (%d datagrams)", idx, datagrams.Load()))
+			return
+		}
+		datLen := binary.BigEndian.Uint16(hdr[0:2])
+		hdrLen := int(hdr[2])
+		if hdrLen < 5 {
+			rt.appendLog(fmt.Sprintf("warn: udp#%d bad hdrlen %d", idx, hdrLen))
+			return
+		}
+		// Read atyp + addr + port (hdrLen - 3 bytes total).
+		addrSection := make([]byte, hdrLen-3)
+		if _, err := io.ReadFull(client, addrSection); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: udp#%d addr read: %v", idx, err))
+			return
+		}
+		atyp := addrSection[0]
+		host, port, err := readSocksAddr(bytes.NewReader(addrSection[1:]), atyp)
+		if err != nil {
+			rt.appendLog(fmt.Sprintf("warn: udp#%d parse addr: %v", idx, err))
+			return
+		}
+		// Read data.
+		data := make([]byte, datLen)
+		if datLen > 0 {
+			if _, err := io.ReadFull(client, data); err != nil {
+				rt.appendLog(fmt.Sprintf("warn: udp#%d data read: %v", idx, err))
+				return
+			}
+		}
+
+		key := pcKey{host: host, port: port}
+		pcMu.Lock()
+		e, ok := pcs[key]
+		if !ok {
+			dialCtx, dialCancel := context.WithTimeout(subCtx, 5*time.Second)
+			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+			dialCancel()
+			if derr != nil {
+				pcMu.Unlock()
+				rt.appendLog(fmt.Sprintf("warn: udp#%d dial %s:%d: %v", idx, host, port, derr))
+				continue
+			}
+			e = &pcEntry{
+				pc:          pc,
+				atyp:        atyp,
+				addrEncoded: addrSection[1:], // addr (incl. domain-len if applicable) + port
+			}
+			pcs[key] = e
+			startReverse(key, e)
+			rt.appendLog(fmt.Sprintf("info: udp#%d new target %s:%d (active=%d)", idx, host, port, len(pcs)))
+		}
+		pcMu.Unlock()
+
+		if datLen > 0 {
+			// Pass nil addr — samizdat's UDP PacketConn rejects any
+			// address other than the tunnel's bound target. nil is
+			// always accepted. For direct-dial fallback the
+			// connectedUDPAdapter ignores the addr arg too.
+			_, _ = e.pc.WriteTo(data, nil)
+			datagrams.Add(1)
+		}
+	}
 }
 
 // relay copies bytes between two duplex streams until either side closes.

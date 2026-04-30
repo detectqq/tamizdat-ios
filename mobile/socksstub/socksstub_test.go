@@ -305,6 +305,134 @@ func socks5Echo(socks string, target *net.TCPAddr) error {
 }
 
 // dialUpstream sanity: passing nil context shouldn't crash.
+// TestFwdUDPDirectEcho exercises the cmd=0x05 (HEV_SOCKS5_REQ_CMD_FWD_UDP)
+// path end-to-end with a localhost UDP echo upstream and direct-dial
+// (no samizdat). Verifies framing on both directions: client → upstream
+// and reverse.
+func TestFwdUDPDirectEcho(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+
+	// UDP echo server.
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	udpEcho, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("UDP listen: %v", err)
+	}
+	defer udpEcho.Close()
+	echoPort := udpEcho.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			_ = udpEcho.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, peer, err := udpEcho.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udpEcho.WriteToUDP(buf[:n], peer)
+		}
+	}()
+
+	port := pickPort(t)
+	socksAddr := "127.0.0.1:" + strconv.Itoa(port)
+	if err := Start(socksAddr); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer Stop()
+	if err := SetSamizdatConfig(""); err != nil {
+		t.Fatalf("SetSamizdatConfig: %v", err)
+	}
+
+	c, err := net.Dial("tcp", socksAddr)
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// SOCKS5 greeting.
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		t.Fatalf("greeting resp: %v", err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		t.Fatalf("greeting reply = %v", resp)
+	}
+
+	// Request: VER=05 CMD=05 (FWD_UDP) RSV=00 ATYP=01 ADDR=0.0.0.0 PORT=0.
+	req := []byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	if _, err := c.Write(req); err != nil {
+		t.Fatalf("FWD_UDP req: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("FWD_UDP reply = %v, want 05 00 (success)", reply)
+	}
+
+	// Send one framed datagram to 127.0.0.1:echoPort.
+	payload := []byte("ping-ping")
+	addrSection := []byte{0x01, 127, 0, 0, 1} // atyp + ipv4
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(echoPort))
+	addrSection = append(addrSection, portBytes...)
+	// addrSection now: atyp(1) + ipv4(4) + port(2) = 7 bytes
+	hdrLen := 3 + len(addrSection) // 10
+	frame := make([]byte, 0, hdrLen+len(payload))
+	dlen := make([]byte, 2)
+	binary.BigEndian.PutUint16(dlen, uint16(len(payload)))
+	frame = append(frame, dlen...)
+	frame = append(frame, byte(hdrLen))
+	frame = append(frame, addrSection...)
+	frame = append(frame, payload...)
+	if _, err := c.Write(frame); err != nil {
+		t.Fatalf("write framed datagram: %v", err)
+	}
+
+	// Read echo back framed the same way.
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	hdr := make([]byte, 3)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		t.Fatalf("read reverse hdr: %v", err)
+	}
+	rdLen := binary.BigEndian.Uint16(hdr[0:2])
+	rhdrLen := int(hdr[2])
+	if rhdrLen != hdrLen {
+		t.Fatalf("reverse hdrLen = %d, want %d", rhdrLen, hdrLen)
+	}
+	if int(rdLen) != len(payload) {
+		t.Fatalf("reverse datLen = %d, want %d", rdLen, len(payload))
+	}
+	rest := make([]byte, rhdrLen-3+int(rdLen))
+	if _, err := io.ReadFull(c, rest); err != nil {
+		t.Fatalf("read reverse rest: %v", err)
+	}
+	gotData := rest[rhdrLen-3:]
+	if !bytesEqual(gotData, payload) {
+		t.Fatalf("reverse data = %q, want %q", gotData, payload)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestDialUpstreamNilContextDoesNotCrash(t *testing.T) {
 	rt = &runtimeState{logsMax: 50}
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
