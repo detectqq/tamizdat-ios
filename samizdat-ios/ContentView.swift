@@ -4,6 +4,7 @@ struct ContentView: View {
     @StateObject private var bridge = SamizdatBridge()
     @State private var showConfig = false
     @State private var showLogs = false
+    @State private var showTelegram = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
@@ -80,6 +81,15 @@ struct ContentView: View {
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.bordered)
+
+                Button {
+                    showTelegram = true
+                } label: {
+                    Label("Telegram", systemImage: "paperplane.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
             }
 
             Text(buildLabel)
@@ -94,6 +104,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showLogs) {
             LogView(bridge: bridge)
+        }
+        .sheet(isPresented: $showTelegram) {
+            TelegramSettingsView()
         }
     }
 

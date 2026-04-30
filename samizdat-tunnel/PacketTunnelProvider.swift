@@ -169,7 +169,7 @@ socks5:
 
 misc:
   task-stack-size: 24576
-  log-level: 'warn'
+  log-level: 'info'
   connect-timeout: 2000
   read-write-timeout: 60000
 """

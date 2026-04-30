@@ -410,6 +410,12 @@ func (r *runtimeState) appendLog(line string) {
 	logSinkMu.Unlock()
 	if sink != nil {
 		_, _ = sink.WriteString(full + "\n")
+		// IPA-G: force fsync so the Swift bridge's file poller sees
+		// every line immediately. Without this, the kernel can hold
+		// writes in the page cache long enough that synchronous
+		// startup messages (listener-up, dial mode) get coalesced
+		// behind later async writes — exactly the IPA-F mystery.
+		_ = sink.Sync()
 	}
 }
 
@@ -426,45 +432,60 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			rt.appendLog(fmt.Sprintf("warn: accept: %v", err))
 			return
 		}
+		n := rt.connsTotal.Add(1)
 		rt.connsActive.Add(1)
-		rt.connsTotal.Add(1)
-		go func(client net.Conn) {
+		// IPA-G: per-connection accept log. If this never appears
+		// while hev says it's forwarding traffic, loopback in
+		// NEPacketTunnelProvider is sandbox-blocked — the headline
+		// data-plane diagnosis we need.
+		rt.appendLog(fmt.Sprintf("info: accept #%d from %s", n, c.RemoteAddr()))
+		go func(client net.Conn, idx uint64) {
 			defer client.Close()
 			defer rt.connsActive.Add(-1)
-			handleSocks(ctx, client)
-		}(c)
+			handleSocks(ctx, client, idx)
+		}(c, n)
 	}
 }
 
-func handleSocks(ctx context.Context, client net.Conn) {
+func handleSocks(ctx context.Context, client net.Conn, idx uint64) {
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	// Greeting: VER NMETHODS METHODS{n}
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(client, hdr); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d greeting read: %v", idx, err))
 		return
 	}
 	if hdr[0] != socksVersion5 {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d bad version 0x%02x", idx, hdr[0]))
 		return
 	}
 	methods := make([]byte, int(hdr[1]))
 	if _, err := io.ReadFull(client, methods); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d methods read: %v", idx, err))
 		return
 	}
 	// Always answer "no auth".
 	if _, err := client.Write([]byte{socksVersion5, socksMethodNoAuth}); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d auth-resp write: %v", idx, err))
 		return
 	}
 
 	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(client, req); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d request hdr read: %v", idx, err))
 		return
 	}
 	if req[0] != socksVersion5 {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d req bad version 0x%02x", idx, req[0]))
 		return
 	}
 	if req[1] != socksCmdConnect {
+		// IPA-G: surface this. If hev's `udp: 'tcp'` is sending
+		// UDP-ASSOCIATE (cmd=0x03), we need to know — and that's
+		// when DNS via tunnel would silently die.
+		rt.appendLog(fmt.Sprintf("warn: conn#%d unsupported cmd 0x%02x (only CONNECT supported)", idx, req[1]))
 		_ = sendReply(client, socksReplyCmdNoSup)
 		return
 	}
@@ -474,31 +495,37 @@ func handleSocks(ctx context.Context, client net.Conn) {
 	case socksAtypIPv4:
 		buf := make([]byte, 4)
 		if _, err := io.ReadFull(client, buf); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: conn#%d ipv4 read: %v", idx, err))
 			return
 		}
 		host = net.IPv4(buf[0], buf[1], buf[2], buf[3]).String()
 	case socksAtypDomain:
 		ln := make([]byte, 1)
 		if _, err := io.ReadFull(client, ln); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: conn#%d domain-len read: %v", idx, err))
 			return
 		}
 		buf := make([]byte, int(ln[0]))
 		if _, err := io.ReadFull(client, buf); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: conn#%d domain read: %v", idx, err))
 			return
 		}
 		host = string(buf)
 	case socksAtypIPv6:
 		buf := make([]byte, 16)
 		if _, err := io.ReadFull(client, buf); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: conn#%d ipv6 read: %v", idx, err))
 			return
 		}
 		host = "[" + net.IP(buf).String() + "]"
 	default:
+		rt.appendLog(fmt.Sprintf("warn: conn#%d bad atyp 0x%02x", idx, req[3]))
 		_ = sendReply(client, socksReplyAtypNo)
 		return
 	}
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(client, portBuf); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d port read: %v", idx, err))
 		return
 	}
 	port := binary.BigEndian.Uint16(portBuf)
@@ -506,10 +533,13 @@ func handleSocks(ctx context.Context, client net.Conn) {
 
 	_ = client.SetReadDeadline(time.Time{})
 
+	rt.appendLog(fmt.Sprintf("info: conn#%d dial → %s", idx, dest))
+	dialStart := time.Now()
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	upstream, err := dialUpstream(dialCtx, dest)
 	cancel()
 	if err != nil {
+		rt.appendLog(fmt.Sprintf("error: conn#%d dial %s failed after %dms: %v", idx, dest, time.Since(dialStart).Milliseconds(), err))
 		// Map common errors to SOCKS reply codes for client benefit.
 		code := byte(socksReplyHostUnk)
 		var oerr *net.OpError
@@ -521,13 +551,16 @@ func handleSocks(ctx context.Context, client net.Conn) {
 		_ = sendReply(client, code)
 		return
 	}
+	rt.appendLog(fmt.Sprintf("info: conn#%d dial %s ok in %dms", idx, dest, time.Since(dialStart).Milliseconds()))
 	defer upstream.Close()
 
 	if err := sendReply(client, socksReplySuccess); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: conn#%d success-reply write: %v", idx, err))
 		return
 	}
 
 	relay(client, upstream)
+	rt.appendLog(fmt.Sprintf("info: conn#%d closed (lifetime %dms)", idx, time.Since(dialStart).Milliseconds()))
 }
 
 func sendReply(client net.Conn, code byte) error {

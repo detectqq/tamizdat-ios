@@ -7,6 +7,31 @@ struct LogView: View {
     @State private var filter: LogFilter = .all
     @State private var autoScroll = true
     @State private var copiedFlash = false
+    @State private var sendStatus: SendStatus = .idle
+
+    enum SendStatus: Equatable {
+        case idle
+        case sending
+        case sent
+        case failed(String)
+
+        var label: String {
+            switch self {
+            case .idle:    return "Telegram"
+            case .sending: return "Sending…"
+            case .sent:    return "Sent ✓"
+            case .failed:  return "Failed"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .idle:    return "paperplane"
+            case .sending: return "paperplane.fill"
+            case .sent:    return "checkmark.circle"
+            case .failed:  return "exclamationmark.triangle"
+            }
+        }
+    }
 
     enum LogFilter: String, CaseIterable, Identifiable {
         case all   = "all"
@@ -81,6 +106,16 @@ struct LogView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
+                    Button {
+                        sendToTelegram()
+                    } label: {
+                        Label(sendStatus.label, systemImage: sendStatus.icon)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(sendStatus == .sending)
+                    .tint(telegramTint)
+
                     Button(role: .destructive) {
                         bridge.clearLogs()
                     } label: {
@@ -105,5 +140,41 @@ struct LogView: View {
         if line.contains(" error:") { return .red }
         if line.contains(" warn:")  { return .orange }
         return .primary
+    }
+
+    private var telegramTint: Color {
+        switch sendStatus {
+        case .idle:    return .blue
+        case .sending: return .gray
+        case .sent:    return .green
+        case .failed:  return .red
+        }
+    }
+
+    private func sendToTelegram() {
+        guard TelegramReporter.isConfigured else {
+            sendStatus = .failed("Configure bot token in Telegram settings")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                if case .failed = sendStatus { sendStatus = .idle }
+            }
+            return
+        }
+        sendStatus = .sending
+        let body = filtered.joined(separator: "\n")
+        let caption = TelegramReporter.defaultCaption(extra: "vpn=\(bridge.state.rawValue)")
+        TelegramReporter.sendLog(text: body, caption: caption) { result in
+            switch result {
+            case .success:
+                sendStatus = .sent
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    if case .sent = sendStatus { sendStatus = .idle }
+                }
+            case .failure(let err):
+                sendStatus = .failed(err.errorDescription ?? "?")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    if case .failed = sendStatus { sendStatus = .idle }
+                }
+            }
+        }
     }
 }
