@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import NetworkExtension
 import OSLog
 import os
@@ -47,6 +48,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var swiftLogHandle: FileHandle?
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
+    // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
+    // Mirrors what V2Box / FoXray / Hiddify do: when the OS default interface
+    // changes, the in-flight TLS+H2 transports to the upstream samizdat
+    // server are tied to old socket fds and won't recover on their own;
+    // we re-call SocksstubSetSamizdatConfig with the same blob, which
+    // closes the old samizdat.Client and rebuilds a fresh one over the
+    // current default interface.
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "com.anarki.samizdat-test.path", qos: .utility)
+    private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
+    private var lastReconnectAt = Date.distantPast
+    private var storedConfigBlob: String = ""
+
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
         // Start writing into App Group log file immediately so we have a
@@ -61,6 +75,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
+
+        // Stash so the path-monitor reconnect handler can re-call
+        // SocksstubSetSamizdatConfig without poking back into
+        // protocolConfiguration on a non-main queue.
+        self.storedConfigBlob = configBlob
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
         // of the loopback bridge live in this extension, so there is no
@@ -123,12 +142,99 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
+        pathMonitor.cancel()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
         try? swiftLogHandle?.close()
         swiftLogHandle = nil
         completionHandler()
+    }
+
+    // MARK: – auto-reconnect on network change
+
+    /// Subscribes to NWPath updates so we can detect Wi-Fi ↔ cellular
+    /// flips and other interface changes. When the underlying default
+    /// interface changes, the OS sockets the samizdat client opened on
+    /// the old interface are stale (may RST or just hang); rebuilding
+    /// the upstream-facing pool from scratch is the cheapest correct
+    /// fix and matches what every other production iOS proxy client
+    /// does.
+    private func startPathMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            self?.onPathUpdate(path)
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+        appendExtLog("info: path monitor started")
+    }
+
+    private func onPathUpdate(_ path: NWPath) {
+        // Compose a stable interface fingerprint: type + name(s). This
+        // avoids treating "same Wi-Fi, just IP renewed" as a change.
+        let kind = describePath(path)
+        let prev = lastPathInterfaceID
+        lastPathInterfaceID = kind
+
+        // First update right after start — record baseline, do nothing.
+        if prev == nil {
+            appendExtLog("info: path baseline = \(kind)")
+            return
+        }
+        if prev == kind {
+            return
+        }
+
+        // Debounce: iOS can fire 3-4 path updates in a flap (interface
+        // appears, gets DHCP, gets IPv6, becomes default, …). 3 s is
+        // longer than typical flap settle but well below user patience.
+        let now = Date()
+        if now.timeIntervalSince(lastReconnectAt) < 3.0 {
+            appendExtLog("info: path change \(prev ?? "?") → \(kind) — debounced")
+            return
+        }
+        lastReconnectAt = now
+
+        appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream")
+        rewireUpstream()
+    }
+
+    private func describePath(_ path: NWPath) -> String {
+        if path.status != .satisfied {
+            return "unsatisfied"
+        }
+        // Pick the dominant interface type for label purposes.
+        let typeName: String
+        switch true {
+        case path.usesInterfaceType(.wifi):     typeName = "wifi"
+        case path.usesInterfaceType(.cellular): typeName = "cellular"
+        case path.usesInterfaceType(.wiredEthernet): typeName = "wired"
+        case path.usesInterfaceType(.loopback): typeName = "loopback"
+        default:                                typeName = "other"
+        }
+        let names = path.availableInterfaces.map(\.name).joined(separator: ",")
+        return "\(typeName)[\(names)]"
+    }
+
+    /// Rebuilds the samizdat client by re-calling SocksstubSetSamizdatConfig
+    /// with the stored config blob. This closes the old client (which
+    /// closes its TLS+H2 transports tied to the previous interface) and
+    /// constructs a new one whose first connect goes via the current
+    /// default interface. The SOCKS5 listener itself stays up, so hev
+    /// can keep using 127.0.0.1:\(socksPort) without restart.
+    private func rewireUpstream() {
+        guard !storedConfigBlob.isEmpty else { return }
+        // Run off the path monitor queue to avoid serializing further
+        // updates while we sit inside Go-side teardown.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, blob = storedConfigBlob] in
+            guard let self else { return }
+            var err: NSError?
+            SocksstubSetSamizdatConfig(blob, &err)
+            if let err {
+                self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
+            } else {
+                self.appendExtLog("info: rewire ok — fresh samizdat client warmed via current interface")
+            }
+        }
     }
 
     override func handleAppMessage(_ messageData: Data,
@@ -210,6 +316,7 @@ misc:
         appendExtLog("info: SOCKS5 reachable; handing packets to hev")
 
         startSwiftHeartbeat()
+        startPathMonitor()
         isRunning = true
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
