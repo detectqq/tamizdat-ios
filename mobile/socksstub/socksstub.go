@@ -304,11 +304,12 @@ func SetSamizdatConfig(blob string) error {
 	// the upstream proxy itself (1.1.1.1:443 won't reach upstream from
 	// the test runner; we use the samizdat server's own port instead).
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		// IPA-K: 8s was too tight for Russian cellular (Megafon TLS handshake
+		// got eaten by DPI delay). 30s gives the warm-up a real chance to
+		// complete on slow links; if it still fails, the log line tells us
+		// whether it was TCP dial, TLS handshake, or H2 settings that died.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		// Pick a benign target the server is happy to CONNECT to. 1.1.1.1:443
-		// is universally reachable and used by the upstream samizdat server
-		// for similar warm-up paths.
 		conn, err := client.DialContext(ctx, "tcp", "1.1.1.1:443")
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("warn: samizdat warm-up dial: %v (cold start will be slower)", err))
@@ -558,7 +559,10 @@ func readSocksAddr(r io.Reader, atyp byte) (string, uint16, error) {
 func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string) {
 	rt.appendLog(fmt.Sprintf("info: conn#%d dial → %s", idx, dest))
 	dialStart := time.Now()
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// IPA-K: 10s was too tight for first-flow on Russian cellular where
+	// TLS handshake gets delayed by DPI. 20s lets cold-cache transport
+	// setup complete; warm transports return ~20ms anyway.
+	dialCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	upstream, err := dialUpstream(dialCtx, dest)
 	cancel()
 	if err != nil {
@@ -768,7 +772,10 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		pcMu.Lock()
 		e, ok := pcs[key]
 		if !ok {
-			dialCtx, dialCancel := context.WithTimeout(subCtx, 5*time.Second)
+			// IPA-K: 5s was too tight for slow cellular. 20s gives the
+			// underlying samizdat.DialUDP enough headroom for cold-cache
+			// transport setup (TCP dial + uTLS handshake + H2 settings).
+			dialCtx, dialCancel := context.WithTimeout(subCtx, 20*time.Second)
 			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 			dialCancel()
 			if derr != nil {
