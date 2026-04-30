@@ -38,6 +38,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -255,34 +256,51 @@ func SetSamizdatConfig(blob string) error {
 		rt.appendLog("error: SetSamizdatConfig pubkey must be 64 hex chars")
 		return errors.New("pubkey: 64 hex chars required")
 	}
-	shortIDBytes, err := hex.DecodeString(cfg.ShortIDHex)
-	if err != nil || len(shortIDBytes) != 8 {
+	// Decode primary shortID (always present — parser guarantees ≥1 entry).
+	primaryBytes, err := hex.DecodeString(cfg.ShortIDHex)
+	if err != nil || len(primaryBytes) != 8 {
 		rt.appendLog("error: SetSamizdatConfig shortid must be 16 hex chars")
 		return errors.New("shortid: 16 hex chars required")
 	}
-	var shortID [8]byte
-	copy(shortID[:], shortIDBytes)
+	var primaryShortID [8]byte
+	copy(primaryShortID[:], primaryBytes)
 
-	client, err := samizdat.NewClient(samizdat.ClientConfig{
-		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
-		ServerName:        cfg.SNI,
-		PublicKey:         pubKey,
-		ShortID:           shortID,
-		Fingerprint:       cfg.Fingerprint,
-		// Audit fix (final IPA-F): cap concurrent H2 streams at 50 (was 200).
-		// With patched x/net transportDefaultStreamFlow=256 KiB, 50 streams
-		// caps the per-conn flow-control window at ~12.5 MB instead of 50 MB.
-		// Speedtest opens at most ~16 parallel TCP flows; 50 is plenty of
-		// headroom for browsing + Speedtest overlap, and gives us the
-		// jetsam cushion the audit asked for.
+	// Decode optional shortID rotation pool. samizdat.Client.pickShortID
+	// rotates per-fresh-transport when ShortIDs has ≥1 entry; otherwise
+	// falls back to the single ShortID field.
+	shortIDPool := make([][8]byte, 0, len(cfg.ShortIDsHex))
+	for _, s := range cfg.ShortIDsHex {
+		raw, derr := hex.DecodeString(s)
+		if derr != nil || len(raw) != 8 {
+			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig shortid pool entry %q invalid", s))
+			return fmt.Errorf("shortid pool: %q invalid", s)
+		}
+		var v [8]byte
+		copy(v[:], raw)
+		shortIDPool = append(shortIDPool, v)
+	}
+
+	clientCfg := samizdat.ClientConfig{
+		ServerAddr:  net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
+		ServerName:  cfg.SNI,
+		PublicKey:   pubKey,
+		ShortID:     primaryShortID,
+		Fingerprint: cfg.Fingerprint,
+		// Audit fix (final IPA-F): cap concurrent H2 streams at 50.
 		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
-		// IPA-E pivot: this client now lives INSIDE the extension. The
-		// extension has the ~50 MB jetsam cap (dynamically shrunk under
-		// pressure), so the security stack must stay lean. Defaults on
-		// the samizdat side (fragmentation, NoiseFrames) are fine — they
-		// allocate per-flow, not per-stream, and the conn pool is bounded.
-	})
+	}
+	// IPA-M: opt-in rotation pools when the URL carried snipool=… and/or
+	// userinfo with comma-separated shortIDs. samizdat.Client picks one
+	// per fresh TLS transport for compass P1.1 anti-correlation.
+	if len(cfg.SNIPool) > 1 {
+		clientCfg.ServerNames = cfg.SNIPool
+	}
+	if len(shortIDPool) > 1 {
+		clientCfg.ShortIDs = shortIDPool
+	}
+
+	client, err := samizdat.NewClient(clientCfg)
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig samizdat.NewClient: %v", err))
 		return err
@@ -323,16 +341,35 @@ func SetSamizdatConfig(blob string) error {
 }
 
 type samizdatConfig struct {
-	ServerHost  string
-	ServerPort  int
-	SNI         string
-	PubkeyHex   string
-	ShortIDHex  string
-	Fingerprint string
+	ServerHost   string
+	ServerPort   int
+	SNI          string   // primary SNI (first of pool, kept for legacy code paths)
+	SNIPool      []string // optional rotation pool; empty = single-SNI mode
+	PubkeyHex    string
+	ShortIDHex   string   // primary shortID (first of pool)
+	ShortIDsHex  []string // optional rotation pool
+	Fingerprint  string
 }
 
-// parseSamizdatURL parses a samizdat://host:port/?sni=…&pubkey=…&shortid=…&fp=…
-// blob. Mirrors mobile/samizdat/samizdat.go's parser shape.
+// parseSamizdatURL parses both URL formats:
+//
+// xray-style (the modern format used by samizdat-server c384388+):
+//
+//	samizdat://<shortids>@<host>:<port>?pbk=<hex64>&sni=<host>&fp=<chrome|...>[&snipool=a,b,c]#<label>
+//
+// where <shortids> is one or more 16-hex shortIDs separated by commas,
+// pbk is the server's X25519 static public key (also accepts pubkey=
+// and public-key-hex= as aliases), and #<label> is an optional UI hint
+// that the parser ignores.
+//
+// legacy (the older format earlier samizdat-ios builds shipped):
+//
+//	samizdat://<host>:<port>/?sni=<host>&pubkey=<hex64>&shortid=<hex16>&fp=<...>
+//
+// All keys/values are merged across both forms so downloaded URLs work
+// regardless of which generator created them. Rotation pools (snipool,
+// userinfo with comma-separated shortIDs) are honoured when present;
+// otherwise the parsed config falls back to single-value fields.
 func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 	u, err := url.Parse(blob)
 	if err != nil {
@@ -354,28 +391,81 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 		return nil, fmt.Errorf("invalid port %q", portStr)
 	}
 	q := u.Query()
+
+	// SNI: prefer snipool (xray multi-SNI for compass P1.1 rotation), fall
+	// back to single sni=. A pool with one entry collapses to single-SNI.
+	var sniPool []string
+	if raw := q.Get("snipool"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if t := strings.TrimSpace(s); t != "" {
+				sniPool = append(sniPool, t)
+			}
+		}
+	}
 	sni := q.Get("sni")
+	if sni == "" && len(sniPool) > 0 {
+		sni = sniPool[0]
+	}
 	if sni == "" {
-		return nil, errors.New("missing sni")
+		return nil, errors.New("missing sni (or snipool)")
 	}
-	pub := q.Get("pubkey")
+
+	// Pubkey: pbk is the xray spelling, pubkey is legacy, public-key-hex is
+	// an older alias. First non-empty wins.
+	pub := q.Get("pbk")
+	if pub == "" {
+		pub = q.Get("pubkey")
+	}
+	if pub == "" {
+		pub = q.Get("public-key-hex")
+	}
 	if len(pub) != 64 {
-		return nil, errors.New("pubkey must be 64 hex chars")
+		return nil, errors.New("pubkey must be 64 hex chars (use pbk= or pubkey=)")
 	}
-	sid := q.Get("shortid")
-	if len(sid) != 16 {
-		return nil, errors.New("shortid must be 16 hex chars")
+
+	// shortIDs: userinfo (xray-style) takes priority over shortid= query
+	// param when both are present. Userinfo may be a single 16-hex value
+	// or comma-separated for rotation pool.
+	var shortIDs []string
+	if u.User != nil {
+		userinfo := u.User.Username()
+		for _, s := range strings.Split(userinfo, ",") {
+			if t := strings.TrimSpace(s); t != "" {
+				shortIDs = append(shortIDs, t)
+			}
+		}
 	}
+	if len(shortIDs) == 0 {
+		if raw := q.Get("shortid"); raw != "" {
+			for _, s := range strings.Split(raw, ",") {
+				if t := strings.TrimSpace(s); t != "" {
+					shortIDs = append(shortIDs, t)
+				}
+			}
+		}
+	}
+	if len(shortIDs) == 0 {
+		return nil, errors.New("missing shortid (use userinfo or shortid=)")
+	}
+	for _, s := range shortIDs {
+		if len(s) != 16 {
+			return nil, fmt.Errorf("shortid must be 16 hex chars (got %q)", s)
+		}
+	}
+
 	fp := q.Get("fp")
 	if fp == "" {
 		fp = "chrome"
 	}
+
 	return &samizdatConfig{
 		ServerHost:  host,
 		ServerPort:  port,
 		SNI:         sni,
+		SNIPool:     sniPool,
 		PubkeyHex:   pub,
-		ShortIDHex:  sid,
+		ShortIDHex:  shortIDs[0],
+		ShortIDsHex: shortIDs,
 		Fingerprint: fp,
 	}, nil
 }

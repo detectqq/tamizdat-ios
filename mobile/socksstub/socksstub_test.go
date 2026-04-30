@@ -171,11 +171,29 @@ func TestSamizdatConfigParse(t *testing.T) {
 		blob    string
 		wantErr string // substring; "" = no error
 	}{
+		// Legacy format
 		{"samizdat://h:18447/?sni=ok&pubkey=" + strings.Repeat("a", 64) + "&shortid=" + strings.Repeat("b", 16) + "&fp=chrome", ""},
 		{"samizdat://h:18447/?sni=ok&pubkey=tooshort&shortid=" + strings.Repeat("b", 16), "pubkey"},
 		{"samizdat://h:18447/?pubkey=" + strings.Repeat("a", 64) + "&shortid=" + strings.Repeat("b", 16), "missing sni"},
 		{"https://example.com/", "scheme must be samizdat"},
 		{"samizdat:///?sni=ok", "missing host"},
+
+		// IPA-M: xray-style format (userinfo + pbk=).
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok&fp=chrome", ""},
+		// xray + #fragment label is ignored.
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok#llm2", ""},
+		// xray pubkey alias public-key-hex= (older).
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?public-key-hex=" + strings.Repeat("a", 64) + "&sni=ok", ""},
+		// userinfo with comma-separated shortIDs (rotation pool).
+		{"samizdat://" + strings.Repeat("b", 16) + "," + strings.Repeat("c", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok", ""},
+		// snipool= multi-SNI rotation pool.
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&snipool=ok.ru,vk.com,mail.ru", ""},
+		// xray with userinfo OVERRIDING shortid= query (xray priority).
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok&shortid=" + strings.Repeat("c", 16), ""},
+		// userinfo too-short -> error.
+		{"samizdat://shortie@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok", "shortid must be 16 hex chars"},
+		// neither pbk nor pubkey -> error.
+		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?sni=ok", "pubkey must be 64 hex chars"},
 	}
 	for _, tc := range cases {
 		_, err := parseSamizdatURL(tc.blob)
@@ -193,6 +211,58 @@ func TestSamizdatConfigParse(t *testing.T) {
 			t.Errorf("blob %q: error %q does not contain %q", tc.blob, err.Error(), tc.wantErr)
 		}
 	}
+}
+
+// TestSamizdatXrayPoolFields verifies the SNI / shortID rotation pool
+// fields are populated correctly when the URL specifies them (snipool=,
+// userinfo with commas).
+func TestSamizdatXrayPoolFields(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	pub := strings.Repeat("a", 64)
+	a := strings.Repeat("b", 16)
+	b := strings.Repeat("c", 16)
+	c := strings.Repeat("d", 16)
+
+	t.Run("xray with snipool + multi-shortID", func(t *testing.T) {
+		blob := "samizdat://" + a + "," + b + "," + c + "@h:777?pbk=" + pub +
+			"&snipool=ok.ru,vk.com,mail.ru&fp=chrome#llm2"
+		cfg, err := parseSamizdatURL(blob)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.ServerHost != "h" || cfg.ServerPort != 777 {
+			t.Errorf("server: got %s:%d", cfg.ServerHost, cfg.ServerPort)
+		}
+		if cfg.SNI != "ok.ru" {
+			t.Errorf("primary SNI = %q, want ok.ru", cfg.SNI)
+		}
+		if got, want := cfg.SNIPool, []string{"ok.ru", "vk.com", "mail.ru"}; len(got) != len(want) {
+			t.Errorf("SNIPool len = %d, want %d", len(got), len(want))
+		}
+		if cfg.ShortIDHex != a {
+			t.Errorf("primary shortID = %q, want %q", cfg.ShortIDHex, a)
+		}
+		if got, want := cfg.ShortIDsHex, []string{a, b, c}; len(got) != len(want) {
+			t.Errorf("ShortIDsHex len = %d, want %d", len(got), len(want))
+		}
+	})
+
+	t.Run("legacy single sni single shortid", func(t *testing.T) {
+		blob := "samizdat://h:18447/?sni=ok.ru&pubkey=" + pub + "&shortid=" + a + "&fp=chrome"
+		cfg, err := parseSamizdatURL(blob)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.SNI != "ok.ru" {
+			t.Errorf("SNI = %q", cfg.SNI)
+		}
+		if len(cfg.SNIPool) != 0 {
+			t.Errorf("SNIPool should be empty, got %v", cfg.SNIPool)
+		}
+		if len(cfg.ShortIDsHex) != 1 || cfg.ShortIDsHex[0] != a {
+			t.Errorf("ShortIDsHex = %v, want [%q]", cfg.ShortIDsHex, a)
+		}
+	})
 }
 
 // TestConcurrentDials covers a small fan-out so we know the listener and

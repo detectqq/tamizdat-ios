@@ -88,3 +88,36 @@ func TestParseConfigError(t *testing.T) {
 		t.Error("invalid blob: expected non-empty error")
 	}
 }
+
+// IPA-M: ConfigPasteView must accept the xray-style format the new
+// samizdat-server c384388 generates ("samizdat://<sid>@host:port?pbk=...").
+func TestParseConfig_XrayStyle(t *testing.T) {
+	pub := "1ecb6d89948bda812bcbd56eff43bd63f94d2a2a32c3d52ebfee0010e4634363"
+	sid := "d1b122782219759f"
+
+	cases := []struct {
+		name, blob string
+	}{
+		{"xray + pbk + #fragment label", "samizdat://" + sid + "@llm2.detectqq.dpdns.org:777?pbk=" + pub + "&sni=ok.ru&fp=chrome#llm2"},
+		{"xray with public-key-hex alias", "samizdat://" + sid + "@h:778?public-key-hex=" + pub + "&sni=ok.ru"},
+		{"xray with snipool", "samizdat://" + sid + "@h:778?pbk=" + pub + "&snipool=ok.ru,vk.com,mail.ru"},
+		{"userinfo OVERRIDES shortid= when both set", "samizdat://" + sid + "@h:777?pbk=" + pub + "&sni=x&shortid=" + strings.Repeat("c", 16)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(tc.blob)
+			if err != nil {
+				t.Fatalf("parseConfig: %v", err)
+			}
+			if cfg.PubkeyHex != pub {
+				t.Errorf("pubkey = %q", cfg.PubkeyHex)
+			}
+			if cfg.ShortIDHex != sid {
+				t.Errorf("shortid = %q", cfg.ShortIDHex)
+			}
+			if cfg.SNI == "" {
+				t.Error("sni empty")
+			}
+		})
+	}
+}

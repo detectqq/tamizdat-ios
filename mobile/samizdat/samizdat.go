@@ -988,17 +988,67 @@ func parseConfig(blob string) (*config, error) {
 		port = parsedPort
 	}
 
+	// IPA-M: support both legacy and xray-style URL formats. Both branches
+	// of mobile/ — this validator and socksstub.parseSamizdatURL — must
+	// accept the same set or ConfigPasteView will reject what runtime then
+	// happily uses.
+	//
+	// Aliases:
+	//   - pubkey: pbk= (xray) | pubkey= (legacy) | public-key-hex= (older)
+	//   - shortid: userinfo before @ (xray) | shortid= (legacy)
+	//   - sni: snipool=a,b,c (multi-SNI rotation, takes first as primary)
+	//          | sni= (single)
 	sni := q.Get("sni")
 	if sni == "" {
-		return nil, errors.New("missing ?sni=")
+		if raw := q.Get("snipool"); raw != "" {
+			for _, s := range strings.Split(raw, ",") {
+				if t := strings.TrimSpace(s); t != "" {
+					sni = t
+					break
+				}
+			}
+		}
 	}
-	pub := q.Get("pubkey")
+	if sni == "" {
+		return nil, errors.New("missing ?sni= (or snipool=)")
+	}
+
+	pub := q.Get("pbk")
+	if pub == "" {
+		pub = q.Get("pubkey")
+	}
+	if pub == "" {
+		pub = q.Get("public-key-hex")
+	}
 	if len(pub) != 64 || !isHex(pub) {
-		return nil, errors.New("pubkey must be 64 hex chars")
+		return nil, errors.New("pubkey must be 64 hex chars (use pbk= or pubkey=)")
 	}
-	sid := q.Get("shortid")
+
+	sid := ""
+	if u.User != nil {
+		userinfo := u.User.Username()
+		// Comma-separated allowed (rotation pool); first non-empty entry is primary.
+		for _, s := range strings.Split(userinfo, ",") {
+			if t := strings.TrimSpace(s); t != "" {
+				sid = t
+				break
+			}
+		}
+	}
+	if sid == "" {
+		sid = q.Get("shortid")
+		// Legacy shortid= may also be comma-separated for compat.
+		if sid != "" && strings.Contains(sid, ",") {
+			for _, s := range strings.Split(sid, ",") {
+				if t := strings.TrimSpace(s); t != "" {
+					sid = t
+					break
+				}
+			}
+		}
+	}
 	if len(sid) != 16 || !isHex(sid) {
-		return nil, errors.New("shortid must be 16 hex chars")
+		return nil, errors.New("shortid must be 16 hex chars (userinfo or shortid=)")
 	}
 	fp := q.Get("fp")
 	if fp == "" {
