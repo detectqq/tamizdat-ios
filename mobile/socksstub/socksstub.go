@@ -258,12 +258,19 @@ func SetSamizdatConfig(blob string) error {
 		PublicKey:         pubKey,
 		ShortID:           shortID,
 		Fingerprint:       cfg.Fingerprint,
-		MaxStreamsPerConn: 200,
+		// Audit fix (final IPA-F): cap concurrent H2 streams at 50 (was 200).
+		// With patched x/net transportDefaultStreamFlow=256 KiB, 50 streams
+		// caps the per-conn flow-control window at ~12.5 MB instead of 50 MB.
+		// Speedtest opens at most ~16 parallel TCP flows; 50 is plenty of
+		// headroom for browsing + Speedtest overlap, and gives us the
+		// jetsam cushion the audit asked for.
+		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
-		// Path 3: heavy security work runs in the main-app process which
-		// has no jetsam cap, so it's fine to leave defaults on (TCP/Record
-		// fragmentation, NoiseFrames). The CPU cost we feared in IPA-B
-		// no longer hits the extension.
+		// IPA-E pivot: this client now lives INSIDE the extension. The
+		// extension has the ~50 MB jetsam cap (dynamically shrunk under
+		// pressure), so the security stack must stay lean. Defaults on
+		// the samizdat side (fragmentation, NoiseFrames) are fine — they
+		// allocate per-flow, not per-stream, and the conn pool is bounded.
 	})
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig samizdat.NewClient: %v", err))
@@ -545,15 +552,18 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 }
 
 // relay copies bytes between two duplex streams until either side closes.
+// Audit fix (final IPA-F): 16 KB per direction (was 32 KB). At 50 concurrent
+// flows that saves ~1.6 MB of buffer RSS — small in absolute terms but
+// directly comes off the extension's jetsam-shrunk available budget.
 func relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		_, _ = io.CopyBuffer(b, a, buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		_, _ = io.CopyBuffer(a, b, buf)
 		done <- struct{}{}
 	}()

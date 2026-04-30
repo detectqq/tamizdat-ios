@@ -317,9 +317,15 @@ misc:
         // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
         settings.ipv6Settings = nil
 
-        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
-        dns.matchDomains = [""]
-        settings.dnsSettings = dns
+        // Audit fix (final): do NOT install dnsSettings with matchDomains=[""].
+        // That would catch every DNS query into the tunnel; combined with
+        // hev's `udp: 'tcp'` (which expects a SOCKS5 UDP-ASSOCIATE handler
+        // we do not implement), DNS would be silently dropped and the
+        // user would see "VPN connects but nothing loads". Letting iOS
+        // resolve via the carrier/Wi-Fi default keeps DNS working; the
+        // tunnel still captures TCP traffic to resolved IPs because the
+        // ipv4 default route routes them through the utun.
+        settings.dnsSettings = nil
 
         return settings
     }
