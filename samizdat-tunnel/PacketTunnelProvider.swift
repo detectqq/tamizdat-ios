@@ -199,19 +199,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func describePath(_ path: NWPath) -> String {
-        if path.status != .satisfied {
+        if path.status != NWPath.Status.satisfied {
             return "unsatisfied"
         }
         // Pick the dominant interface type for label purposes.
         let typeName: String
-        switch true {
-        case path.usesInterfaceType(.wifi):     typeName = "wifi"
-        case path.usesInterfaceType(.cellular): typeName = "cellular"
-        case path.usesInterfaceType(.wiredEthernet): typeName = "wired"
-        case path.usesInterfaceType(.loopback): typeName = "loopback"
-        default:                                typeName = "other"
+        if path.usesInterfaceType(NWInterface.InterfaceType.wifi) {
+            typeName = "wifi"
+        } else if path.usesInterfaceType(NWInterface.InterfaceType.cellular) {
+            typeName = "cellular"
+        } else if path.usesInterfaceType(NWInterface.InterfaceType.wiredEthernet) {
+            typeName = "wired"
+        } else if path.usesInterfaceType(NWInterface.InterfaceType.loopback) {
+            typeName = "loopback"
+        } else {
+            typeName = "other"
         }
-        let names = path.availableInterfaces.map(\.name).joined(separator: ",")
+        let names = path.availableInterfaces.map { $0.name }.joined(separator: ",")
         return "\(typeName)[\(names)]"
     }
 
