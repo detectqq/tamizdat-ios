@@ -1005,9 +1005,12 @@ func parseConfig(blob string) (*config, error) {
 		fp = "chrome"
 	}
 	switch fp {
-	case "chrome", "firefox", "safari":
+	case "chrome", "firefox", "safari", "edge", "ios",
+		"mix", "auto", "rotate":
+		// Acceptable fp value -- newFingerprintRotator has a case for
+		// each, plus a permissive default that maps to chrome family.
 	default:
-		return nil, fmt.Errorf("fp must be chrome/firefox/safari (got %q)", fp)
+		return nil, fmt.Errorf("fp must be chrome/firefox/safari/edge/ios/mix/auto/rotate (got %q)", fp)
 	}
 
 	tcpFrag := true
