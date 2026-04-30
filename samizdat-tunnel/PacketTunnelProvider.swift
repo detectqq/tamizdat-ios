@@ -175,12 +175,29 @@ misc:
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
-        guard let fd = Self.findTunnelFileDescriptor() else {
-            appendExtLog("error: could not locate utun fd")
+        // IPA-H: utun fd discovery via NEPacketTunnelFlow KVO. The
+        // earlier "scan all fds" approach picks up the wrong utun on
+        // iOS 17+ when iCloud Private Relay or other system VPNs add
+        // utun interfaces — symptom in IPA-G: hev tx=0/0 forever
+        // because we hand it a fd that has no packets coming in.
+        // packetFlow.value(forKeyPath: "socket.fileDescriptor") is a
+        // private-API KVO read used by Tun2SocksKit, sing-box-for-
+        // apple, and every other production iOS proxy client.
+        let kvoFD = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
+        let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) ?? -1
+        appendExtLog("info: utun fd kvo=\(kvoFD) scan=\(scanFD)")
+        let fd: Int32
+        if kvoFD >= 0 {
+            fd = kvoFD
+        } else if scanFD >= 0 {
+            appendExtLog("warn: KVO fd unavailable, falling back to scan")
+            fd = scanFD
+        } else {
+            appendExtLog("error: could not locate utun fd (KVO + scan both failed)")
             completionHandler(makeError("utun fd not found"))
             return
         }
-        appendExtLog("info: utun fd = \(fd)")
+        appendExtLog("info: utun fd selected = \(fd)")
 
         // Verify main app's SOCKS5 listener is reachable before handing
         // packets to hev. If the app hasn't started SocksStubStart yet,
@@ -214,13 +231,13 @@ misc:
     // MARK: – utun fd discovery
 
     /// Enumerates open file descriptors and returns the highest-numbered
-    /// utun fd. NEPacketTunnelProvider mints a fresh utun for each
-    /// `startTunnel`; on devices with stale utun fds (multiple proxy
-    /// apps, hot-restarts), the FIRST matching fd may be a dead one.
-    /// Audit recommendation: take the largest fd that matches, since
-    /// kernel allocation is monotonic per session and the freshest
-    /// utun is what NEPacketTunnelProvider just opened for us.
-    private static func findTunnelFileDescriptor() -> Int32? {
+    /// utun fd, logging every candidate it finds along the way (with
+    /// the utun unit number from `sc_unit`). On iOS 17+ with iCloud
+    /// Private Relay this routinely returns the wrong fd because
+    /// Apple's relay utun has a higher fd than ours. KVO is the
+    /// preferred path; this scanner survives only as a diagnostic
+    /// fallback.
+    private static func findTunnelFileDescriptor(log: (String) -> Void) -> Int32? {
         var ctlInfo = ctl_info()
         withUnsafeMutablePointer(to: &ctlInfo.ctl_name) {
             $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: $0.pointee)) {
@@ -228,6 +245,7 @@ misc:
             }
         }
         var best: Int32 = -1
+        var found: [String] = []
         for fd: Int32 in 0...1024 {
             var addr = sockaddr_ctl()
             var ret: Int32 = -1
@@ -247,11 +265,15 @@ misc:
                 }
             }
             if addr.sc_id == ctlInfo.ctl_id {
+                // sc_unit is 1-based: utun(N-1).
+                let unit = Int(addr.sc_unit) - 1
+                found.append("fd=\(fd)→utun\(unit)")
                 if fd > best {
                     best = fd
                 }
             }
         }
+        log("info: utun candidates: [\(found.joined(separator: ", "))]")
         return best >= 0 ? best : nil
     }
 
