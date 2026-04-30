@@ -168,7 +168,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         appendExtLog("info: path monitor started")
     }
 
-    private func onPathUpdate(_ path: NWPath) {
+    private func onPathUpdate(_ path: Network.NWPath) {
         // Compose a stable interface fingerprint: type + name(s). This
         // avoids treating "same Wi-Fi, just IP renewed" as a change.
         let kind = describePath(path)
@@ -198,8 +198,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         rewireUpstream()
     }
 
-    private func describePath(_ path: NWPath) -> String {
-        if path.status != NWPath.Status.satisfied {
+    private func describePath(_ path: Network.NWPath) -> String {
+        if path.status != Network.NWPath.Status.satisfied {
             return "unsatisfied"
         }
         // Pick the dominant interface type for label purposes.
