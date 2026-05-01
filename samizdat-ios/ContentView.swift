@@ -263,9 +263,9 @@ struct ContentView: View {
     private var statusText: String {
         switch whitelistStatus {
         case .off:
-            return "Whitelist: off (using primary)"
+            return "Whitelist: off (using main)"
         case .detected:
-            let ep = whitelistActiveEndpoint == .backup ? "backup" : "primary"
+            let ep = whitelistActiveEndpoint == .backup ? "whitelist server" : "main"
             return "Whitelist: ON — using \(ep)"
         case .frozen:
             return "Frozen: captive portal suspected"

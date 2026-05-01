@@ -18,8 +18,8 @@ enum EndpointMode: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .primary: return "Primary"
-        case .backup:  return "Backup"
+        case .primary: return "Main"
+        case .backup:  return "Whitelist"
         case .auto:    return "Auto"
         }
     }

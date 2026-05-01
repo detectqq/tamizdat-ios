@@ -302,16 +302,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// detector is already running is a no-op.
     private func startWhitelistDetectorIfNeeded() {
         let mode = EndpointModeStore.current
-        guard mode == .auto, let _ = backupBlob else {
-            // Stop if it was running but mode changed (e.g. user toggled off).
+        let hasBackup = (backupBlob != nil)
+        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(hasBackup) running=\(whitelistDetector != nil)")
+        guard mode == .auto else {
+            // Mode is not auto → stop if it was running, paint badge as unknown
+            // so the UI doesn't keep showing a stale verdict.
+            if whitelistDetector != nil {
+                appendExtLog("info: detector stopping (mode is \(mode.rawValue), not auto)")
+                whitelistDetector?.stop()
+                whitelistDetector = nil
+            }
+            WhitelistStatusStore.current = .unknown
+            return
+        }
+        guard hasBackup else {
+            // Auto requested but no backup blob to fail over TO. Be loud
+            // about this — main app shows "Whitelist: monitoring..." silent
+            // forever otherwise. User must Save backup config and reconnect.
+            appendExtLog("warn: detector NOT started — auto mode requested but no backup configured (Save backup URL in Config and reconnect)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
-                WhitelistStatusStore.current = .unknown
             }
+            WhitelistStatusStore.current = .unknown
             return
         }
-        if whitelistDetector != nil { return }
+        if whitelistDetector != nil {
+            appendExtLog("info: detector already running")
+            return
+        }
         let detector = WhitelistDetector(
             log: { [weak self] line in self?.appendExtLog(line) },
             switchEndpoint: { [weak self] target in

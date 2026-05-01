@@ -25,11 +25,11 @@ struct ConfigPasteView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Paste your samizdat:// config URL. Optionally paste a Backup URL — the app can fail over to it when whitelist mode kicks in (full auto-detection comes in the next update).")
+                    Text("Paste your main samizdat:// config URL. Optionally paste a Whitelist URL — the app can fail over to it automatically when TSPU whitelist mode kicks in.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
 
-                    Text("Primary")
+                    Text("Main")
                         .font(.subheadline.bold())
 
                     TextEditor(text: $primary)
@@ -44,7 +44,7 @@ struct ConfigPasteView: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
 
-                    Text("Backup (optional)")
+                    Text("Whitelist server (optional, for auto-failover)")
                         .font(.subheadline.bold())
                         .padding(.top, 4)
 
@@ -68,8 +68,8 @@ struct ConfigPasteView: View {
 
                     HStack {
                         Menu {
-                            Button("Paste into Primary") { pastePrimary() }
-                            Button("Paste into Backup")  { pasteBackup() }
+                            Button("Paste into Main")      { pastePrimary() }
+                            Button("Paste into Whitelist") { pasteBackup() }
                         } label: {
                             Label("Paste from clipboard", systemImage: "doc.on.clipboard")
                         }
@@ -129,12 +129,12 @@ struct ConfigPasteView: View {
         let b = backup.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let err = SamizdatBridge.validate(p) {
-            validationError = "Primary: \(err)"
+            validationError = "Main: \(err)"
             return
         }
         if !b.isEmpty {
             if let err = SamizdatBridge.validate(b) {
-                validationError = "Backup: \(err)"
+                validationError = "Whitelist: \(err)"
                 return
             }
         }

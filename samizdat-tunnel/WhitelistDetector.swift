@@ -133,21 +133,25 @@ final class WhitelistDetector {
 
         // Auto mode required.
         guard EndpointModeStore.current == .auto else {
+            log("info: detector cycle skip (mode=\(EndpointModeStore.current.rawValue))")
             scheduleNextProbe(after: Self.normalCadence)
             return
         }
 
         // Path gate — skip cycle if no network.
         if !isPathSatisfied {
+            log("info: detector cycle skip (path unsatisfied)")
             scheduleNextProbe(after: Self.normalCadence)
             return
         }
 
         // Captive freeze gate.
         if Date() < captiveFreezeUntil {
+            log("info: detector cycle skip (captive-freeze active)")
             scheduleNextProbe(after: 30)
             return
         }
+        log("info: detector cycle start")
 
         // Cadence depends on current effective endpoint.
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
@@ -161,7 +165,7 @@ final class WhitelistDetector {
         }
     }
 
-    private enum CascadeOutcome {
+    private enum CascadeOutcome: String {
         case internetOK
         case whitelistActive
         case noNetwork
@@ -229,7 +233,8 @@ final class WhitelistDetector {
                            completion: @escaping (_ ok: Bool, _ elapsed: TimeInterval) -> Void) {
         let started = Date()
         var didSettle = false
-        let settle: (Bool) -> Void = { [weak self] ok in
+        let label = "\(canary.host):\(canary.port.rawValue)"
+        let settle: (Bool, String) -> Void = { [weak self] ok, reason in
             guard let self else { return }
             if didSettle { return }
             didSettle = true
@@ -237,7 +242,9 @@ final class WhitelistDetector {
             let conn = self.pendingConn
             self.pendingConn = nil
             conn?.cancel()
-            completion(ok, Date().timeIntervalSince(started))
+            let elapsed = Date().timeIntervalSince(started)
+            self.log("info: detector probe \(label) → \(ok ? "ok" : "fail") in \(Int(elapsed*1000))ms (\(reason))")
+            completion(ok, elapsed)
         }
 
         let host = NWEndpoint.Host(canary.host)
@@ -247,19 +254,22 @@ final class WhitelistDetector {
         conn.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                settle(true)
-            case .failed(_), .cancelled:
-                settle(false)
-            case .waiting:
-                // Waiting on a connectivity issue — let timeout decide.
-                break
+                settle(true, "ready")
+            case .failed(let err):
+                settle(false, "failed: \(err)")
+            case .cancelled:
+                settle(false, "cancelled")
+            case .waiting(let err):
+                // Waiting on a connectivity issue — let timeout decide,
+                // but log the reason so we can debug later.
+                self.log("info: detector probe \(label) waiting: \(err)")
             default:
                 break
             }
         }
         conn.start(queue: queue)
 
-        let timeoutWork = DispatchWorkItem { settle(false) }
+        let timeoutWork = DispatchWorkItem { settle(false, "timeout") }
         pendingTimeoutWork = timeoutWork
         queue.asyncAfter(deadline: .now() + Self.probeTimeout, execute: timeoutWork)
     }
@@ -269,6 +279,7 @@ final class WhitelistDetector {
     private func handleOutcome(_ outcome: CascadeOutcome) {
         let now = Date()
         let inHoldDown = now.timeIntervalSince(lastSwitchedAt) < Self.holdDownSeconds
+        log("info: detector cycle outcome=\(outcome.rawValue) holdDown=\(inHoldDown)")
 
         switch outcome {
         case .internetOK:
