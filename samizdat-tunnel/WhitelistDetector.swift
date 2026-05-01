@@ -175,21 +175,20 @@ final class WhitelistDetector {
     /// Walks the cascade in order, stopping on the first ✅ in steps 1..2
     /// or the first ✅ in steps 3..4 after all of 1..2 failed. Calls
     /// completion exactly once on the detector queue.
+    ///
+    /// IPA-Q.4: removed the captive-portal "both canaries <50 ms"
+    /// heuristic — it false-positived on regular home Wi-Fi where
+    /// 1.1.1.1/8.8.8.8 normally respond in 20-40 ms. Without a real
+    /// content-check (HTTP fetch of captive.apple.com/hotspot-detect.html)
+    /// we cannot reliably distinguish a captive portal from healthy
+    /// fast internet. We let it pass through as .internetOK; if there
+    /// IS a captive portal the user's actual flows will fail, the user
+    /// will know.
     private func cascadeProbe(completion: @escaping (CascadeOutcome) -> Void) {
-        runOne(canaries: Self.internetCanaries, idx: 0) { [weak self] internetOK, allSucceededFast in
+        runOne(canaries: Self.internetCanaries, idx: 0) { [weak self] internetOK, _ in
             guard let self else { return }
             if internetOK {
-                // Captive portal suspicion: 1.1.1.1 OR 8.8.8.8 connecting
-                // ridiculously fast (sub-50 ms) on first cycle is rare on
-                // cellular and may indicate a portal MITM. We only treat
-                // this as suspicious if BOTH internet canaries connect
-                // ridiculously fast (so a single fast Wi-Fi probe doesn't
-                // trip the freeze).
-                if allSucceededFast {
-                    completion(.captiveSuspected)
-                } else {
-                    completion(.internetOK)
-                }
+                completion(.internetOK)
                 return
             }
             // Internet canaries all failed — try RU.
@@ -341,8 +340,9 @@ final class WhitelistDetector {
             WhitelistStatusStore.current = .noNetwork
 
         case .captiveSuspected:
-            // Both global canaries returned in <50 ms — treat as portal.
-            // Freeze switching for 5 minutes; show yellow.
+            // IPA-Q.4: cascadeProbe no longer emits this — kept for
+            // forward-compat in case a proper captive-portal check
+            // (HTTP fetch of captive.apple.com) is added later.
             captiveFreezeUntil = now.addingTimeInterval(Self.captiveFreezeSeconds)
             log("warn: detector: captive portal suspected — freezing 300 s")
             WhitelistStatusStore.current = .frozen
