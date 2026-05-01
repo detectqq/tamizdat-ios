@@ -7,7 +7,17 @@ struct ContentView: View {
     @State private var showTelegram = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
-    @State private var endpointMode: EndpointMode = EndpointModeStore.current
+
+    // IPA-P.1: split the 3-way segmented picker into a clearer
+    // "Auto detection on/off" toggle + a manual endpoint picker that
+    // is only shown when auto is off. The persistent EndpointMode in
+    // App Group UserDefaults still has three values (primary/backup/
+    // auto) — this UI just maps them to two controls.
+    @State private var isAutoMode: Bool = (EndpointModeStore.current == .auto)
+    @State private var manualEndpoint: EndpointMode = {
+        let cur = EndpointModeStore.current
+        return cur == .auto ? .primary : cur
+    }()
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
@@ -69,31 +79,45 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // ── Endpoint picker (only when backup configured) ──────────────
+            // ── Endpoint controls (only when backup configured) ────────────
             if hasBackupConfigured {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Endpoint")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Picker("Endpoint", selection: $endpointMode) {
-                        Text(EndpointMode.primary.label).tag(EndpointMode.primary)
-                        Text(EndpointMode.backup.label).tag(EndpointMode.backup)
-                        Text("Auto (soon)").tag(EndpointMode.auto)
-                    }
-                    .pickerStyle(.segmented)
-                    // Auto disabled in IPA-P (needs WhitelistDetector from IPA-Q).
-                    .onChange(of: endpointMode) { _, newMode in
-                        if newMode == .auto {
-                            // Bounce back to whatever was before — auto isn't
-                            // wired yet. Picker shows the option to telegraph
-                            // that it's coming.
-                            DispatchQueue.main.async {
-                                endpointMode = EndpointModeStore.current
-                            }
-                            return
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: $isAutoMode) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                            Text("Auto-detect whitelist")
+                                .font(.subheadline.weight(.medium))
                         }
+                    }
+                    .onChange(of: isAutoMode) { _, newAuto in
+                        let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
                         Task {
                             await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                        }
+                    }
+
+                    if isAutoMode {
+                        // Whitelist status fonarь — placeholder в P.1.
+                        // В IPA-Q здесь будет состояние от WhitelistDetector.
+                        HStack(spacing: 6) {
+                            Image(systemName: "circle.fill")
+                                .foregroundStyle(.gray)
+                                .font(.caption)
+                            Text("Whitelist: monitoring activates after next update")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Picker("Endpoint", selection: $manualEndpoint) {
+                            Text(EndpointMode.primary.label).tag(EndpointMode.primary)
+                            Text(EndpointMode.backup.label).tag(EndpointMode.backup)
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: manualEndpoint) { _, newEndpoint in
+                            guard !isAutoMode else { return }
+                            Task {
+                                await VPNProfileStore.shared.switchEndpoint(to: newEndpoint)
+                            }
                         }
                     }
                 }
@@ -139,11 +163,16 @@ struct ContentView: View {
             ConfigPasteView { saved in
                 hasConfig = saved
                 hasBackupConfigured = ContentView.checkBackupConfigured()
-                // If backup got removed and current mode was .backup, fall
-                // back to .primary so we don't dial nothing.
-                if !hasBackupConfigured && endpointMode == .backup {
-                    endpointMode = .primary
-                    EndpointModeStore.current = .primary
+                // If backup got removed:
+                //  - manualEndpoint can no longer be .backup
+                //  - if current persisted mode was .backup, demote to .primary
+                if !hasBackupConfigured {
+                    if manualEndpoint == .backup {
+                        manualEndpoint = .primary
+                    }
+                    if EndpointModeStore.current == .backup {
+                        EndpointModeStore.current = .primary
+                    }
                 }
             }
         }
