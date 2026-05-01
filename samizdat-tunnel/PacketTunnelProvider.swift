@@ -70,6 +70,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var primaryBlob: String = ""
     private var backupBlob: String?
 
+    // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
+    // that flips to backup when TSPU whitelist mode is detected and
+    // back to primary when it lifts.
+    private var whitelistDetector: WhitelistDetector?
+    private var lastPathSatisfied: Bool = true
+
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
         // Start writing into App Group log file immediately so we have a
@@ -157,6 +163,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
+        whitelistDetector?.stop()
+        whitelistDetector = nil
+        WhitelistStatusStore.reset()
         pathMonitor.cancel()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
@@ -184,6 +193,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func onPathUpdate(_ path: Network.NWPath) {
+        // Forward path-satisfied state to the WhitelistDetector so it
+        // pauses probes during a network outage (lift / forest / metro).
+        let satisfied = (path.status == .satisfied)
+        if satisfied != lastPathSatisfied {
+            lastPathSatisfied = satisfied
+            whitelistDetector?.notePathChange(satisfied: satisfied)
+        }
+
         // Compose a stable interface fingerprint: type + name(s). This
         // avoids treating "same Wi-Fi, just IP renewed" as a change.
         let kind = describePath(path)
@@ -258,16 +275,59 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Picks the appropriate blob for a given mode. Auto falls back to
-    /// primary in IPA-P (WhitelistDetector lands in IPA-Q). Backup mode
-    /// without a configured backup blob silently uses primary.
+    /// Picks the appropriate blob for a given mode. In manual modes
+    /// (.primary/.backup) it follows the user's pick. In .auto mode it
+    /// honours WhitelistStatusStore.activeEndpoint — which the
+    /// WhitelistDetector flips between .primary and .backup based on
+    /// the cascade probe verdict.
     private static func pick(mode: EndpointMode, primary: String, backup: String?) -> String {
         switch mode {
-        case .primary, .auto:
+        case .primary:
             return primary
         case .backup:
             return backup ?? primary
+        case .auto:
+            // Detector's effective choice; defaults to primary on first run.
+            switch WhitelistStatusStore.activeEndpoint {
+            case .backup: return backup ?? primary
+            default:      return primary
+            }
         }
+    }
+
+    // MARK: – WhitelistDetector lifecycle
+
+    /// Starts the detector iff EndpointModeStore.current == .auto AND a
+    /// backup blob is configured. Idempotent — calling again while the
+    /// detector is already running is a no-op.
+    private func startWhitelistDetectorIfNeeded() {
+        let mode = EndpointModeStore.current
+        guard mode == .auto, let _ = backupBlob else {
+            // Stop if it was running but mode changed (e.g. user toggled off).
+            if whitelistDetector != nil {
+                whitelistDetector?.stop()
+                whitelistDetector = nil
+                WhitelistStatusStore.current = .unknown
+            }
+            return
+        }
+        if whitelistDetector != nil { return }
+        let detector = WhitelistDetector(
+            log: { [weak self] line in self?.appendExtLog(line) },
+            switchEndpoint: { [weak self] target in
+                guard let self else { return }
+                // The detector already wrote WhitelistStatusStore.activeEndpoint
+                // before calling us; just trigger the rewire to apply it.
+                self.appendExtLog("info: detector requested switch → \(target.rawValue)")
+                self.rewireUpstream()
+            },
+            pathProvider: { [weak self] in self?.pathMonitor.currentPath }
+        )
+        // Seed with current path-status so first-cycle decisions don't
+        // trip on a stale "satisfied" assumption.
+        detector.notePathChange(satisfied: lastPathSatisfied)
+        whitelistDetector = detector
+        detector.start()
     }
 
     override func handleAppMessage(_ messageData: Data,
@@ -281,6 +341,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // UserDefaults; we re-read and rewire to the new endpoint.
             let mode = EndpointModeStore.current
             appendExtLog("info: app requested endpoint switch → \(mode.rawValue)")
+            // IPA-Q: also start/stop the WhitelistDetector based on
+            // whether auto mode is now selected.
+            startWhitelistDetectorIfNeeded()
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         default:
@@ -355,6 +418,7 @@ misc:
 
         startSwiftHeartbeat()
         startPathMonitor()
+        startWhitelistDetectorIfNeeded()
         isRunning = true
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
@@ -478,6 +542,14 @@ misc:
         // (iOS may special-case loopback here but explicit is safer.)
         ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
+            // IPA-Q: WhitelistDetector probe targets must reach the
+            // underlying interface, not loop through our own utun.
+            // 1.1.1.1 + 8.8.8.8 are the global "is internet up" canaries;
+            // 77.88.8.0/24 covers all Yandex DNS variants used as the
+            // RU-whitelisted canary.
+            NEIPv4Route(destinationAddress: "1.1.1.1", subnetMask: "255.255.255.255"),
+            NEIPv4Route(destinationAddress: "8.8.8.8", subnetMask: "255.255.255.255"),
+            NEIPv4Route(destinationAddress: "77.88.8.0", subnetMask: "255.255.255.0"),
         ]
         settings.ipv4Settings = ipv4
 

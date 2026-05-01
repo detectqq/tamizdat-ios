@@ -18,6 +18,13 @@ struct ContentView: View {
         let cur = EndpointModeStore.current
         return cur == .auto ? .primary : cur
     }()
+
+    // IPA-Q: live whitelist-detection status, polled from App Group
+    // UserDefaults every 2 s while the view is visible.
+    @State private var whitelistStatus: WhitelistStatus = .unknown
+    @State private var whitelistActiveEndpoint: EndpointMode = .primary
+    @State private var statusPollTimer: Timer?
+
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
@@ -97,13 +104,13 @@ struct ContentView: View {
                     }
 
                     if isAutoMode {
-                        // Whitelist status fonarь — placeholder в P.1.
-                        // В IPA-Q здесь будет состояние от WhitelistDetector.
+                        // IPA-Q: live status from WhitelistDetector via
+                        // WhitelistStatusStore (App Group UserDefaults).
                         HStack(spacing: 6) {
                             Image(systemName: "circle.fill")
-                                .foregroundStyle(.gray)
+                                .foregroundStyle(statusColor)
                                 .font(.caption)
-                            Text("Whitelist: monitoring activates after next update")
+                            Text(statusText)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -182,6 +189,12 @@ struct ContentView: View {
         .sheet(isPresented: $showTelegram) {
             TelegramSettingsView()
         }
+        .onAppear {
+            startStatusPolling()
+        }
+        .onDisappear {
+            stopStatusPolling()
+        }
     }
 
     // MARK: – derived
@@ -234,6 +247,59 @@ struct ContentView: View {
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "v\(marketing) (build \(build))"
+    }
+
+    // IPA-Q: status badge colour + text driven by WhitelistDetector.
+    private var statusColor: Color {
+        switch whitelistStatus {
+        case .off:        return .green
+        case .detected:   return .red
+        case .frozen:     return .yellow
+        case .noNetwork:  return .gray
+        case .unknown:    return .gray
+        }
+    }
+
+    private var statusText: String {
+        switch whitelistStatus {
+        case .off:
+            return "Whitelist: off (using primary)"
+        case .detected:
+            let ep = whitelistActiveEndpoint == .backup ? "backup" : "primary"
+            return "Whitelist: ON — using \(ep)"
+        case .frozen:
+            return "Frozen: captive portal suspected"
+        case .noNetwork:
+            return "Whitelist: no network (paused)"
+        case .unknown:
+            return "Whitelist: monitoring…"
+        }
+    }
+
+    private func refreshWhitelistStatus() {
+        whitelistStatus = WhitelistStatusStore.current
+        whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
+        // If we haven't heard from the detector in >15 s while connected,
+        // paint grey "monitoring stalled" rather than misleading green.
+        if isAutoMode && bridge.state == .connected
+            && WhitelistStatusStore.ageSeconds > 15 {
+            whitelistStatus = .unknown
+        }
+    }
+
+    private func startStatusPolling() {
+        statusPollTimer?.invalidate()
+        let timer = Timer(timeInterval: 2.0, repeats: true) { _ in
+            refreshWhitelistStatus()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        statusPollTimer = timer
+        refreshWhitelistStatus() // immediate
+    }
+
+    private func stopStatusPolling() {
+        statusPollTimer?.invalidate()
+        statusPollTimer = nil
     }
 
     private func toggleConnection() {

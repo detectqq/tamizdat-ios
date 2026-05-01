@@ -73,6 +73,10 @@ targets:
       # App Group UserDefaults at startTunnel time and split the stored
       # combined URL into per-endpoint blobs.
       - path: samizdat-ios/EndpointMode.swift
+      # IPA-Q: WhitelistStatusStore is the same App Group UserDefaults
+      # bridge — extension writes the detector verdict, main app polls
+      # for the status badge.
+      - path: samizdat-ios/WhitelistStatus.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true
