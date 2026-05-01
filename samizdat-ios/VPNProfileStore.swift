@@ -117,6 +117,15 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("switchEndpoint")
     }
 
+    /// IPA-T: triggers extension to rebuild the samizdat client. Used
+    /// by the "Performance mode" toggle so flipping it immediately
+    /// reflects in the live transport (the new client picks up
+    /// PerformancePreferences.gameOptimized when it constructs the
+    /// ClientConfig).
+    func refreshSamizdatClient() async {
+        _ = try? await sendProviderMessage("refreshSamizdatClient")
+    }
+
     @discardableResult
     private func ensureProfile(configBlob: String, engineConfigBlob: String, serverIP: String?) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager

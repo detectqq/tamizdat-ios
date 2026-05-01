@@ -149,6 +149,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return false
             }
         }
+        // IPA-T: seed Go-side with the persisted "Performance mode" flag
+        // before building the client. The setter just stores the bit;
+        // SetSamizdatConfig below reads it when constructing ClientConfig.
+        SocksstubSetGameOptimizedMode(PerformancePreferences.gameOptimized)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -365,6 +369,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             startWhitelistDetectorIfNeeded()
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
+        case "refreshSamizdatClient":
+            // IPA-T: Performance-mode toggle changed in main-app UI.
+            // Push the new flag into Go-side then rebuild the client
+            // with the matching DisableDefaultSecurity setting.
+            let perf = PerformancePreferences.gameOptimized
+            appendExtLog("info: app requested samizdat refresh (performance mode = \(perf))")
+            SocksstubSetGameOptimizedMode(perf)
+            rewireUpstream()
+            completionHandler?("refreshed".data(using: .utf8))
         default:
             completionHandler?(Data())
         }

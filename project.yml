@@ -81,6 +81,12 @@ targets:
       # check the user-set enabled flag before posting a local
       # notification on whitelist on/off transitions.
       - path: samizdat-ios/NotificationPreferences.swift
+      # IPA-T: PerformancePreferences shared so the SocksStub can
+      # check whether to flip DisableDefaultSecurity on the
+      # tamizdat ClientConfig (Game-optimized mode disables TLS
+      # transport rotation + cover-traffic + fragmentation, which
+      # otherwise make real-time games stutter).
+      - path: samizdat-ios/PerformancePreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

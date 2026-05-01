@@ -86,6 +86,10 @@ type runtimeState struct {
 	samizdatClient *samizdat.Client // nil unless SetSamizdatConfig succeeded
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
+	// IPA-T: gameOptimized flips DisableDefaultSecurity on the next
+	// samizdat.NewClient call. Toggled by Swift via SocksstubSetGameMode
+	// before re-calling SocksstubSetSamizdatConfig with the same blob.
+	gameOptimized atomic.Bool
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -293,6 +297,19 @@ func SetSamizdatConfig(blob string) error {
 		// Audit fix (final IPA-F): cap concurrent H2 streams at 50.
 		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
+		// IPA-T: Game-optimized mode flips DisableDefaultSecurity on
+		// tamizdat's ClientConfig. The library's applyDefaults() then
+		// skips: BytesPerTransportSoftCap=13312, TCPFragmentation,
+		// RecordFragmentation, CoverTrafficEnabled, MinTransports=2.
+		// Result: a single stable TLS+H2 transport for the whole
+		// session — no rotation handshakes during gameplay, no
+		// Geneva-fragmented frames stalling UDP-in-TCP relay, no
+		// cover-traffic competing for bandwidth.
+		// Off by default; flipped via Settings -> Game-optimized.
+		DisableDefaultSecurity: rt.gameOptimized.Load(),
+	}
+	if rt.gameOptimized.Load() {
+		rt.appendLog("info: client built with DisableDefaultSecurity=true (game-optimized mode)")
 	}
 	// IPA-M: opt-in SNI rotation pool when the URL carried snipool=…
 	// (legacy ServerNames field still present in tamizdat ClientConfig).
@@ -494,6 +511,20 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 // keeps the visible process RSS as low as the live-set permits.
 func FreeOSMemory() {
 	debug.FreeOSMemory()
+}
+
+// SetGameOptimizedMode flips the global flag that drives
+// DisableDefaultSecurity on the next samizdat.NewClient. Caller must
+// follow up with a SetSamizdatConfig(blob) to actually rebuild the
+// transport (the existing client keeps its old defaults until torn
+// down). Exported for gomobile bind.
+func SetGameOptimizedMode(enabled bool) {
+	rt.gameOptimized.Store(enabled)
+	if enabled {
+		rt.appendLog("info: game-optimized mode = ON (next client build will use DisableDefaultSecurity)")
+	} else {
+		rt.appendLog("info: game-optimized mode = OFF (default tamizdat security applied)")
+	}
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.
