@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import UserNotifications
 
 /// WhitelistDetector — periodic out-of-tunnel TCP probe cascade that
 /// decides whether the current network is in TSPU whitelist mode and
@@ -353,5 +354,32 @@ final class WhitelistDetector {
         lastSwitchedAt = Date()
         WhitelistStatusStore.activeEndpoint = endpoint
         switchEndpoint(endpoint)
+        postSwitchNotification(to: endpoint)
+    }
+
+    /// Posts a local notification announcing the switch. Gated on the
+    /// user's NotificationPreferences toggle — silent when off.
+    private func postSwitchNotification(to endpoint: EndpointMode) {
+        guard NotificationPreferences.enabled else { return }
+        let content = UNMutableNotificationContent()
+        switch endpoint {
+        case .backup:
+            content.title = "Whitelist mode detected"
+            content.body  = "Switched to whitelist server to keep traffic flowing."
+        case .primary, .auto:
+            content.title = "Whitelist lifted"
+            content.body  = "Switched back to main server."
+        }
+        content.sound = .default
+        content.categoryIdentifier = NotificationIDs.categoryIdentifier
+        let id = (endpoint == .backup) ? NotificationIDs.detectedID : NotificationIDs.recoveredID
+        let req = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req) { [weak self] err in
+            if let err = err {
+                self?.log("warn: notification post failed: \(err)")
+            } else {
+                self?.log("info: notification posted (\(endpoint.rawValue))")
+            }
+        }
     }
 }

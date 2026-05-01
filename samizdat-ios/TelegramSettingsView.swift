@@ -117,7 +117,7 @@ struct TelegramSettingsView: View {
         TelegramReporter.chatID   = chatID
         testStatus = .sending
         let caption = TelegramReporter.defaultCaption(extra: "test message")
-        TelegramReporter.sendLog(text: "Samizdat Telegram test \(Date())\n",
+        TelegramReporter.sendLog(text: "Tamizdat Telegram test \(Date())\n",
                                  caption: caption) { result in
             switch result {
             case .success:

@@ -7,7 +7,7 @@ final class VPNProfileStore {
     static let shared = VPNProfileStore()
 
     private let providerBundleIdentifier = "com.anarki.samizdat-test.tunnel"
-    private let localizedDescription = "Samizdat Test"
+    private let localizedDescription = "Tamizdat"
 
     /// Cache of the loaded NETunnelProviderManager. Each
     /// loadAllFromPreferences call is an XPC roundtrip to nesessionmanager,

@@ -77,6 +77,10 @@ targets:
       # bridge — extension writes the detector verdict, main app polls
       # for the status badge.
       - path: samizdat-ios/WhitelistStatus.swift
+      # IPA-S: NotificationPreferences shared so the extension can
+      # check the user-set enabled flag before posting a local
+      # notification on whitelist on/off transitions.
+      - path: samizdat-ios/NotificationPreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

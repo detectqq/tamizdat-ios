@@ -2,9 +2,8 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var bridge = SamizdatBridge()
-    @State private var showConfig = false
+    @State private var showSettings = false
     @State private var showLogs = false
-    @State private var showTelegram = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
 
@@ -134,15 +133,6 @@ struct ContentView: View {
             // ── Sub-buttons ────────────────────────────────────────────────
             HStack(spacing: 12) {
                 Button {
-                    showConfig = true
-                } label: {
-                    Label("Config", systemImage: "key.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.bordered)
-
-                Button {
                     showLogs = true
                 } label: {
                     Label("Logs", systemImage: "doc.text.fill")
@@ -152,9 +142,9 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
 
                 Button {
-                    showTelegram = true
+                    showSettings = true
                 } label: {
-                    Label("Telegram", systemImage: "paperplane.fill")
+                    Label("Settings", systemImage: "gearshape.fill")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                 }
@@ -166,13 +156,10 @@ struct ContentView: View {
                 .foregroundStyle(.tertiary)
         }
         .padding(24)
-        .sheet(isPresented: $showConfig) {
-            ConfigPasteView { saved in
+        .sheet(isPresented: $showSettings) {
+            SettingsView(onConfigChanged: { saved in
                 hasConfig = saved
                 hasBackupConfigured = ContentView.checkBackupConfigured()
-                // If backup got removed:
-                //  - manualEndpoint can no longer be .backup
-                //  - if current persisted mode was .backup, demote to .primary
                 if !hasBackupConfigured {
                     if manualEndpoint == .backup {
                         manualEndpoint = .primary
@@ -181,13 +168,10 @@ struct ContentView: View {
                         EndpointModeStore.current = .primary
                     }
                 }
-            }
+            })
         }
         .sheet(isPresented: $showLogs) {
             LogView(bridge: bridge)
-        }
-        .sheet(isPresented: $showTelegram) {
-            TelegramSettingsView()
         }
         .onAppear {
             startStatusPolling()

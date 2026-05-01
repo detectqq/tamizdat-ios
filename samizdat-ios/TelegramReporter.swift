@@ -140,7 +140,7 @@ enum TelegramReporter {
         let app = bundle?["CFBundleShortVersionString"] as? String ?? "?"
         let build = bundle?["CFBundleVersion"] as? String ?? "?"
         var parts = [
-            "Samizdat \(app) (\(build))",
+            "Tamizdat \(app) (\(build))",
             "iOS \(device.systemVersion)",
             device.model,
         ]
