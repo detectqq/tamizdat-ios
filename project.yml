@@ -68,6 +68,11 @@ targets:
           - "*.entitlements"
           - "Info.plist"
           - "Bridging-Header.h"
+      # IPA-P: share EndpointMode + SamizdatURLCodec with the extension
+      # so the extension can read the user's primary/backup choice from
+      # App Group UserDefaults at startTunnel time and split the stored
+      # combined URL into per-endpoint blobs.
+      - path: samizdat-ios/EndpointMode.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

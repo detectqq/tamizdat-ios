@@ -108,6 +108,15 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("clearLogs")
     }
 
+    /// IPA-P: live-switch the active endpoint without disconnecting the
+    /// VPN. Writes EndpointModeStore.current first (source of truth)
+    /// then pokes the extension via provider message so it re-reads
+    /// and rewires its samizdat client over the current network.
+    func switchEndpoint(to mode: EndpointMode) async {
+        EndpointModeStore.current = mode
+        _ = try? await sendProviderMessage("switchEndpoint")
+    }
+
     @discardableResult
     private func ensureProfile(configBlob: String, engineConfigBlob: String, serverIP: String?) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager

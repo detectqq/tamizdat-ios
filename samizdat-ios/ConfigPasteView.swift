@@ -2,64 +2,97 @@ import SwiftUI
 
 struct ConfigPasteView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var blob: String = ConfigStore.shared.load() ?? ""
+
+    // IPA-P: split the stored combined URL on entry so the UI can show
+    // two TextFields. On Save we compose them back into one Keychain
+    // blob via SamizdatURLCodec.
+    @State private var primary: String
+    @State private var backup: String
     @State private var validationError: String?
 
     /// Called on dismiss with `true` if a config is now stored, `false` if cleared.
     var onClose: (Bool) -> Void
 
+    init(onClose: @escaping (Bool) -> Void) {
+        self.onClose = onClose
+        let stored = ConfigStore.shared.load() ?? ""
+        let split = SamizdatURLCodec.split(stored)
+        _primary = State(initialValue: split.primary)
+        _backup  = State(initialValue: split.backup ?? "")
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Paste a samizdat:// config URL.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Paste your samizdat:// config URL. Optionally paste a Backup URL — the app can fail over to it when whitelist mode kicks in (full auto-detection comes in the next update).")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
 
-                TextEditor(text: $blob)
-                    .font(.body.monospaced())
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(.secondarySystemBackground))
-                    )
-                    .frame(minHeight: 160)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    Text("Primary")
+                        .font(.subheadline.bold())
 
-                if let validationError {
-                    Label(validationError, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
+                    TextEditor(text: $primary)
+                        .font(.body.monospaced())
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color(.secondarySystemBackground))
+                        )
+                        .frame(minHeight: 120)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
 
-                HStack {
-                    Button {
-                        if let pasted = UIPasteboard.general.string {
-                            blob = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
-                            validationError = nil
+                    Text("Backup (optional)")
+                        .font(.subheadline.bold())
+                        .padding(.top, 4)
+
+                    TextEditor(text: $backup)
+                        .font(.body.monospaced())
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color(.secondarySystemBackground))
+                        )
+                        .frame(minHeight: 120)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+
+                    if let validationError {
+                        Label(validationError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+
+                    HStack {
+                        Menu {
+                            Button("Paste into Primary") { pastePrimary() }
+                            Button("Paste into Backup")  { pasteBackup() }
+                        } label: {
+                            Label("Paste from clipboard", systemImage: "doc.on.clipboard")
                         }
-                    } label: {
-                        Label("Paste from clipboard", systemImage: "doc.on.clipboard")
-                    }
-                    .buttonStyle(.bordered)
+                        .buttonStyle(.bordered)
 
-                    Spacer()
+                        Spacer()
 
-                    Button(role: .destructive) {
-                        ConfigStore.shared.delete()
-                        blob = ""
-                        validationError = nil
-                    } label: {
-                        Label("Clear", systemImage: "trash")
+                        Button(role: .destructive) {
+                            ConfigStore.shared.delete()
+                            primary = ""
+                            backup = ""
+                            validationError = nil
+                        } label: {
+                            Label("Clear", systemImage: "trash")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(primary.isEmpty && backup.isEmpty)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(blob.isEmpty)
+
+                    Spacer(minLength: 24)
                 }
-
-                Spacer()
+                .padding()
             }
-            .padding()
             .navigationTitle("Configuration")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -70,19 +103,45 @@ struct ConfigPasteView: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let err = SamizdatBridge.validate(trimmed) {
-                            validationError = err
-                            return
-                        }
-                        ConfigStore.shared.save(trimmed)
-                        onClose(true)
-                        dismiss()
-                    }
-                    .disabled(blob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Save") { save() }
+                        .disabled(primary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }
     }
+
+    // MARK: – actions
+
+    private func pastePrimary() {
+        guard let pasted = UIPasteboard.general.string else { return }
+        primary = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+        validationError = nil
+    }
+
+    private func pasteBackup() {
+        guard let pasted = UIPasteboard.general.string else { return }
+        backup = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+        validationError = nil
+    }
+
+    private func save() {
+        let p = primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = backup.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let err = SamizdatBridge.validate(p) {
+            validationError = "Primary: \(err)"
+            return
+        }
+        if !b.isEmpty {
+            if let err = SamizdatBridge.validate(b) {
+                validationError = "Backup: \(err)"
+                return
+            }
+        }
+        let combined = SamizdatURLCodec.compose(primary: p, backup: b.isEmpty ? nil : b)
+        ConfigStore.shared.save(combined)
+        onClose(true)
+        dismiss()
+    }
 }
+

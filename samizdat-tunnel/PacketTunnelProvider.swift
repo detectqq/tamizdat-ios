@@ -59,7 +59,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let pathMonitorQueue = DispatchQueue(label: "com.anarki.samizdat-test.path", qos: .utility)
     private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
     private var lastReconnectAt = Date.distantPast
-    private var storedConfigBlob: String = ""
+
+    // IPA-P: dual-endpoint storage. The combined blob arrives in
+    // providerConfiguration; we split it into primary + optional backup
+    // and pick which one to dial based on EndpointModeStore.current
+    // (read from App Group UserDefaults — the main app writes when the
+    // user taps the picker, then sends a "switchEndpoint" provider
+    // message so we re-read live without disconnect).
+    private var combinedConfigBlob: String = ""
+    private var primaryBlob: String = ""
+    private var backupBlob: String?
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -76,17 +85,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
 
-        // Stash so the path-monitor reconnect handler can re-call
-        // SocksstubSetSamizdatConfig without poking back into
-        // protocolConfiguration on a non-main queue.
-        self.storedConfigBlob = configBlob
+        // IPA-P: split the combined blob (which carries an optional
+        // &backup=base64url(...) query param) into per-endpoint URLs.
+        // The currently selected endpoint feeds SocksStubSetSamizdatConfig.
+        let split = SamizdatURLCodec.split(configBlob)
+        self.combinedConfigBlob = configBlob
+        self.primaryBlob = split.primary
+        self.backupBlob = split.backup
+        let mode = EndpointModeStore.current
+        let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
+        appendExtLog("info: endpoint mode = \(mode.rawValue) (backup configured: \(split.backup != nil))")
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
         // of the loopback bridge live in this extension, so there is no
         // cross-process sandbox issue and the listener can never get
         // host-app-suspended out from under us.
         appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: configBlob, log: appendExtLog) {
+        if !Self.startInProcessSocks(configBlob: activeBlob, log: appendExtLog) {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
@@ -226,29 +241,48 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// default interface. The SOCKS5 listener itself stays up, so hev
     /// can keep using 127.0.0.1:\(socksPort) without restart.
     private func rewireUpstream() {
-        guard !storedConfigBlob.isEmpty else { return }
+        let mode = EndpointModeStore.current
+        let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
+        guard !blob.isEmpty else { return }
         // Run off the path monitor queue to avoid serializing further
         // updates while we sit inside Go-side teardown.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, blob = storedConfigBlob] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
                 self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
             } else {
-                self.appendExtLog("info: rewire ok — fresh samizdat client warmed via current interface")
+                self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
             }
+        }
+    }
+
+    /// Picks the appropriate blob for a given mode. Auto falls back to
+    /// primary in IPA-P (WhitelistDetector lands in IPA-Q). Backup mode
+    /// without a configured backup blob silently uses primary.
+    private static func pick(mode: EndpointMode, primary: String, backup: String?) -> String {
+        switch mode {
+        case .primary, .auto:
+            return primary
+        case .backup:
+            return backup ?? primary
         }
     }
 
     override func handleAppMessage(_ messageData: Data,
                                    completionHandler: ((Data?) -> Void)?) {
-        // App reads logs from the App Group file directly now; this RPC
-        // path is kept only for explicit "ping" probes from the bridge.
         let cmd = String(data: messageData, encoding: .utf8) ?? "ping"
         switch cmd {
         case "ping":
             completionHandler?("pong".data(using: .utf8))
+        case "switchEndpoint":
+            // IPA-P: main app updated EndpointModeStore in App Group
+            // UserDefaults; we re-read and rewire to the new endpoint.
+            let mode = EndpointModeStore.current
+            appendExtLog("info: app requested endpoint switch → \(mode.rawValue)")
+            rewireUpstream()
+            completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         default:
             completionHandler?(Data())
         }

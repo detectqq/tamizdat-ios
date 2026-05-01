@@ -6,8 +6,15 @@ struct ContentView: View {
     @State private var showLogs = false
     @State private var showTelegram = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
+    @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
+    @State private var endpointMode: EndpointMode = EndpointModeStore.current
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
+
+    private static func checkBackupConfigured() -> Bool {
+        guard let blob = ConfigStore.shared.load() else { return false }
+        return SamizdatURLCodec.split(blob).backup != nil
+    }
 
     var body: some View {
         VStack(spacing: 28) {
@@ -62,6 +69,37 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // ── Endpoint picker (only when backup configured) ──────────────
+            if hasBackupConfigured {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Endpoint")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("Endpoint", selection: $endpointMode) {
+                        Text(EndpointMode.primary.label).tag(EndpointMode.primary)
+                        Text(EndpointMode.backup.label).tag(EndpointMode.backup)
+                        Text("Auto (soon)").tag(EndpointMode.auto)
+                    }
+                    .pickerStyle(.segmented)
+                    // Auto disabled in IPA-P (needs WhitelistDetector from IPA-Q).
+                    .onChange(of: endpointMode) { _, newMode in
+                        if newMode == .auto {
+                            // Bounce back to whatever was before — auto isn't
+                            // wired yet. Picker shows the option to telegraph
+                            // that it's coming.
+                            DispatchQueue.main.async {
+                                endpointMode = EndpointModeStore.current
+                            }
+                            return
+                        }
+                        Task {
+                            await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                        }
+                    }
+                }
+                .padding(.horizontal, 4)
+            }
+
             // ── Sub-buttons ────────────────────────────────────────────────
             HStack(spacing: 12) {
                 Button {
@@ -100,6 +138,13 @@ struct ContentView: View {
         .sheet(isPresented: $showConfig) {
             ConfigPasteView { saved in
                 hasConfig = saved
+                hasBackupConfigured = ContentView.checkBackupConfigured()
+                // If backup got removed and current mode was .backup, fall
+                // back to .primary so we don't dial nothing.
+                if !hasBackupConfigured && endpointMode == .backup {
+                    endpointMode = .primary
+                    EndpointModeStore.current = .primary
+                }
             }
         }
         .sheet(isPresented: $showLogs) {
