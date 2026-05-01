@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import (
 	"crypto/sha256"
@@ -30,9 +30,9 @@ func initReplayExpvars() {
 		replayHits = new(expvar.Int)
 		replayWindowSize = new(expvar.Int)
 		replayEvictions = new(expvar.Int)
-		expvar.Publish("samizdat.replay.hits", replayHits)
-		expvar.Publish("samizdat.replay.window_size", replayWindowSize)
-		expvar.Publish("samizdat.replay.evictions", replayEvictions)
+		expvar.Publish("tamizdat.replay.hits", replayHits)
+		expvar.Publish("tamizdat.replay.window_size", replayWindowSize)
+		expvar.Publish("tamizdat.replay.evictions", replayEvictions)
 	})
 }
 

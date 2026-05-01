@@ -175,7 +175,7 @@ func TestSamizdatConfigParse(t *testing.T) {
 		{"samizdat://h:18447/?sni=ok&pubkey=" + strings.Repeat("a", 64) + "&shortid=" + strings.Repeat("b", 16) + "&fp=chrome", ""},
 		{"samizdat://h:18447/?sni=ok&pubkey=tooshort&shortid=" + strings.Repeat("b", 16), "pubkey"},
 		{"samizdat://h:18447/?pubkey=" + strings.Repeat("a", 64) + "&shortid=" + strings.Repeat("b", 16), "missing sni"},
-		{"https://example.com/", "scheme must be samizdat"},
+		{"https://example.com/", "scheme must be tamizdat"},
 		{"samizdat:///?sni=ok", "missing host"},
 
 		// IPA-M: xray-style format (userinfo + pbk=).
@@ -199,6 +199,9 @@ func TestSamizdatConfigParse(t *testing.T) {
 		// tcpfrag/recfrag/idle/conn/drain/mstreams) are silently ignored.
 		// Forward-compat: parser accepts any unknown query key without error.
 		{"samizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok&mintr=2&cap=13312&cover=1&cpool=ok.ru,vk.com&tcpfrag=1&recfrag=1&idle=300000&conn=15000&drain=10000&mstreams=100&future_unknown_key=hello", ""},
+
+		// IPA-R (project rename samizdat -> tamizdat): both schemes accepted.
+		{"tamizdat://" + strings.Repeat("b", 16) + "@h:777?pbk=" + strings.Repeat("a", 64) + "&sni=ok", ""},
 	}
 	for _, tc := range cases {
 		_, err := parseSamizdatURL(tc.blob)

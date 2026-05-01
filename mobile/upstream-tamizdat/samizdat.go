@@ -6,7 +6,7 @@
 //
 // The server acts as a real web server to unauthorized connections by
 // transparently proxying them to the masquerade domain at the TCP level.
-package samizdat
+package tamizdat
 
 import (
 	"context"
@@ -24,16 +24,16 @@ type ConnHandler func(ctx context.Context, conn net.Conn, destination string)
 type ClientConfig struct {
 	// Server connection
 	ServerAddr  string
+	PrimarySNI  string   // canonical URI primary SNI; normalized from ServerName
 	ServerName  string   // legacy single SNI; if ServerNames empty this is used
-	ServerNames []string // pool of SNIs; client picks random per fresh transport
+	ServerNames []string // legacy pool of SNIs; client picks random before bundle
 
-	// Authentication. Provide either a single ShortID (legacy) or a pool via
-	// ShortIDs (recommended) — client picks random per fresh transport, which
-	// breaks the "all clients of one IP have identical 8-byte SessionID prefix"
-	// signal flagged by compass deep-research P1.1.
-	PublicKey []byte
-	ShortID   [8]byte    // legacy single ID; if ShortIDs is empty this is used
-	ShortIDs  [][8]byte  // pool of allowed IDs; client picks random
+	// Authentication. MasterShortID is the single URI shortID used as the root
+	// for HKDF-derived pools. ShortID is kept for backward-compatible
+	// in-process callers and is normalized into MasterShortID by applyDefaults.
+	PublicKey     []byte
+	MasterShortID [8]byte
+	ShortID       [8]byte // legacy single ID; normalized to MasterShortID
 
 	// TLS fingerprint
 	Fingerprint string
@@ -79,6 +79,23 @@ type ClientConfig struct {
 }
 
 func (c *ClientConfig) applyDefaults() {
+	if c.PrimarySNI == "" {
+		if c.ServerName != "" {
+			c.PrimarySNI = c.ServerName
+		} else if len(c.ServerNames) > 0 {
+			c.PrimarySNI = c.ServerNames[0]
+		}
+	}
+	if c.ServerName == "" {
+		c.ServerName = c.PrimarySNI
+	}
+	var zeroShortID [8]byte
+	if c.MasterShortID == zeroShortID && c.ShortID != zeroShortID {
+		c.MasterShortID = c.ShortID
+	}
+	if c.ShortID == zeroShortID {
+		c.ShortID = c.MasterShortID
+	}
 	if c.Fingerprint == "" {
 		c.Fingerprint = "chrome"
 	}
@@ -96,7 +113,7 @@ func (c *ClientConfig) applyDefaults() {
 	}
 	// Security defaults are ON by default (compass v2/v3): callers must opt
 	// out via DisableDefaultSecurity (e.g. tests). The block below makes the
-	// URI form minimal -- a samizdat:// URI does not need to carry mintr/cap/
+	// URI form minimal -- a tamizdat:// URI does not need to carry mintr/cap/
 	// cover/tcpfrag/recfrag fields; library forces the safe values.
 	if !c.DisableDefaultSecurity {
 		c.TCPFragmentation = true
@@ -118,14 +135,17 @@ func (c *ClientConfig) applyDefaults() {
 type ServerConfig struct {
 	ListenAddr string
 
-	PrivateKey []byte
-	ShortIDs   [][8]byte
+	PrivateKey    []byte
+	MasterShortID [8]byte
+
+	CoverConfigPath         string
+	CoverConfigPreviousPath string
 
 	CertPEM []byte
 	KeyPEM  []byte
 
-	MasqueradeDomain      string            // default origin if SNI not in pool
-	MasqueradeAddr        string            // default origin IP override
+	MasqueradeDomain string // default origin if SNI not in pool
+	MasqueradeAddr   string // default origin IP override
 	// MasqueradePool maps client-presented SNI -> origin host:port. Allows
 	// cover-SNI rotation (compass P1.1): client picks a random SNI from a
 	// pool, server forwards auth-failed probes to the matching real origin
@@ -147,12 +167,17 @@ type ServerConfig struct {
 
 	DisableDefaultSecurity bool
 
+	EpochGraceWindow int
+
 	MaxConcurrentStreams int
 
 	Handler ConnHandler
 }
 
 func (c *ServerConfig) applyDefaults() {
+	if c.EpochGraceWindow == 0 {
+		c.EpochGraceWindow = 2
+	}
 	if c.MasqueradeIdleTimeout == 0 {
 		c.MasqueradeIdleTimeout = 5 * time.Minute
 	}

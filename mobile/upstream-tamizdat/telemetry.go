@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import (
 	"expvar"
@@ -20,22 +20,30 @@ import (
 
 var telemetryInitOnce sync.Once
 
+func init() {
+	initTelemetry()
+}
+
 // Counters
 var (
-	connectTotal       *expvar.Int
-	connectAuthOK      *expvar.Int
-	connectAuthFail    *expvar.Int
-	connectReplay      *expvar.Int
-	connectMasquerade  *expvar.Int
-	masqRateLimited    *expvar.Int
+	connectTotal      *expvar.Int
+	connectAuthOK     *expvar.Int
+	connectAuthFail   *expvar.Int
+	connectReplay     *expvar.Int
+	connectMasquerade *expvar.Int
+	masqRateLimited   *expvar.Int
 
-	tunnelsTCPOpened   *expvar.Int
-	tunnelsTCPClosed   *expvar.Int
-	tunnelsUDPOpened   *expvar.Int
-	tunnelsUDPClosed   *expvar.Int
+	tunnelsTCPOpened *expvar.Int
+	tunnelsTCPClosed *expvar.Int
+	tunnelsUDPOpened *expvar.Int
+	tunnelsUDPClosed *expvar.Int
 
-	ssrfRejectedTCP    *expvar.Int
-	ssrfRejectedUDP    *expvar.Int
+	ssrfRejectedTCP *expvar.Int
+	ssrfRejectedUDP *expvar.Int
+
+	bundleReceivedTotal    *expvar.Int
+	bundleAppliedTotal     *expvar.Int
+	bundleFetchErrorsTotal *expvar.Int
 
 	bytesClientToTarget atomic.Int64
 	bytesTargetToClient atomic.Int64
@@ -45,11 +53,11 @@ var (
 	// Bytes-per-flow buckets — at flow close we attribute the total bytes
 	// transferred to one bucket. Distribution shape reveals #490: a heavy
 	// spike in the 12-20 KB bucket = throttling enforcement.
-	bytesPerFlowSub5KB    *expvar.Int
-	bytesPerFlow5_15KB    *expvar.Int
-	bytesPerFlow15_50KB   *expvar.Int
-	bytesPerFlow50KB_1MB  *expvar.Int
-	bytesPerFlowAbove1MB  *expvar.Int
+	bytesPerFlowSub5KB   *expvar.Int
+	bytesPerFlow5_15KB   *expvar.Int
+	bytesPerFlow15_50KB  *expvar.Int
+	bytesPerFlow50KB_1MB *expvar.Int
+	bytesPerFlowAbove1MB *expvar.Int
 
 	// Handshake duration sum + count (avg = sum/count).
 	handshakeDurationNanosSum   atomic.Int64
@@ -58,41 +66,45 @@ var (
 
 func initTelemetry() {
 	telemetryInitOnce.Do(func() {
-		connectTotal = newPublishedInt("samizdat.connect.total")
-		connectAuthOK = newPublishedInt("samizdat.connect.auth_ok")
-		connectAuthFail = newPublishedInt("samizdat.connect.auth_fail")
-		connectReplay = newPublishedInt("samizdat.connect.replay_rejected")
-		connectMasquerade = newPublishedInt("samizdat.connect.masquerade_dispatched")
-		masqRateLimited = newPublishedInt("samizdat.masquerade.rate_limited")
+		connectTotal = newPublishedInt("tamizdat.connect.total")
+		connectAuthOK = newPublishedInt("tamizdat.connect.auth_ok")
+		connectAuthFail = newPublishedInt("tamizdat.connect.auth_fail")
+		connectReplay = newPublishedInt("tamizdat.connect.replay_rejected")
+		connectMasquerade = newPublishedInt("tamizdat.connect.masquerade_dispatched")
+		masqRateLimited = newPublishedInt("tamizdat.masquerade.rate_limited")
 
-		tunnelsTCPOpened = newPublishedInt("samizdat.tunnels.tcp.opened")
-		tunnelsTCPClosed = newPublishedInt("samizdat.tunnels.tcp.closed")
-		tunnelsUDPOpened = newPublishedInt("samizdat.tunnels.udp.opened")
-		tunnelsUDPClosed = newPublishedInt("samizdat.tunnels.udp.closed")
+		tunnelsTCPOpened = newPublishedInt("tamizdat.tunnels.tcp.opened")
+		tunnelsTCPClosed = newPublishedInt("tamizdat.tunnels.tcp.closed")
+		tunnelsUDPOpened = newPublishedInt("tamizdat.tunnels.udp.opened")
+		tunnelsUDPClosed = newPublishedInt("tamizdat.tunnels.udp.closed")
 
-		ssrfRejectedTCP = newPublishedInt("samizdat.ssrf.rejected_tcp")
-		ssrfRejectedUDP = newPublishedInt("samizdat.ssrf.rejected_udp")
+		ssrfRejectedTCP = newPublishedInt("tamizdat.ssrf.rejected_tcp")
+		ssrfRejectedUDP = newPublishedInt("tamizdat.ssrf.rejected_udp")
 
-		expvar.Publish("samizdat.bytes.client_to_target", expvar.Func(func() any {
+		bundleReceivedTotal = newPublishedInt("tamizdat_bundle_received_total")
+		bundleAppliedTotal = newPublishedInt("tamizdat_bundle_applied_total")
+		bundleFetchErrorsTotal = newPublishedInt("tamizdat_bundle_fetch_errors_total")
+
+		expvar.Publish("tamizdat.bytes.client_to_target", expvar.Func(func() any {
 			return bytesClientToTarget.Load()
 		}))
-		expvar.Publish("samizdat.bytes.target_to_client", expvar.Func(func() any {
+		expvar.Publish("tamizdat.bytes.target_to_client", expvar.Func(func() any {
 			return bytesTargetToClient.Load()
 		}))
-		expvar.Publish("samizdat.masquerade.bytes_forwarded", expvar.Func(func() any {
+		expvar.Publish("tamizdat.masquerade.bytes_forwarded", expvar.Func(func() any {
 			return masqueradeBytesForwarded.Load()
 		}))
 
-		bytesPerFlowSub5KB = newPublishedInt("samizdat.bytes_per_flow.sub_5kb")
-		bytesPerFlow5_15KB = newPublishedInt("samizdat.bytes_per_flow.5_15kb")
-		bytesPerFlow15_50KB = newPublishedInt("samizdat.bytes_per_flow.15_50kb")
-		bytesPerFlow50KB_1MB = newPublishedInt("samizdat.bytes_per_flow.50kb_1mb")
-		bytesPerFlowAbove1MB = newPublishedInt("samizdat.bytes_per_flow.above_1mb")
+		bytesPerFlowSub5KB = newPublishedInt("tamizdat.bytes_per_flow.sub_5kb")
+		bytesPerFlow5_15KB = newPublishedInt("tamizdat.bytes_per_flow.5_15kb")
+		bytesPerFlow15_50KB = newPublishedInt("tamizdat.bytes_per_flow.15_50kb")
+		bytesPerFlow50KB_1MB = newPublishedInt("tamizdat.bytes_per_flow.50kb_1mb")
+		bytesPerFlowAbove1MB = newPublishedInt("tamizdat.bytes_per_flow.above_1mb")
 
-		expvar.Publish("samizdat.handshake.duration_nanos_sum", expvar.Func(func() any {
+		expvar.Publish("tamizdat.handshake.duration_nanos_sum", expvar.Func(func() any {
 			return handshakeDurationNanosSum.Load()
 		}))
-		expvar.Publish("samizdat.handshake.duration_nanos_count", expvar.Func(func() any {
+		expvar.Publish("tamizdat.handshake.duration_nanos_count", expvar.Func(func() any {
 			return handshakeDurationNanosCount.Load()
 		}))
 	})

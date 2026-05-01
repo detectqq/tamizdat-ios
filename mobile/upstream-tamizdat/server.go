@@ -1,8 +1,7 @@
-package samizdat
+package tamizdat
 
 import (
 	"context"
-	"os"
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
@@ -11,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,8 +36,8 @@ type Server struct {
 
 	// Shaper + fragmenter wire P0.1 record fragmentation into server-side
 	// response writes. P0.4 removes per-record jitter from this path.
-	shaper       *Shaper
-	fragmenter   *RecordFragmenter
+	shaper     *Shaper
+	fragmenter *RecordFragmenter
 
 	// Replay-protection: sliding window of recently-seen SessionID nonces
 	// (auth T5 finding - captured ClientHellos could be replayed forever).
@@ -61,6 +61,9 @@ type Server struct {
 
 	// Per-IP rate-limiter on masquerade forwards (compass v2 §3.11 DoS protection).
 	masqLimiter *masqueradeRateLimiter
+
+	shortIDPool     *shortIDPool
+	coverConfigJSON []byte
 }
 
 // NewServer creates a new Samizdat server.
@@ -70,8 +73,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if len(config.PrivateKey) != 32 {
 		return nil, fmt.Errorf("PrivateKey must be exactly 32 bytes, got %d", len(config.PrivateKey))
 	}
-	if len(config.ShortIDs) == 0 {
-		return nil, fmt.Errorf("at least one ShortID is required")
+	var zeroShortID [8]byte
+	if config.MasterShortID == zeroShortID {
+		return nil, fmt.Errorf("MasterShortID is required")
 	}
 	if config.Handler == nil {
 		return nil, fmt.Errorf("Handler is required")
@@ -103,6 +107,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		replayGuard:  newReplayGuard(config.ReplayWindow),
 		ctx:          ctx,
 		cancel:       cancel,
+		shortIDPool:  newShortIDPool(config.MasterShortID, config.EpochGraceWindow),
 	}
 
 	// Aparecium audit fix: pad cert chain to ~3.5 KB extra so encrypted
@@ -122,6 +127,10 @@ func NewServer(config ServerConfig) (*Server, error) {
 
 	s.masqLimiter = newMasqueradeRateLimiter()
 
+	if err := s.initCoverConfig(config); err != nil {
+		return nil, err
+	}
+
 	if config.MasqueradeDomain != "" {
 		s.masquerade = NewMasquerade(
 			config.MasqueradeDomain,
@@ -138,6 +147,35 @@ func NewServer(config ServerConfig) (*Server, error) {
 	}
 
 	return s, nil
+}
+
+func (s *Server) initCoverConfig(config ServerConfig) error {
+	if config.CoverConfigPath == "" {
+		s.coverConfigJSON = []byte(`{"version":1}`)
+		return nil
+	}
+	if config.CoverConfigPreviousPath != "" {
+		previous, err := LoadCoverConfigWithMasquerade(config.CoverConfigPreviousPath, config.MasqueradePool)
+		if err != nil {
+			return fmt.Errorf("load previous cover config: %w", err)
+		}
+		if previous.EpochKey != "" && previous.ShortIDPoolSize > 0 {
+			s.shortIDPool.Rotate(previous.EpochKey, previous.ShortIDPoolSize)
+		}
+	}
+	bundle, err := LoadCoverConfigWithMasquerade(config.CoverConfigPath, config.MasqueradePool)
+	if err != nil {
+		return fmt.Errorf("load cover config: %w", err)
+	}
+	wire, err := bundle.MarshalForWire()
+	if err != nil {
+		return err
+	}
+	s.coverConfigJSON = wire
+	if bundle.EpochKey != "" && bundle.ShortIDPoolSize > 0 {
+		s.shortIDPool.Rotate(bundle.EpochKey, bundle.ShortIDPoolSize)
+	}
+	return nil
 }
 
 // logf is a debug-gated wrapper around log.Printf. Production servers run
@@ -169,7 +207,7 @@ func (s *Server) startDebugExpvar() error {
 	s.debugMu.Unlock()
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logf("[samizdat] debug expvar server: %v", err)
+			s.logf("[tamizdat] debug expvar server: %v", err)
 		}
 	}()
 	return nil
@@ -299,7 +337,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 0xFE0C extension path removed in compass v3 cleanup -- 24h+ soak passed).
 	ephPub, err := ExtractX25519FromKeyShare(handshakeMsg)
 	if err != nil {
-		s.logf("[samizdat] ephemeral pubkey extraction failed: %v", err)
+		s.logf("[tamizdat] ephemeral pubkey extraction failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
@@ -310,20 +348,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 	var shortID [shortIDLen]byte
 	copy(shortID[:], sessionID[:shortIDLen])
-	if !shortIDAllowed(shortID, s.config.ShortIDs) {
+	if s.shortIDPool == nil || !s.shortIDPool.Accept(shortID) {
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
 
 	psk, err := DeriveServerPSK(s.config.PrivateKey, ephPub[:], shortID)
 	if err != nil {
-		s.logf("[samizdat] deriving PSK failed: %v", err)
+		s.logf("[tamizdat] deriving PSK failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
-	verifiedShortID, authenticated, err := VerifySessionIDv1(sessionID, psk, ephPub[:], s.config.ShortIDs)
+	verifiedShortID, authenticated, err := VerifySessionIDv1(sessionID, psk, ephPub[:], [][shortIDLen]byte{shortID})
 	if err != nil || !authenticated {
-		s.logf("[samizdat] P0.3 SessionID verification failed: %v", err)
+		s.logf("[tamizdat] P0.3 SessionID verification failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
@@ -457,7 +495,7 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 		// sends PING after IdleTimeout of inactivity; if no PONG within
 		// PingTimeout, server tears down the connection. Defends symmetrically
 		// against NAT-table eviction and detects half-open connections.
-		IdleTimeout: 60 * time.Second,
+		IdleTimeout:     60 * time.Second,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     10 * time.Second,
 		// OPT-1: per-stream initial upload window so client uploads aren't
@@ -479,6 +517,15 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			return
 		}
 
+		if r.Host == configAuthority {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(s.coverConfigJSON)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return
+		}
+
 		destination := r.Host
 		if destination == "" {
 			http.Error(w, "No destination", http.StatusBadRequest)
@@ -495,11 +542,11 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			s.handleUDPCONNECT(w, r, destination)
 			return
 		default:
-			http.Error(w, "unsupported samizdat-protocol", http.StatusBadRequest)
+			http.Error(w, "unsupported tamizdat-protocol", http.StatusBadRequest)
 			return
 		}
 
-		s.logf("[samizdat] legacy CONNECT: handler started")
+		s.logf("[tamizdat] legacy CONNECT: handler started")
 
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
@@ -522,31 +569,31 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 
 		s.config.Handler(r.Context(), streamConn, destination)
 
-		s.logf("[samizdat] legacy CONNECT: handler returned, starting drain")
+		s.logf("[tamizdat] legacy CONNECT: handler returned, starting drain")
 
 		drainDone := make(chan struct{})
 		go func() {
 			n, err := io.Copy(io.Discard, sr)
-			s.logf("[samizdat] legacy CONNECT: drain finished, n=%d, err=%v", n, err)
+			s.logf("[tamizdat] legacy CONNECT: drain finished, n=%d, err=%v", n, err)
 			close(drainDone)
 		}()
 		timer := time.NewTimer(5 * time.Second)
 		select {
 		case <-drainDone:
 			timer.Stop()
-			s.logf("[samizdat] legacy CONNECT: drain completed, handler returning cleanly")
+			s.logf("[tamizdat] legacy CONNECT: drain completed, handler returning cleanly")
 		case <-timer.C:
-			s.logf("[samizdat] legacy CONNECT: drain timeout, closing body")
+			s.logf("[tamizdat] legacy CONNECT: drain timeout, closing body")
 			body.Close()
 			<-drainDone
 		}
 	})
 
-	s.logf("[samizdat] serveH2: starting ServeConn")
+	s.logf("[tamizdat] serveH2: starting ServeConn")
 	h2Server.ServeConn(flow.wrapServerConn(tlsConn), &http2.ServeConnOpts{
 		Handler: handler,
 	})
-	s.logf("[samizdat] serveH2: ServeConn returned")
+	s.logf("[tamizdat] serveH2: ServeConn returned")
 }
 
 // readClientHelloRecord reads a complete TLS record from the connection.
@@ -647,7 +694,7 @@ func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
 			msg, ok := r.(string)
 			if ok && msg == "Write called after Handler finished" {
 				if sc.debug {
-					log.Printf("[samizdat] recovered expected panic in Write: %v", r)
+					log.Printf("[tamizdat] recovered expected panic in Write: %v", r)
 				}
 				sc.closed.Store(true)
 				n = 0
@@ -655,7 +702,7 @@ func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
 				return
 			}
 			if sc.debug {
-				log.Printf("[samizdat] unexpected panic in Write: %v", r)
+				log.Printf("[tamizdat] unexpected panic in Write: %v", r)
 			}
 			panic(r)
 		}
@@ -703,8 +750,9 @@ func (sc *serverStreamConn) CloseWrite() error {
 	return nil
 }
 
-func (sc *serverStreamConn) LocalAddr() net.Addr                { return &streamAddr{"tcp", "server"} }
-func (sc *serverStreamConn) RemoteAddr() net.Addr               { return &streamAddr{"tcp", "client"} }
+func (sc *serverStreamConn) LocalAddr() net.Addr  { return &streamAddr{"tcp", "server"} }
+func (sc *serverStreamConn) RemoteAddr() net.Addr { return &streamAddr{"tcp", "client"} }
+
 // SetDeadline sets both read and write deadlines. Implements net.Conn contract:
 // blocked Read/Write returns os.ErrDeadlineExceeded after t; t.IsZero() clears.
 func (sc *serverStreamConn) SetDeadline(t time.Time) error {

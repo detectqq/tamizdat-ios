@@ -1,6 +1,6 @@
 //go:build !linux
 
-package samizdat
+package tamizdat
 
 import "net"
 

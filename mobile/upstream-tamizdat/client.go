@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import (
 	"context"
@@ -6,22 +6,51 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
-
-
 
 // pickServerName returns a randomly-chosen SNI from the configured pool.
 // Falls back to legacy single ServerName when no pool is configured.
 // Per-transport rotation breaks the "all clients of one IP share one SNI"
 // behavioural correlation flagged by compass P1.1.
 func (c *Client) pickServerName() string {
+	if pushed := c.serverPushedSNIPool.Load(); pushed != nil && len(*pushed) > 0 {
+		primary := c.config.PrimarySNI
+		if primary == "" {
+			primary = c.config.ServerName
+		}
+		// Per spec §3.B (clarified 2026-05-01): if bundle has primary's sni, use max(its weight, 100); else insert primary at weight 100; append other bundle entries unchanged.
+		entries := []SNIEntry{{SNI: primary, Weight: 100}}
+		for _, e := range *pushed {
+			if e.SNI == "" {
+				continue
+			}
+			if e.SNI == primary {
+				if e.Weight > entries[0].Weight {
+					entries[0].Weight = e.Weight
+				}
+				continue
+			}
+			entries = append(entries, e)
+		}
+		if picked := pickWeightedSNI(entries); picked != "" {
+			return picked
+		}
+	}
 	pool := c.config.ServerNames
 	if len(pool) == 0 {
+		if c.config.PrimarySNI != "" {
+			return c.config.PrimarySNI
+		}
 		return c.config.ServerName
 	}
 	if len(pool) == 1 {
@@ -37,32 +66,37 @@ func (c *Client) pickServerName() string {
 // no pool is configured, falls back to the legacy single ShortID. Per-transport
 // rotation breaks the "fixed 8-byte SessionID prefix per server IP" signal.
 func (c *Client) pickShortID() [8]byte {
-	pool := c.config.ShortIDs
-	if len(pool) == 0 {
-		return c.config.ShortID
+	poolPtr := c.derivedShortIDs.Load()
+	if poolPtr == nil || len(*poolPtr) == 0 {
+		return c.config.MasterShortID
 	}
-	if len(pool) == 1 {
-		return pool[0]
-	}
+	pool := *poolPtr
 	var idx [8]byte
 	_, _ = rand.Read(idx[:])
-	i := int(binary.BigEndian.Uint64(idx[:])>>1) % len(pool) // >>1 avoids sign issues
-	return pool[i]
+	i := int(binary.BigEndian.Uint64(idx[:])>>1) % (len(pool) + 1) // +1 includes master
+	if i == 0 {
+		return c.config.MasterShortID
+	}
+	return pool[i-1]
 }
 
 // Client dials connections through a Samizdat server. Multiple calls to
 // DialContext share the same underlying TLS+H2 connection via multiplexing.
 type Client struct {
-	config             ClientConfig
-	pool               *connPool
-	shaper             *Shaper
-	fragmenter         *RecordFragmenter
-	fingerprintChooser *fingerprintRotator
-	cover              *coverDriver
-	coverCtx           context.Context
-	coverCancel        context.CancelFunc
-	mu                 sync.Mutex
-	closed             bool
+	config              ClientConfig
+	pool                *connPool
+	shaper              *Shaper
+	fragmenter          *RecordFragmenter
+	fingerprintChooser  *fingerprintRotator
+	cover               *coverDriver
+	derivedShortIDs     atomic.Pointer[[][8]byte]
+	serverPushedSNIPool atomic.Pointer[[]SNIEntry]
+	coverCtx            context.Context
+	coverCancel         context.CancelFunc
+	bundleCtx           context.Context
+	bundleCancel        context.CancelFunc
+	mu                  sync.Mutex
+	closed              bool
 }
 
 // NewClient creates a new Samizdat client.
@@ -75,13 +109,18 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.ServerAddr == "" {
 		return nil, fmt.Errorf("ServerAddr is required")
 	}
-	if config.ServerName == "" {
-		return nil, fmt.Errorf("ServerName is required")
+	if config.PrimarySNI == "" {
+		return nil, fmt.Errorf("PrimarySNI/ServerName is required")
+	}
+	var zeroShortID [8]byte
+	if config.MasterShortID == zeroShortID {
+		return nil, fmt.Errorf("MasterShortID/ShortID is required")
 	}
 
 	c := &Client{
 		config: config,
 	}
+	c.bundleCtx, c.bundleCancel = context.WithCancel(context.Background())
 
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
@@ -152,6 +191,9 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.bundleCancel != nil {
+		c.bundleCancel()
+	}
 	if c.coverCancel != nil {
 		c.coverCancel()
 	}
@@ -274,8 +316,90 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		uConn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
 	}
+	if c.bundleCtx != nil {
+		go func() {
+			_ = c.fetchAndApplyBundle(c.bundleCtx, transport)
+		}()
+	}
 
 	return transport, nil
+}
+
+func (c *Client) fetchAndApplyBundle(parent context.Context, transport *h2Transport) (err error) {
+	if parent == nil || transport == nil || transport.h2Roundtrip == nil {
+		return nil
+	}
+	defer func() {
+		if err != nil {
+			safeIntAdd(bundleFetchErrorsTotal, 1)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+transport.serverAddr, nil)
+	if err != nil {
+		return err
+	}
+	req.Host = configAuthority
+	req.Header.Set(SamizdatProtocolHeader, SamizdatProtocolConfig)
+	resp, err := transport.h2Roundtrip.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("config bundle status %d", resp.StatusCode)
+	}
+	buf, err := io.ReadAll(io.LimitReader(resp.Body, MaxCoverConfigBundleBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(buf) == 0 {
+		return nil
+	}
+	if len(buf) > MaxCoverConfigBundleBytes {
+		return fmt.Errorf("config bundle too large: %d > %d", len(buf), MaxCoverConfigBundleBytes)
+	}
+	var bundle CoverConfigBundle
+	if err := json.Unmarshal(buf, &bundle); err != nil {
+		return err
+	}
+	if err := bundle.Validate(nil, false); err != nil {
+		return err
+	}
+	safeIntAdd(bundleReceivedTotal, 1)
+	c.applyCoverConfigBundle(&bundle)
+	safeIntAdd(bundleAppliedTotal, 1)
+	return nil
+}
+
+func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
+	if bundle == nil {
+		return
+	}
+	if bundle.EpochKey != "" && bundle.ShortIDPoolSize > 0 {
+		derived := DeriveShortIDPool(c.config.MasterShortID, bundle.EpochKey, bundle.ShortIDPoolSize)
+		poolCopy := append([][8]byte(nil), derived...)
+		c.derivedShortIDs.Store(&poolCopy)
+	} else {
+		empty := [][8]byte{}
+		c.derivedShortIDs.Store(&empty)
+	}
+	if len(bundle.SNIPool) > 0 {
+		sniCopy := append([]SNIEntry(nil), bundle.SNIPool...)
+		c.serverPushedSNIPool.Store(&sniCopy)
+	} else {
+		empty := []SNIEntry{}
+		c.serverPushedSNIPool.Store(&empty)
+	}
+	if c.cover != nil {
+		if len(bundle.CoverTargets) > 0 {
+			c.cover.replaceTargets(bundle.CoverTargets)
+		}
+		if bundle.CoverGapMinMS > 0 || bundle.CoverGapMaxMS > 0 {
+			c.cover.replaceGap(time.Duration(bundle.CoverGapMinMS)*time.Millisecond, time.Duration(bundle.CoverGapMaxMS)*time.Millisecond)
+		}
+	}
 }
 
 type tlsConnWrapper struct {

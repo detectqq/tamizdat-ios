@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import (
 	utls "github.com/refraction-networking/utls"
@@ -20,39 +20,38 @@ func newFingerprintRotator(mode string) *fingerprintRotator {
 	var pool []utls.ClientHelloID
 	switch mode {
 	case "", "mix", "auto", "rotate":
-		// IPA-L: only current fingerprints. ANY 2022-era preset
-		// (Chrome 100/106, Safari 16, Edge 106) gets DPI-flagged as
-		// "stale browser" on Russian mobile carriers and the handshake
-		// is dropped. The 0xFE0C extension fix removed our biggest DPI
-		// signal but Chrome 100 in 2026 is still a strong "stale browser"
-		// signature; keeping pool aggressively current.
+		// Weighted (by internet share). 2026-04-30 refresh: Chrome_Auto (=133)
+		// includes X25519MLKEM768 in supported_groups -- matches real Chrome
+		// 131+ post-quantum hybrid handshakes that Cloudflare/Google have
+		// rolled out. Dropped Chrome 100/106 (would emit a "stale browser"
+		// signature). Pool intentionally biased toward 2024-2025 versions
+		// since real fleet of clients is heavily on the latest channels.
 		pool = []utls.ClientHelloID{
-			utls.HelloChrome_Auto, // Chrome 133, ML-KEM-768 in supported_groups
+			utls.HelloChrome_Auto, // = Chrome 133, ML-KEM-768 in supported_groups
 			utls.HelloChrome_131,
 			utls.HelloChrome_120_PQ,
 			utls.HelloChrome_120,
 			utls.HelloFirefox_120,
+			utls.HelloSafari_16_0,
+			utls.HelloEdge_106,
 		}
 	case "firefox":
-		pool = []utls.ClientHelloID{utls.HelloFirefox_120}
+		pool = []utls.ClientHelloID{
+			utls.HelloFirefox_120, utls.HelloFirefox_105, utls.HelloFirefox_102,
+		}
 	case "safari":
 		pool = []utls.ClientHelloID{
-			utls.HelloChrome_Auto, // primary
-			utls.HelloSafari_16_0, // single 2022 preset, weighted via Chrome_Auto above
+			utls.HelloSafari_16_0, utls.HelloIOS_14, utls.HelloIOS_13,
 		}
 	case "edge":
-		pool = []utls.ClientHelloID{utls.HelloChrome_Auto, utls.HelloEdge_106}
+		pool = []utls.ClientHelloID{utls.HelloEdge_106, utls.HelloEdge_85}
 	case "ios":
-		pool = []utls.ClientHelloID{utls.HelloChrome_Auto}
-	default: // "chrome" and any unrecognised value: default to modern Chrome only
-		// IPA-L: dropped HelloChrome_100/106_Shuffle/115_PQ from the
-		// default chrome case. Most existing samizdat:// URLs carry
-		// fp=chrome literal and would otherwise hit 2022-era presets.
+		pool = []utls.ClientHelloID{utls.HelloIOS_14, utls.HelloIOS_13, utls.HelloIOS_12_1}
+	default: // "chrome" and any unrecognised value: default to Chrome family
 		pool = []utls.ClientHelloID{
+			utls.HelloChrome_120, utls.HelloChrome_115_PQ,
+			utls.HelloChrome_106_Shuffle, utls.HelloChrome_100,
 			utls.HelloChrome_Auto,
-			utls.HelloChrome_131,
-			utls.HelloChrome_120_PQ,
-			utls.HelloChrome_120,
 		}
 	}
 	return &fingerprintRotator{pool: pool}

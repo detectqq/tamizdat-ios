@@ -25,7 +25,7 @@ struct ConfigPasteView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Paste your main samizdat:// config URL. Optionally paste a Whitelist URL — the app can fail over to it automatically when TSPU whitelist mode kicks in.")
+                    Text("Paste your main tamizdat:// (or samizdat://) config URL. Optionally paste a Whitelist URL — the app can fail over to it automatically when TSPU whitelist mode kicks in.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
 

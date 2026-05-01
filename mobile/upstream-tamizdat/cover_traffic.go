@@ -1,12 +1,13 @@
-package samizdat
+package tamizdat
 
 import (
 	"context"
-	"encoding/binary"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,7 +37,9 @@ const (
 
 type coverDriver struct {
 	c       *Client
-	targets []string
+	targets atomic.Pointer[[]string]
+	gapMin  atomic.Int64
+	gapMax  atomic.Int64
 	stop    chan struct{}
 	once    sync.Once
 }
@@ -66,18 +69,32 @@ func (c *Client) startCoverTraffic(ctx context.Context, targets []string) *cover
 	if len(targets) == 0 {
 		targets = defaultCoverTargets()
 	}
+	targetCopy := append([]string(nil), targets...)
 	d := &coverDriver{
-		c:       c,
-		targets: targets,
-		stop:    make(chan struct{}),
+		c:    c,
+		stop: make(chan struct{}),
 	}
+	d.targets.Store(&targetCopy)
+	d.gapMin.Store(int64(coverGapMin))
+	d.gapMax.Store(int64(coverGapMax))
 	go d.run(ctx)
 	return d
 }
 
 func (d *coverDriver) run(ctx context.Context) {
 	for {
-		gap := coverGapMin + time.Duration(coverRandUint64n(uint64(coverGapMax-coverGapMin)))
+		minGap := time.Duration(d.gapMin.Load())
+		maxGap := time.Duration(d.gapMax.Load())
+		if minGap <= 0 {
+			minGap = coverGapMin
+		}
+		if maxGap < minGap {
+			maxGap = minGap
+		}
+		gap := minGap
+		if maxGap > minGap {
+			gap += time.Duration(coverRandUint64n(uint64(maxGap - minGap)))
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -85,9 +102,15 @@ func (d *coverDriver) run(ctx context.Context) {
 			return
 		case <-time.After(gap):
 		}
-		// Pick a target at random.
-		idx := int(coverRandUint64n(uint64(len(d.targets))))
-		target := d.targets[idx]
+		// Pick a target at random. The slice pointer can be atomically replaced
+		// by a server-pushed bundle; existing iterations keep their snapshot.
+		targetsPtr := d.targets.Load()
+		if targetsPtr == nil || len(*targetsPtr) == 0 {
+			continue
+		}
+		targets := *targetsPtr
+		idx := int(coverRandUint64n(uint64(len(targets))))
+		target := targets[idx]
 		d.coverOnce(ctx, target)
 	}
 }
@@ -118,6 +141,22 @@ func (d *coverDriver) coverOnce(parent context.Context, target string) {
 	// Read up to budget bytes, then close.
 	_ = conn.SetReadDeadline(time.Now().Add(coverReadDeadline))
 	io.CopyN(io.Discard, conn, coverReadBudget)
+}
+
+func (d *coverDriver) replaceTargets(newTargets []string) {
+	if len(newTargets) == 0 {
+		return
+	}
+	copyTargets := append([]string(nil), newTargets...)
+	d.targets.Store(&copyTargets)
+}
+
+func (d *coverDriver) replaceGap(min, max time.Duration) {
+	if min <= 0 || max <= 0 || min > max {
+		return
+	}
+	d.gapMin.Store(int64(min))
+	d.gapMax.Store(int64(max))
 }
 
 func (d *coverDriver) close() {

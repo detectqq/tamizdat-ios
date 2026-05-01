@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import (
 	"crypto/ecdh"
@@ -14,7 +14,7 @@ import (
 
 const (
 	// authLabel is the HKDF info string for deriving the auth key.
-	authLabel = "SAMIZDAT v1"
+	authLabel = "TAMIZDAT v1"
 	// authKeyLen is the length of the derived HMAC key.
 	authKeyLen = 32
 	// sessionIDLen is the TLS SessionID field length.
@@ -96,7 +96,7 @@ func derivePSK(sharedSecret []byte, shortID [shortIDLen]byte) ([]byte, error) {
 	if len(sharedSecret) != x25519KeyLen {
 		return nil, fmt.Errorf("shared secret length %d, want %d", len(sharedSecret), x25519KeyLen)
 	}
-	// salt = shortID, ikm = X25519 shared secret, info = "SAMIZDAT v1".
+	// salt = shortID, ikm = X25519 shared secret, info = "TAMIZDAT v1".
 	hkdfReader := hkdf.New(sha256.New, sharedSecret, shortID[:], []byte(authLabel))
 	key := make([]byte, authKeyLen)
 	if _, err := io.ReadFull(hkdfReader, key); err != nil {

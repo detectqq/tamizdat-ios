@@ -43,7 +43,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	samizdat "github.com/getlantern/samizdat"
+	// Project renamed samizdat -> tamizdat (2026-05-01). Local alias
+	// kept as `samizdat` to minimise the diff; the imported package
+	// is github.com/detectqq/tamizdat (`package tamizdat`). All call
+	// sites continue to use `samizdat.Client` etc. via this alias.
+	samizdat "github.com/detectqq/tamizdat"
 )
 
 const (
@@ -290,15 +294,20 @@ func SetSamizdatConfig(blob string) error {
 		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
 	}
-	// IPA-M: opt-in rotation pools when the URL carried snipool=… and/or
-	// userinfo with comma-separated shortIDs. samizdat.Client picks one
-	// per fresh TLS transport for compass P1.1 anti-correlation.
+	// IPA-M: opt-in SNI rotation pool when the URL carried snipool=…
+	// (legacy ServerNames field still present in tamizdat ClientConfig).
 	if len(cfg.SNIPool) > 1 {
 		clientCfg.ServerNames = cfg.SNIPool
 	}
-	if len(shortIDPool) > 1 {
-		clientCfg.ShortIDs = shortIDPool
-	}
+	// IPA-R rename: tamizdat removed the legacy ShortIDs []byte slice
+	// field. The new model is one MasterShortID + HKDF-derived pool of
+	// N entries (server pushes the size via config bundle). The client
+	// derives the pool internally; URL "userinfo with comma-separated
+	// shortIDs" is no longer wired through. We keep the URL parser
+	// permissive and just use the first entry as MasterShortID — which
+	// the library already does via ClientConfig.ShortID -> MasterShortID
+	// normalisation in applyDefaults().
+	_ = shortIDPool
 
 	client, err := samizdat.NewClient(clientCfg)
 	if err != nil {
@@ -380,8 +389,11 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("not a URL: %w", err)
 	}
-	if u.Scheme != "samizdat" {
-		return nil, fmt.Errorf("scheme must be samizdat:// (got %q)", u.Scheme)
+	// IPA-R: project rename samizdat -> tamizdat. Accept both schemes
+	// so existing URIs in the user's keychain keep working alongside
+	// freshly-issued tamizdat:// links.
+	if u.Scheme != "samizdat" && u.Scheme != "tamizdat" {
+		return nil, fmt.Errorf("scheme must be tamizdat:// or samizdat:// (got %q)", u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {

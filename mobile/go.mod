@@ -2,11 +2,11 @@ module github.com/anarki/samizdat-ios/mobile
 
 go 1.25.5
 
-// Vendored copy of the live samizdat client/server module from llm2's
-// audit-p0-fixes branch. Replace points at ./upstream-samizdat so we always
-// stay in sync with what the production server actually serves (BBCR + the
-// current auth_extension flow).
-replace github.com/getlantern/samizdat => ./upstream-samizdat
+// Vendored copy of the tamizdat client/server module (renamed from
+// samizdat 2026-05-01, github.com/detectqq/tamizdat). Replace points
+// at ./upstream-tamizdat so we always stay in sync with what the
+// production server actually serves.
+replace github.com/detectqq/tamizdat => ./upstream-tamizdat
 
 // iOS-vendor patch of golang.org/x/net to shrink the http2 client's
 // transportDefaultConnFlow (1 GiB → 4 MiB) and transportDefaultStreamFlow
@@ -18,7 +18,7 @@ replace github.com/getlantern/samizdat => ./upstream-samizdat
 replace golang.org/x/net => ./vendor-x-net
 
 require (
-	github.com/getlantern/samizdat v0.0.0-00010101000000-000000000000
+	github.com/detectqq/tamizdat v0.0.0-00010101000000-000000000000
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
 	gvisor.dev/gvisor v0.0.0-20260325202830-7644cf3a343c
 )

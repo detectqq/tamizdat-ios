@@ -19,7 +19,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	core "github.com/getlantern/samizdat"
+	// IPA-R: project renamed samizdat -> tamizdat (2026-05-01).
+	// Local alias kept as `core` so call sites stay unchanged; the
+	// imported package is github.com/detectqq/tamizdat.
+	core "github.com/detectqq/tamizdat"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -961,8 +964,9 @@ func parseConfig(blob string) (*config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("not a URL: %w", err)
 	}
-	if u.Scheme != "samizdat" {
-		return nil, fmt.Errorf("scheme must be samizdat:// (got %q)", u.Scheme)
+	// IPA-R: also accept tamizdat:// (project rename 2026-05-01).
+	if u.Scheme != "samizdat" && u.Scheme != "tamizdat" {
+		return nil, fmt.Errorf("scheme must be tamizdat:// or samizdat:// (got %q)", u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {

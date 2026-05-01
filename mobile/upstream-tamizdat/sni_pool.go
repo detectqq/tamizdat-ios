@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 // Default Russian-cover SNI pool (compass v2 §5.7 / §3.10). Curated subset
 // of high-traffic RU sites that:
@@ -18,8 +18,8 @@ package samizdat
 // real domains we forward to).
 
 type SNIEntry struct {
-	SNI    string
-	Weight int
+	SNI    string `json:"sni"`
+	Weight int    `json:"weight"`
 }
 
 // defaultRussianCoverSNIs is the curated pool. Order = approximate rank.

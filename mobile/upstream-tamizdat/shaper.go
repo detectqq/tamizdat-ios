@@ -1,4 +1,4 @@
-package samizdat
+package tamizdat
 
 import "io"
 

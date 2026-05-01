@@ -1,4 +1,4 @@
-module github.com/getlantern/samizdat
+module github.com/detectqq/tamizdat
 
 go 1.24.0
 
