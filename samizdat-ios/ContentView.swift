@@ -279,10 +279,12 @@ struct ContentView: View {
     private func refreshWhitelistStatus() {
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
-        // If we haven't heard from the detector in >15 s while connected,
-        // paint grey "monitoring stalled" rather than misleading green.
+        // The detector cycle cadence is 30 s normal / 60 s on-backup
+        // / up to 180 s in Low Power Mode. Stale-out at 3× the longest
+        // expected cadence so we don't misreport detector death on
+        // perfectly-healthy LPM devices. 200 s = generous.
         if isAutoMode && bridge.state == .connected
-            && WhitelistStatusStore.ageSeconds > 15 {
+            && WhitelistStatusStore.ageSeconds > 200 {
             whitelistStatus = .unknown
         }
     }

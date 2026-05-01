@@ -229,6 +229,14 @@ final class WhitelistDetector {
     /// Single TCP-connect probe with timeout. Closes the connection as
     /// soon as it transitions to .ready (we only need SYN/SYN-ACK to
     /// confirm reachability, not data). Result delivered exactly once.
+    ///
+    /// CRITICAL: NEPacketTunnelProvider extensions own the utun, but
+    /// their OWN NWConnection objects still get routed via that utun
+    /// by default — excludedRoutes only apply to OTHER apps on the
+    /// device. To bypass our own tunnel we pin the connection to the
+    /// underlying physical interface via NWParameters.requiredInterfaceType.
+    /// Falls back to .tcp without binding if no underlying interface
+    /// is available (which is itself a no-network signal).
     private func probeOnce(canary: Canary,
                            completion: @escaping (_ ok: Bool, _ elapsed: TimeInterval) -> Void) {
         let started = Date()
@@ -247,8 +255,30 @@ final class WhitelistDetector {
             completion(ok, elapsed)
         }
 
+        // Build NWParameters that pin the connection to a real
+        // underlying interface so it bypasses our own utun. iOS
+        // routes the extension's own NWConnection through the tunnel
+        // by default unless we explicitly bind to wifi/cellular.
+        // We prefer wifi when up (faster, no cellular wakeup), fall
+        // through to cellular, then ethernet for the iPad case.
+        let params: NWParameters = .tcp
+        var pinned: String = "<default>"
+        if let path = pathProvider() {
+            if path.usesInterfaceType(.wifi) {
+                params.requiredInterfaceType = .wifi
+                pinned = "wifi"
+            } else if path.usesInterfaceType(.cellular) {
+                params.requiredInterfaceType = .cellular
+                pinned = "cellular"
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                params.requiredInterfaceType = .wiredEthernet
+                pinned = "wired"
+            }
+        }
+        log("info: detector probe \(label) starting (pinned=\(pinned))")
+
         let host = NWEndpoint.Host(canary.host)
-        let conn = NWConnection(host: host, port: canary.port, using: .tcp)
+        let conn = NWConnection(host: host, port: canary.port, using: params)
         pendingConn = conn
 
         conn.stateUpdateHandler = { state in
