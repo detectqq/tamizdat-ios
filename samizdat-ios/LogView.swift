@@ -124,7 +124,36 @@ struct LogView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
-                .padding()
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                // Telegram send result detail — surfaced below the
+                // button so the user can actually read why "Failed"
+                // happened (Telegram block in RU, no token, HTTP 4xx,
+                // …). Tappable: copies the message to the clipboard
+                // so it can be pasted back to me for diagnosis.
+                if let detail = sendStatusDetail {
+                    Button {
+                        UIPasteboard.general.string = detail
+                    } label: {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: detailIcon)
+                                .foregroundStyle(detailColor)
+                                .font(.caption)
+                            Text(detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+                }
             }
             .navigationTitle("Logs")
             .navigationBarTitleDisplayMode(.inline)
@@ -151,12 +180,33 @@ struct LogView: View {
         }
     }
 
+    private var sendStatusDetail: String? {
+        switch sendStatus {
+        case .failed(let msg): return "Telegram send failed: \(msg). Tap to copy."
+        case .sent:            return "Sent ✓"
+        default:               return nil
+        }
+    }
+
+    private var detailIcon: String {
+        switch sendStatus {
+        case .failed: return "exclamationmark.triangle.fill"
+        case .sent:   return "checkmark.circle.fill"
+        default:      return "info.circle"
+        }
+    }
+
+    private var detailColor: Color {
+        switch sendStatus {
+        case .failed: return .red
+        case .sent:   return .green
+        default:      return .secondary
+        }
+    }
+
     private func sendToTelegram() {
         guard TelegramReporter.isConfigured else {
-            sendStatus = .failed("Configure bot token in Telegram settings")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-                if case .failed = sendStatus { sendStatus = .idle }
-            }
+            sendStatus = .failed("Configure bot token in Telegram settings (gear icon).")
             return
         }
         sendStatus = .sending
@@ -166,14 +216,15 @@ struct LogView: View {
             switch result {
             case .success:
                 sendStatus = .sent
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                // Auto-reset only success — user wants to see error
+                // text long enough to read + copy it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
                     if case .sent = sendStatus { sendStatus = .idle }
                 }
             case .failure(let err):
-                sendStatus = .failed(err.errorDescription ?? "?")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-                    if case .failed = sendStatus { sendStatus = .idle }
-                }
+                // Surface error verbatim. No auto-reset — user dismisses
+                // by tapping Telegram again or closing the sheet.
+                sendStatus = .failed(err.errorDescription ?? "unknown error")
             }
         }
     }
