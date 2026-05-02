@@ -140,28 +140,32 @@ final class PacketBridge {
     ///    `write()` it to the hev side of the socketpair.
     private func startInboundReader() {
         guard let provider else { return }
-        provider.packetFlow.readPacketsAndMetadata { [weak self] packets, protocols, metadata in
+        // `readPacketObjects` returns `[NEPacket]`, where each NEPacket
+        // carries `.data`, `.protocolFamily`, `.direction`, and (iOS 14+)
+        // `.metadata`. `metadata.sourceAppSigningIdentifier` is the
+        // string we want.
+        provider.packetFlow.readPacketObjects { [weak self] (packets: [NEPacket]) in
             guard let self, self.running else { return }
-            self.handleInbound(packets: packets, protocols: protocols, metadata: metadata)
+            self.handleInbound(packets: packets)
             // Re-arm.
             self.startInboundReader()
         }
     }
 
-    private func handleInbound(packets: [Data], protocols: [NSNumber], metadata: [NEFlowMetaData]) {
-        let count = min(packets.count, protocols.count)
-        for i in 0..<count {
-            let packet = packets[i]
-            let af = protocols[i].uint32Value
-            let meta: NEFlowMetaData? = (i < metadata.count) ? metadata[i] : nil
+    private func handleInbound(packets: [NEPacket]) {
+        for pkt in packets {
+            let payload = pkt.data
+            // protocolFamily is sa_family_t (UInt8 on Darwin).
+            let af = UInt32(pkt.protocolFamily)
+            let meta: NEFlowMetaData? = pkt.metadata
 
             // Step 1: extract dst, attribute to a process if metadata
-            // has a non-nil bundle-id. Apple delivers an NEFlowMetaData
-            // for every packet but `sourceAppSigningIdentifier` is
+            // has a non-nil bundle-id. Apple delivers metadata for
+            // every packet but `sourceAppSigningIdentifier` is
             // typically nil for system / kernel-originated traffic and
             // populated for app traffic.
             if let bundleID = meta?.sourceAppSigningIdentifier,
-               let tuple = parseDestinationTuple(packet: packet, af: af) {
+               let tuple = parseDestinationTuple(packet: payload, af: af) {
                 let normalized = normalizeBundleID(bundleID)
                 if !normalized.isEmpty {
                     SocksstubSubmitAppHint(tuple.proto, tuple.dest, normalized, 5000)
@@ -170,7 +174,7 @@ final class PacketBridge {
             }
 
             // Step 2: write 4-byte AF prefix + packet to hev side.
-            let prefixed = framePacket(packet: packet, af: af)
+            let prefixed = framePacket(packet: payload, af: af)
             prefixed.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
                 guard let base = buf.baseAddress else { return }
                 let n = write(swiftSideFD, base, prefixed.count)
