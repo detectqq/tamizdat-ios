@@ -145,6 +145,13 @@ func (t *h2Transport) addBytesSent(n int) {
 // live pcaps before treating BytesPerTransportSoftCap as an outer-wire budget.
 func estimatedOuterWireBytes(n int) int64 { return int64(n) * 6 }
 
+
+// appHintCtxKey is the context key used by client-side process attribution
+// to pass an "app hint" (process name) through DialContext into the H2
+// CONNECT request as the "Tamizdat-App-Hint" header. Server uses it as a
+// Tier 3 side signal in the realtime classifier.
+type appHintCtxKey struct{}
+
 // openTunnel issues an HTTP/2 CONNECT request to open a tunnel to the
 // destination through the proxy server. Returns a net.Conn backed by the
 // H2 stream.
@@ -174,6 +181,9 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
 	}
 	req.Host = destination
+	if hint, ok := ctx.Value(appHintCtxKey{}).(string); ok && hint != "" {
+		req.Header.Set("Tamizdat-App-Hint", hint)
+	}
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {

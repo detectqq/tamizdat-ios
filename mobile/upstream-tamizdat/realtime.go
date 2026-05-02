@@ -53,6 +53,12 @@ type FlowMeta struct {
 	Port     int
 	Protocol string
 	Payload  []byte
+	// AppHint is a lowercased process / application name supplied by the
+	// client (e.g. "anydesk", "roblox", "chrome"). Empty when the platform
+	// cannot attribute the connection to a process. Used as a Tier 3 side
+	// signal in ClassifyOpen against RealtimeAppHints; never trusted on its
+	// own, only used to break ties / promote known-realtime apps.
+	AppHint string
 }
 
 func NewFlowMeta(network, address string) FlowMeta {
@@ -62,6 +68,7 @@ func NewFlowMeta(network, address string) FlowMeta {
 func normalizeFlowMeta(meta FlowMeta) FlowMeta {
 	meta.Network = strings.ToLower(strings.TrimSpace(meta.Network))
 	meta.Protocol = strings.ToLower(strings.TrimSpace(meta.Protocol))
+	meta.AppHint = strings.ToLower(strings.TrimSpace(meta.AppHint))
 	if meta.Address != "" && (meta.Host == "" || meta.Port == 0) {
 		if host, port, err := net.SplitHostPort(meta.Address); err == nil {
 			meta.Host = host
@@ -87,15 +94,22 @@ type RealtimeDetectorConfig struct {
 	RealtimePorts           []int
 	SmoothnessSamples       int
 	SmoothnessWindows       int
-	RealtimePortRanges []PortRange
+	RealtimePortRanges      []PortRange
+	// RealtimeAppHints lists lowercased process / application names that
+	// should be classified as realtime when supplied by the client via the
+	// Tamizdat-App-Hint H2 CONNECT header. Substring match (lower-cased).
+	// Used as a Tier 3 side signal that runs *before* port-range fallback,
+	// so a known realtime app on a non-standard port is still promoted.
+	RealtimeAppHints        []string
 	SmoothnessMaxJitterFrac float64
 	SmoothnessMinInterval   time.Duration
 	SmoothnessMaxInterval   time.Duration
 }
 
 type RealtimeDetector struct {
-	ports map[int]struct{}
-	cfg   RealtimeDetectorConfig
+	ports     map[int]struct{}
+	appHints  []string // lowercased substrings to match
+	cfg       RealtimeDetectorConfig
 
 	mu    sync.Mutex
 	flows map[uint64]*realtimeSmoothState
@@ -127,6 +141,32 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 		RealtimePortRanges: []PortRange{
 			{Lo: 49152, Hi: 65535},
 		},
+		// Default known-realtime app names. Substring match (case-insensitive).
+		// Conservative whitelist of apps where realtime classification is
+		// almost always correct; do NOT list browsers (chrome/firefox/safari)
+		// here because they multiplex many flow types.
+		RealtimeAppHints: []string{
+			"anydesk",   // remote desktop, custom UDP+DTLS
+			"roblox",    // game, dynamic UDP
+			"discord",   // voice/video, DTLS-SRTP
+			"zoom",      // voice/video, custom + DTLS-SRTP
+			"webex",     // voice/video
+			"teams",     // voice/video
+			"skype",     // voice
+			"telegram",  // voice/video calls (tdesktop / Telegram)
+			"signal",    // voice/video
+			"whatsapp",  // voice/video
+			"viber",     // voice/video
+			"obs",       // streaming (OBS / OBS-streamlabs)
+			"streamlabs",
+			"mumble",    // VoIP
+			"teamspeak", // VoIP
+			"vmware-view", // VDI
+			"rdp",       // Microsoft RDP (mstsc)
+			"mstsc",
+			"parsec",    // remote-play
+			"steam",     // some realtime sub-flows; tolerated FP
+		},
 		SmoothnessSamples:       5,
 		SmoothnessWindows:       3,
 		SmoothnessMaxJitterFrac: 0.35,
@@ -154,13 +194,45 @@ func newRealtimeDetectorWithConfig(cfg RealtimeDetectorConfig) *RealtimeDetector
 	if len(cfg.RealtimePorts) == 0 {
 		cfg.RealtimePorts = defaultRealtimeDetectorConfig().RealtimePorts
 	}
+	if cfg.RealtimeAppHints == nil {
+		// nil => use defaults; explicit empty []string{} => disabled.
+		cfg.RealtimeAppHints = defaultRealtimeDetectorConfig().RealtimeAppHints
+	}
 	ports := make(map[int]struct{}, len(cfg.RealtimePorts))
 	for _, p := range cfg.RealtimePorts {
 		if p > 0 && p <= 65535 {
 			ports[p] = struct{}{}
 		}
 	}
-	return &RealtimeDetector{ports: ports, cfg: cfg, flows: make(map[uint64]*realtimeSmoothState)}
+	hints := make([]string, 0, len(cfg.RealtimeAppHints))
+	for _, h := range cfg.RealtimeAppHints {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h != "" {
+			hints = append(hints, h)
+		}
+	}
+	return &RealtimeDetector{
+		ports:    ports,
+		appHints: hints,
+		cfg:      cfg,
+		flows:    make(map[uint64]*realtimeSmoothState),
+	}
+}
+
+// appHintMatch returns true if hint contains any configured RealtimeAppHints
+// substring (already lowercased). Empty hint => false. The substring style
+// covers names like "anydesk-server" / "anydesk_service" / "Roblox.exe-via-Wine"
+// without needing exact-match curation.
+func (d *RealtimeDetector) appHintMatch(hint string) bool {
+	if hint == "" || len(d.appHints) == 0 {
+		return false
+	}
+	for _, needle := range d.appHints {
+		if strings.Contains(hint, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
@@ -172,6 +244,9 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 		return TrafficRealtime
 	}
 	if looksLikeRealtimeMagic(meta.Payload) {
+		return TrafficRealtime
+	}
+	if d.appHintMatch(meta.AppHint) {
 		return TrafficRealtime
 	}
 	if _, ok := d.ports[meta.Port]; ok {

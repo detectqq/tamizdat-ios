@@ -11,6 +11,7 @@ package tamizdat
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -227,4 +228,28 @@ func (c *ServerConfig) applyDefaults() {
 	if !c.DisableDefaultSecurity {
 		c.RecordFragmentation = c.RecordFragmentation || true
 	}
+}
+
+// ContextWithAppHint attaches a process-name hint to ctx. Client-side
+// process attribution (e.g. /proc/net/tcp lookup on Linux) uses this to
+// pass the local app's name into Client.DialContext, which forwards it
+// as a "Tamizdat-App-Hint" HTTP/2 CONNECT header. Server-side realtime
+// classifier reads the header and applies a Tier 3 side-signal score
+// boost when the app is in the operator-configured realtime-app list.
+//
+// Empty hint is no-op. Hint values are lower-cased + trimmed before
+// transport to normalise across OSes.
+func ContextWithAppHint(ctx context.Context, hint string) context.Context {
+	hint = strings.ToLower(strings.TrimSpace(hint))
+	if hint == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, appHintCtxKey{}, hint)
+}
+
+// AppHintFromContext returns the app hint stored on ctx via
+// ContextWithAppHint, or "" if none.
+func AppHintFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(appHintCtxKey{}).(string)
+	return v
 }

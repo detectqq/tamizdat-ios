@@ -548,7 +548,17 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			// Server-side first-RTT realtime still uses the accepted socket's
 			// delayed-ACK posture: class is only knowable after CONNECT parsing,
 			// so V2 leaves post-CONNECT TCP_QUICKACK flips out of scope.
-			class = s.realtime.Detector.ClassifyOpen(NewFlowMeta(network, destination))
+			//
+			// Tamizdat-App-Hint is supplied by the client when it can attribute
+			// the local SOCKS5 connection to a process (Linux today via
+			// /proc/net/tcp; iOS via NEFlowMetaData when implemented). It is
+			// untrusted: if the client lies, worst case is a false-positive
+			// realtime classification (slightly weaker shape) for that flow.
+			meta := NewFlowMeta(network, destination)
+			meta.AppHint = r.Header.Get("Tamizdat-App-Hint")
+			class = s.realtime.Detector.ClassifyOpen(meta)
+			s.logf("[tamizdat] classify: dst=%s proto=%s app_hint=%q class=%s",
+				destination, network, meta.AppHint, class)
 		}
 
 		switch proto {

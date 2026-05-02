@@ -162,3 +162,60 @@ func TestRealtimeControllerOnModeReturnToFullCallback(t *testing.T) {
 	}
 	controller.Close(flowID2)
 }
+
+func TestRealtimeDetectorAppHintPromotesNonRealtimePort(t *testing.T) {
+	// Default config: pool of known-realtime app substrings + standard ports.
+	det := newRealtimeDetector()
+
+	// Sanity: TCP/443 to example.com normally classifies bulk.
+	if got := det.ClassifyOpen(NewFlowMeta("tcp", "example.com:443")); got != TrafficBulk {
+		t.Fatalf("baseline tcp/443 = %s, want bulk", got)
+	}
+
+	// With AppHint that matches a known realtime app substring,
+	// the same destination is promoted to realtime.
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "anydesk-service",
+	}); got != TrafficRealtime {
+		t.Fatalf("anydesk-service hint on tcp/443 = %s, want realtime", got)
+	}
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "Roblox.exe-via-Wine",
+	}); got != TrafficRealtime {
+		t.Fatalf("roblox hint = %s, want realtime", got)
+	}
+
+	// Unknown / browser hint must NOT promote: chrome/firefox multiplex many
+	// flow types and false-positive realtime would weaken bulk shape.
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "chrome",
+	}); got != TrafficBulk {
+		t.Fatalf("chrome hint on tcp/443 = %s, want bulk", got)
+	}
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "curl",
+	}); got != TrafficBulk {
+		t.Fatalf("curl hint on tcp/443 = %s, want bulk", got)
+	}
+
+	// Empty hint (non-Linux client / detection failed) must not promote.
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "",
+	}); got != TrafficBulk {
+		t.Fatalf("empty hint = %s, want bulk", got)
+	}
+}
+
+func TestRealtimeDetectorAppHintExplicitEmptyDisables(t *testing.T) {
+	// Operator can disable hint promotion by setting RealtimeAppHints=[]string{}
+	// (vs leaving it nil which uses defaults).
+	det := newRealtimeDetectorWithConfig(RealtimeDetectorConfig{
+		RealtimePorts:    []int{3478},
+		RealtimeAppHints: []string{},
+	})
+	if got := det.ClassifyOpen(FlowMeta{
+		Network: "tcp", Address: "example.com:443", AppHint: "anydesk",
+	}); got != TrafficBulk {
+		t.Fatalf("hint with empty hints list = %s, want bulk", got)
+	}
+}
