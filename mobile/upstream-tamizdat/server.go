@@ -61,6 +61,7 @@ type Server struct {
 
 	// Per-IP rate-limiter on masquerade forwards (compass v2 §3.11 DoS protection).
 	masqLimiter *masqueradeRateLimiter
+	realtime    *RealtimeController
 
 	shortIDPool     *shortIDPool
 	coverConfigJSON []byte
@@ -107,6 +108,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		replayGuard:  newReplayGuard(config.ReplayWindow),
 		ctx:          ctx,
 		cancel:       cancel,
+		realtime:     newRealtimeController(),
 		shortIDPool:  newShortIDPool(config.MasterShortID, config.EpochGraceWindow),
 	}
 
@@ -348,11 +350,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 	var shortID [shortIDLen]byte
 	copy(shortID[:], sessionID[:shortIDLen])
-	if s.shortIDPool == nil || !s.shortIDPool.Accept(shortID) {
-		s.doMasquerade(conn, clientHelloRecord)
-		return
-	}
 
+	// Timing-oracle hardening: derive and HMAC-check using the candidate
+	// shortID before consulting shortIDPool.Accept. Unknown-shortID probes and
+	// known-shortID/bad-tag probes both pay the same expensive auth path.
 	psk, err := DeriveServerPSK(s.config.PrivateKey, ephPub[:], shortID)
 	if err != nil {
 		s.logf("[tamizdat] deriving PSK failed: %v", err)
@@ -360,7 +361,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 	verifiedShortID, authenticated, err := VerifySessionIDv1(sessionID, psk, ephPub[:], [][shortIDLen]byte{shortID})
-	if err != nil || !authenticated {
+	acceptedShortID := s.shortIDPool != nil && s.shortIDPool.Accept(shortID)
+	if err != nil || !authenticated || !acceptedShortID {
 		s.logf("[tamizdat] P0.3 SessionID verification failed: %v", err)
 		s.doMasquerade(conn, clientHelloRecord)
 		return
@@ -534,8 +536,22 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 
 		// Branch on Samizdat-Protocol header to route UDP-over-CONNECT through
 		// the dedicated handler (udp_server.go). Empty / "tcp/1" is the default
-		// TCP CONNECT path.
-		switch proto := r.Header.Get(SamizdatProtocolHeader); proto {
+		// TCP CONNECT path. The realtime classifier is consulted here, after
+		// CONNECT authority parse and before stream handling.
+		proto := r.Header.Get(SamizdatProtocolHeader)
+		network := "tcp"
+		if proto == SamizdatProtocolUDP {
+			network = "udp"
+		}
+		class := TrafficBulk
+		if s.realtime != nil {
+			// Server-side first-RTT realtime still uses the accepted socket's
+			// delayed-ACK posture: class is only knowable after CONNECT parsing,
+			// so V2 leaves post-CONNECT TCP_QUICKACK flips out of scope.
+			class = s.realtime.Detector.ClassifyOpen(NewFlowMeta(network, destination))
+		}
+
+		switch proto {
 		case "", "tcp/1":
 			// fallthrough to TCP CONNECT handler below
 		case SamizdatProtocolUDP:
@@ -558,11 +574,12 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 		sr := &syncReader{r: body}
 
 		streamConn := &serverStreamConn{
-			reader:     io.NopCloser(sr),
-			writer:     flushWriter{w: w, flusher: flusher},
-			shaper:     s.shaper,
-			fragmenter: s.fragmenter,
-			debug:      s.config.Debug,
+			reader:       io.NopCloser(sr),
+			writer:       flushWriter{w: w, flusher: flusher},
+			shaper:       s.shaper,
+			fragmenter:   s.fragmenter,
+			debug:        s.config.Debug,
+			trafficClass: class,
 		}
 
 		defer streamConn.shutdown()
@@ -653,13 +670,14 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 // subject to the same record fragmentation (P0.1) and no per-record jitter (P0.4) as
 // the client side.
 type serverStreamConn struct {
-	reader     io.ReadCloser
-	writer     flushWriter
-	shaper     *Shaper
-	fragmenter *RecordFragmenter
-	debug      bool
-	closed     atomic.Bool
-	mu         sync.Mutex
+	reader       io.ReadCloser
+	writer       flushWriter
+	shaper       *Shaper
+	fragmenter   *RecordFragmenter
+	debug        bool
+	trafficClass TrafficClass
+	closed       atomic.Bool
+	mu           sync.Mutex
 
 	// HIGH-2: deadline enforcement to satisfy net.Conn contract.
 	// rd / wd store the deadline as Unix nanos (0 = no deadline). Read/Write
@@ -707,6 +725,14 @@ func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
 			panic(r)
 		}
 	}()
+
+	if sc.trafficClass == TrafficRealtime {
+		n, err = sc.writer.Write(b)
+		if err == nil {
+			sc.writer.Flush()
+		}
+		return n, err
+	}
 
 	// Route through shaper+fragmenter so outer TLS records stay small and
 	// fragmented without per-record jitter - P0.1 and P0.4 wired on the server side.

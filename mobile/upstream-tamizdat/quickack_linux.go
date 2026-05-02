@@ -13,6 +13,13 @@ import (
 // recommended mitigation: raise transport-layer RTT (TRTT) instead of adding
 // userspace per-record jitter that inflates ARTT.
 func setAcceptedConnDelayedAck(conn net.Conn) error {
+	return setTCPQuickAck(conn, false)
+}
+
+// setTCPQuickAck sets TCP_QUICKACK on Linux TCP connections. quick=false
+// preserves the delayed-ACK mitigation; quick=true is a lite-mode hook for
+// future realtime variants.
+func setTCPQuickAck(conn net.Conn, quick bool) error {
 	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
 		return nil
@@ -23,9 +30,13 @@ func setAcceptedConnDelayedAck(conn net.Conn) error {
 		return err
 	}
 
+	value := 0
+	if quick {
+		value = 1
+	}
 	var setErr error
 	err = rawConn.Control(func(fd uintptr) {
-		setErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
+		setErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_QUICKACK, value)
 	})
 	if err != nil {
 		return err

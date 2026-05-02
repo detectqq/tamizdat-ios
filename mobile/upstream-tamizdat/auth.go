@@ -198,14 +198,24 @@ func VerifySessionIDv1WithServerKey(sessionID []byte, serverPrivateKey []byte, e
 	}
 	var candidateShortID [shortIDLen]byte
 	copy(candidateShortID[:], sessionID[:shortIDLen])
-	if !shortIDAllowed(candidateShortID, allowedShortIDs) {
-		return zero, false, nil
-	}
+
+	// Timing-oracle hardening: derive and verify the HMAC for the candidate
+	// shortID before consulting the server's allowed-shortID pool. Unknown
+	// shortIDs and known-shortID/bad-tag probes therefore both pay the same
+	// X25519+HKDF+HMAC cost before they fail.
 	psk, err := DeriveServerPSK(serverPrivateKey, ephemeralPublicKey, candidateShortID)
 	if err != nil {
 		return zero, false, err
 	}
-	return VerifySessionIDv1(sessionID, psk, ephemeralPublicKey, allowedShortIDs)
+	nonce := sessionID[shortIDLen : shortIDLen+nonceLen]
+	tag := sessionID[shortIDLen+nonceLen:]
+	expectedTag := sessionIDTagV1(psk, candidateShortID, nonce, ephemeralPublicKey)
+	tagOK := hmac.Equal(tag, expectedTag)
+	allowed := shortIDAllowed(candidateShortID, allowedShortIDs)
+	if !tagOK || !allowed {
+		return zero, false, nil
+	}
+	return candidateShortID, true, nil
 }
 
 func sessionIDTagV1(psk []byte, shortID [shortIDLen]byte, nonce []byte, ephemeralPublicKey []byte) []byte {

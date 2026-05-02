@@ -18,6 +18,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+var setClientTCPQuickAck = setTCPQuickAck
+
 // pickServerName returns a randomly-chosen SNI from the configured pool.
 // Falls back to legacy single ServerName when no pool is configured.
 // Per-transport rotation breaks the "all clients of one IP share one SNI"
@@ -89,6 +91,8 @@ type Client struct {
 	fragmenter          *RecordFragmenter
 	fingerprintChooser  *fingerprintRotator
 	cover               *coverDriver
+	handshakeLimiter    *handshakeLimiter
+	realtime            *RealtimeController
 	derivedShortIDs     atomic.Pointer[[][8]byte]
 	serverPushedSNIPool atomic.Pointer[[]SNIEntry]
 	coverCtx            context.Context
@@ -118,14 +122,31 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 
 	c := &Client{
-		config: config,
+		config:           config,
+		handshakeLimiter: newHandshakeLimiter(),
+		realtime:         newRealtimeController(),
 	}
 	c.bundleCtx, c.bundleCancel = context.WithCancel(context.Background())
 
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
 	c.fingerprintChooser = newFingerprintRotator(config.Fingerprint)
-	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.BytesPerTransportSoftCap, c.createTransport)
+	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.MaxTransports, config.BytesPerTransportSoftCap, config.RotationOverlapAllowance, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+		return c.createTransport(ctx, class)
+	})
+	c.pool.setRealtimeController(c.realtime)
+	c.realtime.onLastRealtimeClose = c.pool.armLiteCloseHysteresis
+	if config.MaxTransports == 1 {
+		c.realtime.onRealtimeOpen = func() {
+			c.pool.cancelLiteCloseHysteresis()
+			c.pool.flipAllBulkTransports(ShapeLite)
+		}
+		c.realtime.onModeReturnToFull = func() {
+			c.pool.flipAllBulkTransports(ShapeFull)
+		}
+	} else {
+		c.realtime.onRealtimeOpen = c.pool.cancelLiteCloseHysteresis
+	}
 
 	if config.CoverTrafficEnabled {
 		c.coverCtx, c.coverCancel = context.WithCancel(context.Background())
@@ -144,16 +165,56 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	}
 	c.mu.Unlock()
 
-	transport, err := c.pool.getTransport(ctx)
+	class := TrafficBulk
+	var flowID uint64
+	if c.realtime != nil {
+		class = c.realtime.Detector.ClassifyOpen(NewFlowMeta(network, address))
+		flowID = c.realtime.Open(class)
+	}
+	closeRealtime := func() {
+		if c.realtime != nil && flowID != 0 {
+			c.realtime.Close(flowID)
+		}
+	}
+
+	transport, err := c.pool.getTransportForClass(ctx, class)
 	if err != nil {
+		closeRealtime()
 		return nil, fmt.Errorf("getting transport: %w", err)
 	}
 
 	conn, err := transport.openTunnel(ctx, address)
 	if err != nil {
+		transport.releaseStreamSlot()
+		closeRealtime()
 		return nil, fmt.Errorf("opening tunnel to %s: %w", address, err)
 	}
 
+	return wrapRealtimeConn(conn, c.realtime, flowID), nil
+}
+
+// dialBulk opens an internal TCP tunnel pinned to the bulk transport class.
+// Cover traffic uses this to bypass realtime classification explicitly.
+func (c *Client) dialBulk(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("dialBulk supports tcp only, got %q", network)
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("client is closed")
+	}
+	c.mu.Unlock()
+
+	transport, err := c.pool.getTransportForClass(ctx, TrafficBulk)
+	if err != nil {
+		return nil, fmt.Errorf("getting bulk transport: %w", err)
+	}
+	conn, err := transport.openTunnel(ctx, address)
+	if err != nil {
+		transport.releaseStreamSlot()
+		return nil, fmt.Errorf("opening bulk tunnel to %s: %w", address, err)
+	}
 	return conn, nil
 }
 
@@ -169,18 +230,34 @@ func (c *Client) DialUDP(ctx context.Context, address string) (net.PacketConn, e
 	}
 	c.mu.Unlock()
 
-	transport, err := c.pool.getTransport(ctx)
+	class := TrafficBulk
+	var flowID uint64
+	if c.realtime != nil {
+		class = c.realtime.Detector.ClassifyOpen(NewFlowMeta("udp", address))
+		flowID = c.realtime.Open(class)
+	}
+	closeRealtime := func() {
+		if c.realtime != nil && flowID != 0 {
+			c.realtime.Close(flowID)
+		}
+	}
+
+	transport, err := c.pool.getTransportForClass(ctx, class)
 	if err != nil {
+		closeRealtime()
 		return nil, fmt.Errorf("getting transport: %w", err)
 	}
 
 	rwc, err := transport.openUDPTunnel(ctx, address)
 	if err != nil {
+		transport.releaseStreamSlot()
+		closeRealtime()
 		return nil, fmt.Errorf("opening UDP tunnel to %s: %w", address, err)
 	}
 
 	target := &streamAddr{network: "udp", address: address}
-	return newUDPFramedPacketConn(rwc, target), nil
+	pc := newUDPFramedPacketConn(rwc, target)
+	return wrapRealtimePacketConn(pc, c.realtime, flowID), nil
 }
 
 // Close shuts down all connections.
@@ -205,7 +282,13 @@ func (c *Client) Close() error {
 
 // createTransport creates a new TLS+H2 connection to the server with
 // Reality-style auth embedded in the ClientHello.
-func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
+func (c *Client) createTransport(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	if c.handshakeLimiter != nil {
+		if err := c.handshakeLimiter.Wait(ctx, c.config.ServerAddr); err != nil {
+			return nil, err
+		}
+	}
+
 	var tcpConn net.Conn
 	var err error
 
@@ -217,6 +300,9 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("TCP dial to %s: %w", c.config.ServerAddr, err)
+	}
+	if class == TrafficRealtime {
+		_ = setClientTCPQuickAck(tcpConn, true)
 	}
 
 	var conn net.Conn = tcpConn
@@ -311,7 +397,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		fragmenter.ReportOutcome(true)
 	}
 
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout)
+	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout, class)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)

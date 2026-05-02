@@ -62,6 +62,10 @@ var (
 	// Handshake duration sum + count (avg = sum/count).
 	handshakeDurationNanosSum   atomic.Int64
 	handshakeDurationNanosCount atomic.Int64
+
+	poolBulkAliveGauge       atomic.Int64
+	poolRealtimeAliveGauge   atomic.Int64
+	realtimeFlowsActiveGauge atomic.Int64
 )
 
 func initTelemetry() {
@@ -107,6 +111,15 @@ func initTelemetry() {
 		expvar.Publish("tamizdat.handshake.duration_nanos_count", expvar.Func(func() any {
 			return handshakeDurationNanosCount.Load()
 		}))
+		expvar.Publish("tamizdat.pool.transports.bulk.alive", expvar.Func(func() any {
+			return poolBulkAliveGauge.Load()
+		}))
+		expvar.Publish("tamizdat.pool.transports.realtime.alive", expvar.Func(func() any {
+			return poolRealtimeAliveGauge.Load()
+		}))
+		expvar.Publish("tamizdat.realtime.flows.active", expvar.Func(func() any {
+			return realtimeFlowsActiveGauge.Load()
+		}))
 	})
 }
 
@@ -150,4 +163,13 @@ func safeIntAdd(c *expvar.Int, delta int64) {
 	if c != nil {
 		c.Add(delta)
 	}
+}
+
+func setPoolTransportGauges(bulkAlive, realtimeAlive int) {
+	poolBulkAliveGauge.Store(int64(bulkAlive))
+	poolRealtimeAliveGauge.Store(int64(realtimeAlive))
+}
+
+func setRealtimeFlowsActive(n int) {
+	realtimeFlowsActiveGauge.Store(int64(n))
 }

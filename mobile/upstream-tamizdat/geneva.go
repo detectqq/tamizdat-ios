@@ -144,10 +144,24 @@ func (b *genevaBandit) pick(server string) string {
 	}
 
 	bestName := fragStrategies[0].Name
+	if b.epsilon == 0 {
+		bestScore := -1.0
+		for _, s := range fragStrategies {
+			wins := st.wins[s.Name]
+			losses := st.losses[s.Name]
+			score := float64(wins+1) / float64(wins+losses+2)
+			if score > bestScore {
+				bestScore = score
+				bestName = s.Name
+			}
+		}
+		return bestName
+	}
+
 	bestSample := -1.0
 	for _, s := range fragStrategies {
-		alpha := float64(st.wins[s.Name] + 1)   // +1 prior
-		beta := float64(st.losses[s.Name] + 1)  // +1 prior
+		alpha := float64(st.wins[s.Name] + 1)  // +1 prior
+		beta := float64(st.losses[s.Name] + 1) // +1 prior
 		sample := sampleBeta(alpha, beta)
 		if sample > bestSample {
 			bestSample = sample

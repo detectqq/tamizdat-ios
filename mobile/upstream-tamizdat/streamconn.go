@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +17,7 @@ type streamConn struct {
 	remoteAddr  net.Addr
 	shaper      *Shaper
 	fragmenter  *RecordFragmenter
+	shapeMode   *atomic.Int32
 	destination string
 
 	readDeadline  *deadlineTimer
@@ -28,7 +30,7 @@ type streamConn struct {
 // newStreamConn creates a net.Conn backed by the given ReadWriteCloser.
 // The fragmenter (may be nil) is consulted on every Write to split the
 // payload across multiple H2 DATA frames (P0.1 wiring).
-func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string, shaper *Shaper, fragmenter *RecordFragmenter) *streamConn {
+func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string, shaper *Shaper, fragmenter *RecordFragmenter, shapeMode *atomic.Int32) *streamConn {
 	return &streamConn{
 		rwc:           rwc,
 		localAddr:     localAddr,
@@ -36,6 +38,7 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 		destination:   destination,
 		shaper:        shaper,
 		fragmenter:    fragmenter,
+		shapeMode:     shapeMode,
 		readDeadline:  newDeadlineTimer(),
 		writeDeadline: newDeadlineTimer(),
 	}
@@ -52,10 +55,20 @@ func (sc *streamConn) Write(b []byte) (int, error) {
 	if err := sc.writeDeadline.wait(); err != nil {
 		return 0, err
 	}
+	if sc.currentShapeMode() == ShapeLite {
+		return sc.rwc.Write(b)
+	}
 	if sc.shaper != nil {
 		return sc.shaper.FragmentWrite(sc.rwc, sc.fragmenter, b)
 	}
 	return sc.rwc.Write(b)
+}
+
+func (sc *streamConn) currentShapeMode() ShapeMode {
+	if sc.shapeMode == nil {
+		return ShapeFull
+	}
+	return ShapeMode(sc.shapeMode.Load())
 }
 
 func (sc *streamConn) Close() error {

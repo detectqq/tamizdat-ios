@@ -44,10 +44,13 @@ type h2Transport struct {
 	// bytesSoftCap > 0: marks draining when bytesSent >= cap. Independent of
 	// effectiveThreshold (which stays MaxInt64 in the post-BBCR design).
 	// Set by connpool from ClientConfig.BytesPerTransportSoftCap.
-	bytesSoftCap int64
-	drainTimeout       time.Duration
-	draining           atomic.Bool
-	drainCloseStarted  atomic.Bool
+	bytesSoftCap      int64
+	drainTimeout      time.Duration
+	draining          atomic.Bool
+	drainCloseStarted atomic.Bool
+	// shapeMode controls per-stream shaping inherited from this transport.
+	shapeMode atomic.Int32
+	class     TrafficClass
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
@@ -56,7 +59,7 @@ type h2Transport struct {
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration) (*h2Transport, error) {
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration, class TrafficClass) (*h2Transport, error) {
 	t := &h2Transport{
 		tlsConn:      tlsConn,
 		serverAddr:   serverAddr,
@@ -66,6 +69,12 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		shaper:       shaper,
 		fragmenter:   fragmenter,
 		drainTimeout: drainTimeout,
+		class:        class,
+	}
+	if class == TrafficRealtime {
+		t.shapeMode.Store(int32(ShapeLite))
+	} else {
+		t.shapeMode.Store(int32(ShapeFull))
 	}
 	wrappedConn := t.wrapClientConn(tlsConn)
 	h2t := &http2.Transport{
@@ -132,6 +141,8 @@ func (t *h2Transport) addBytesSent(n int) {
 // plaintext bytes 1:1 under-shoots and lets pcap flows exceed 15KB. A 6x
 // multiplier is intentionally conservative: it triggers migration earlier
 // while preserving the configured randomized threshold formula.
+// TODO(pool-foundation): operator should recalibrate this multiplier from
+// live pcaps before treating BytesPerTransportSoftCap as an outer-wire budget.
 func estimatedOuterWireBytes(n int) int64 { return int64(n) * 6 }
 
 // openTunnel issues an HTTP/2 CONNECT request to open a tunnel to the
@@ -207,11 +218,11 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		destination,
 		t.shaper,
 		t.fragmenter,
+		&t.shapeMode,
 	)
 
 	return conn, nil
 }
-
 
 // openUDPTunnel issues an HTTP/2 CONNECT request with the Samizdat-Protocol
 // header set to udp/1. Server bridges this stream to a UDP socket targeting
@@ -327,10 +338,8 @@ func (t *h2Transport) close() error {
 	}
 	t.closed = true
 
-	if closer, ok := t.h2Roundtrip.(io.Closer); ok {
-		closer.Close()
-	}
-	return t.tlsConn.Close()
+	t.closeH2RoundTripper()
+	return t.closeTLSConn()
 }
 
 // isClosed returns true if the transport has been closed.
@@ -402,6 +411,13 @@ func (s *h2StreamRWC) CloseWrite() error {
 // randomizedBytesThreshold returns threshold randomized by ±jitter for one
 // transport. randomInt is crypto/rand-backed (see fragmenter.go), avoiding a
 // deterministic per-process fingerprint.
+func randomizedBytesSoftCap(base int64) int64 {
+	if base <= 0 {
+		return 0
+	}
+	return base + int64(randomInt(0, 1537))
+}
+
 func randomizedBytesThreshold(threshold int, jitter float64) int64 {
 	if threshold <= 0 {
 		return 0
@@ -426,7 +442,7 @@ func (t *h2Transport) markDraining() {
 		return
 	}
 	if t.draining.CompareAndSwap(false, true) {
-		t.scheduleDrainClose()
+		t.startGracefulDrainClose()
 	}
 }
 
@@ -434,14 +450,59 @@ func (t *h2Transport) isDraining() bool {
 	return t != nil && t.draining.Load()
 }
 
-func (t *h2Transport) scheduleDrainClose() {
-	if t.drainTimeout <= 0 {
-		return
-	}
+func (t *h2Transport) startGracefulDrainClose() {
 	if !t.drainCloseStarted.CompareAndSwap(false, true) {
 		return
 	}
-	time.AfterFunc(t.drainTimeout, func() { _ = t.close() })
+	go t.gracefulDrainClose()
+}
+
+func (t *h2Transport) gracefulDrainClose() {
+	// Ask the H2 stack to stop accepting/opening streams before touching the
+	// TLS socket. This is the GOAWAY-equivalent ordering available through the
+	// standard x/net/http2 Transport API.
+	t.closeH2RoundTripper()
+
+	wait := t.drainTimeout / 2
+	if wait < 0 {
+		wait = 0
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if t.activeStreams.Load() == 0 {
+			_ = t.closeTLSConn()
+			return
+		}
+		select {
+		case <-deadline.C:
+			_ = t.closeTLSConn()
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (t *h2Transport) closeH2RoundTripper() {
+	if t == nil || t.h2Roundtrip == nil {
+		return
+	}
+	if closer, ok := t.h2Roundtrip.(io.Closer); ok {
+		_ = closer.Close()
+		return
+	}
+	if closer, ok := t.h2Roundtrip.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+func (t *h2Transport) closeTLSConn() error {
+	if t == nil || t.tlsConn == nil {
+		return nil
+	}
+	return t.tlsConn.Close()
 }
 
 func (t *h2Transport) wrapClientConn(conn net.Conn) net.Conn {
@@ -453,6 +514,44 @@ func (t *h2Transport) wrapServerConn(conn net.Conn) net.Conn {
 		return conn
 	}
 	return &h2AdaptiveConn{Conn: conn, transport: t, serverSide: true}
+}
+
+func (t *h2Transport) flipShapeMode(m ShapeMode) {
+	if t == nil {
+		return
+	}
+	t.shapeMode.Store(int32(m))
+	t.applyTCPQuickAckFlip(m == ShapeLite)
+}
+
+// underlyingTCPConn returns the *net.TCPConn beneath the TLS layer if
+// reachable; nil otherwise.
+func (t *h2Transport) underlyingTCPConn() *net.TCPConn {
+	if t == nil || t.tlsConn == nil {
+		return nil
+	}
+	type netConner interface {
+		NetConn() net.Conn
+	}
+	var conn net.Conn = t.tlsConn
+	if nc, ok := conn.(netConner); ok {
+		conn = nc.NetConn()
+	}
+	if f, ok := conn.(*Fragmenter); ok {
+		return f.UnderlyingTCP()
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		return tc
+	}
+	return nil
+}
+
+func (t *h2Transport) applyTCPQuickAckFlip(quick bool) {
+	tcpConn := t.underlyingTCPConn()
+	if tcpConn == nil {
+		return
+	}
+	_ = setClientTCPQuickAck(tcpConn, quick)
 }
 
 type h2AdaptiveConn struct {

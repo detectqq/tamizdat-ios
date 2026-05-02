@@ -1,0 +1,4 @@
+# window cover_bytes record_p50
+full 10240 240
+lite 0 1240
+full2 9216 260

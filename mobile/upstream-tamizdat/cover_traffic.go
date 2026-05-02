@@ -102,6 +102,9 @@ func (d *coverDriver) run(ctx context.Context) {
 			return
 		case <-time.After(gap):
 		}
+		if d.c != nil && d.c.realtime != nil && d.c.realtime.Mode() == ShapeLite {
+			continue
+		}
 		// Pick a target at random. The slice pointer can be atomically replaced
 		// by a server-pushed bundle; existing iterations keep their snapshot.
 		targetsPtr := d.targets.Load()
@@ -121,7 +124,7 @@ func (d *coverDriver) coverOnce(parent context.Context, target string) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 
-	conn, err := d.c.DialContext(ctx, "tcp", target)
+	conn, err := d.c.dialBulk(ctx, "tcp", target)
 	if err != nil {
 		return
 	}

@@ -13,12 +13,12 @@ import (
 // to split it at the SNI field boundary across multiple TCP segments with
 // a small randomized delay between them.
 type Fragmenter struct {
-	conn          net.Conn
-	firstWrite    bool
-	mu            sync.Mutex
-	tcpFragment   bool
-	minDelay      time.Duration
-	maxDelay      time.Duration
+	conn        net.Conn
+	firstWrite  bool
+	mu          sync.Mutex
+	tcpFragment bool
+	minDelay    time.Duration
+	maxDelay    time.Duration
 	// #7 adaptive Geneva: per-conn picked strategy + server key for bandit reporting.
 	strategyName string
 	serverAddr   string
@@ -58,6 +58,18 @@ func (f *Fragmenter) ReportOutcome(won bool) {
 		return
 	}
 	globalGenevaBandit.reportOutcome(f.serverAddr, f.strategyName, won)
+}
+
+// UnderlyingTCP returns the wrapped TCP connection, used by transport-level
+// quickack flips after TLS handshake completes.
+func (f *Fragmenter) UnderlyingTCP() *net.TCPConn {
+	if f == nil {
+		return nil
+	}
+	if tc, ok := f.conn.(*net.TCPConn); ok {
+		return tc
+	}
+	return nil
 }
 
 // Write implements net.Conn.Write. The first call fragments the ClientHello;
@@ -244,12 +256,12 @@ func (f *Fragmenter) randomDelay() {
 }
 
 func (f *Fragmenter) Read(b []byte) (int, error)         { return f.conn.Read(b) }
-func (f *Fragmenter) Close() error                        { return f.conn.Close() }
-func (f *Fragmenter) LocalAddr() net.Addr                 { return f.conn.LocalAddr() }
-func (f *Fragmenter) RemoteAddr() net.Addr                { return f.conn.RemoteAddr() }
-func (f *Fragmenter) SetDeadline(t time.Time) error       { return f.conn.SetDeadline(t) }
-func (f *Fragmenter) SetReadDeadline(t time.Time) error   { return f.conn.SetReadDeadline(t) }
-func (f *Fragmenter) SetWriteDeadline(t time.Time) error  { return f.conn.SetWriteDeadline(t) }
+func (f *Fragmenter) Close() error                       { return f.conn.Close() }
+func (f *Fragmenter) LocalAddr() net.Addr                { return f.conn.LocalAddr() }
+func (f *Fragmenter) RemoteAddr() net.Addr               { return f.conn.RemoteAddr() }
+func (f *Fragmenter) SetDeadline(t time.Time) error      { return f.conn.SetDeadline(t) }
+func (f *Fragmenter) SetReadDeadline(t time.Time) error  { return f.conn.SetReadDeadline(t) }
+func (f *Fragmenter) SetWriteDeadline(t time.Time) error { return f.conn.SetWriteDeadline(t) }
 
 // randomInt returns a random int in [min, max).
 func randomInt(min, max int) int {

@@ -60,6 +60,11 @@ type ClientConfig struct {
 	CoverTrafficEnabled bool
 	CoverTrafficTargets []string // empty = defaults
 
+	// PoolVariant selects an operator-controlled transport-pool strategy.
+	// Empty keeps the foundation/V3-shaped defaults; "v2" uses one bulk
+	// transport plus one on-demand realtime lite transport.
+	PoolVariant string
+
 	// Multi-conn fallback against #490 (compass deep-research P1.2):
 	// MinTransports pre-warms N parallel TLS+H2 transports up-front; new
 	// streams round-robin across them so no single transport carries the
@@ -67,6 +72,17 @@ type ClientConfig struct {
 	// stay healthy and traffic continues. Default 1 = legacy behaviour
 	// (single lazy transport).
 	MinTransports int
+
+	// MaxTransports caps the number of simultaneous TLS+H2 transports in the
+	// pool. 0 means applyDefaults pins it to MinTransports; values below
+	// MinTransports are raised to MinTransports.
+	MaxTransports int
+
+	// RotationOverlapAllowance permits this many extra transient bulk
+	// transports while an old bulk transport is draining after a byte-cap
+	// rotation. V1 defaults this to 1 so a single steady transport can be
+	// gracefully replaced when rotation is explicitly enabled.
+	RotationOverlapAllowance int
 
 	// BytesPerTransportSoftCap, if >0, marks a transport draining once its
 	// cumulative outbound bytes cross the cap (typical 12-15 KB to trigger
@@ -97,7 +113,7 @@ func (c *ClientConfig) applyDefaults() {
 		c.ShortID = c.MasterShortID
 	}
 	if c.Fingerprint == "" {
-		c.Fingerprint = "chrome"
+		c.Fingerprint = "mix"
 	}
 	if c.MaxStreamsPerConn == 0 {
 		c.MaxStreamsPerConn = 100
@@ -119,15 +135,30 @@ func (c *ClientConfig) applyDefaults() {
 		c.TCPFragmentation = true
 		c.RecordFragmentation = true
 		c.CoverTrafficEnabled = true
-		if c.MinTransports < 2 {
+		if c.PoolVariant != "v1" && c.PoolVariant != "v2" && c.MinTransports < 2 {
 			c.MinTransports = 2
-		}
-		if c.BytesPerTransportSoftCap == 0 {
-			c.BytesPerTransportSoftCap = 13312 // ~13 KiB, before TSPU #490 ~15-20 KB shaping
 		}
 	} else if c.MinTransports < 1 {
 		// even with security disabled, MinTransports must be >=1
 		c.MinTransports = 1
+	}
+	switch c.PoolVariant {
+	case "v1":
+		c.MinTransports = 1
+		c.MaxTransports = 1
+		if c.RotationOverlapAllowance == 0 {
+			c.RotationOverlapAllowance = 1
+		}
+	case "v2":
+		c.MinTransports = 1
+		c.MaxTransports = 2
+	default:
+		if c.MaxTransports == 0 {
+			c.MaxTransports = c.MinTransports
+		}
+		if c.MaxTransports < c.MinTransports {
+			c.MaxTransports = c.MinTransports
+		}
 	}
 }
 
@@ -188,7 +219,7 @@ func (c *ServerConfig) applyDefaults() {
 		c.MaxConcurrentStreams = 250
 	}
 	if c.ReplayWindow == 0 {
-		c.ReplayWindow = 2 * time.Minute
+		c.ReplayWindow = defaultReplayWindow
 	}
 	if c.DrainTimeout == 0 {
 		c.DrainTimeout = 10 * time.Second

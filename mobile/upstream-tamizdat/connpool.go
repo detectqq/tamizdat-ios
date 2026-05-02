@@ -2,8 +2,11 @@ package tamizdat
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,35 +23,72 @@ import (
 //	    IdleTimeout wallclock (default 5 m, set by ClientConfig), and
 //	(b) uses a slower tick (60 s) so the pool does not itself emit a 30 s
 //	    heartbeat signature.
+var ErrPoolBackpressure = errors.New("tamizdat: pool at MaxTransports cap")
+
+var poolDebugLog atomic.Bool
+
+func poolLogf(format string, args ...any) {
+	if poolDebugLog.Load() {
+		log.Printf(format, args...)
+	}
+}
+
 type connPool struct {
 	mu          sync.Mutex
 	transports  []*h2Transport
 	maxStreams  int
 	idleTimeout time.Duration
-	createFunc  func(ctx context.Context) (*h2Transport, error)
+	createFunc  func(ctx context.Context, class TrafficClass) (*h2Transport, error)
 	closed      bool
 	closeCh     chan struct{}
 	// Multi-conn fallback (#6 / compass P1.2):
-	minTransports int   // pre-warm + reaper target
-	bytesSoftCap  int64 // close transport at outbound bytes >= cap (0=disabled)
-	nextRR        int   // round-robin index into transports for getTransport
+	minTransports            int   // pre-warm + reaper target
+	maxTransports            int   // hard cap on simultaneous transports
+	creating                 int   // transports being dialed outside p.mu
+	bytesSoftCap             int64 // close transport at outbound bytes >= cap (0=disabled)
+	rotationOverlapAllowance int   // extra transient bulk slots while a capped transport drains
+	bulkRR                   int   // round-robin index into transports for bulk getTransport
+	liteTransport            *h2Transport
+
+	liteCloseDeadline atomic.Int64 // Unix nanos, 0 = not armed
+	liteCloseTimer    *time.Timer
+	liteCloseMin      time.Duration
+	liteCloseMax      time.Duration
+	realtime          *RealtimeController
 }
 
 // newConnPool creates a connection pool that creates new transports via createFunc.
 // minTransports >= 1: pre-warm pool and keep at least N transports alive
 // (compass P1.2 multi-conn fallback against TSPU detector #490). bytesSoftCap
 // > 0 marks a transport draining once outbound bytes cross threshold.
-func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, bytesSoftCap int64, createFunc func(ctx context.Context) (*h2Transport, error)) *connPool {
+func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, maxTransports int, bytesSoftCap int64, rotationOverlapAllowance int, createFunc func(ctx context.Context, class TrafficClass) (*h2Transport, error)) *connPool {
 	if minTransports < 1 {
 		minTransports = 1
 	}
+	if maxTransports == 0 {
+		maxTransports = minTransports
+	}
+	if maxTransports < minTransports {
+		maxTransports = minTransports
+	}
+	if rotationOverlapAllowance < 0 {
+		if maxTransports == 1 && bytesSoftCap > 0 {
+			rotationOverlapAllowance = 1
+		} else {
+			rotationOverlapAllowance = 0
+		}
+	}
 	p := &connPool{
-		maxStreams:    maxStreams,
-		idleTimeout:   idleTimeout,
-		createFunc:    createFunc,
-		closeCh:       make(chan struct{}),
-		minTransports: minTransports,
-		bytesSoftCap:  bytesSoftCap,
+		maxStreams:               maxStreams,
+		idleTimeout:              idleTimeout,
+		createFunc:               createFunc,
+		closeCh:                  make(chan struct{}),
+		minTransports:            minTransports,
+		maxTransports:            maxTransports,
+		bytesSoftCap:             bytesSoftCap,
+		rotationOverlapAllowance: rotationOverlapAllowance,
+		liteCloseMin:             45 * time.Second,
+		liteCloseMax:             90 * time.Second,
 	}
 
 	go p.cleanupLoop()
@@ -57,61 +97,346 @@ func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, b
 	return p
 }
 
-// getTransport returns an existing transport with available capacity, or
-// creates a new one.
+// getTransport returns a bulk-class transport with available capacity, or
+// creates a new bulk transport. Kept for legacy internal callers; V2 traffic
+// routing should use getTransportForClass.
 func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
-	p.mu.Lock()
+	return p.getBulkTransport(ctx)
+}
 
-	if p.closed {
-		p.mu.Unlock()
-		return nil, context.Canceled
+// getTransportForClass routes V2 traffic classes to separate transport buckets.
+func (p *connPool) getTransportForClass(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	if class == TrafficRealtime {
+		return p.getLiteTransport(ctx)
 	}
+	return p.getBulkTransport(ctx)
+}
 
-	// Round-robin pick across existing transports so traffic is distributed
-	// instead of piling onto the first available (compass P1.2). Combined
-	// with HIGH-4 atomic CAS reservation: even if two callers see the same
-	// rr index, reserveStreamSlot ensures only one gets the slot.
+func (p *connPool) getBulkTransport(ctx context.Context) (*h2Transport, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, context.Canceled
+		}
+
+		if t := p.reserveBulkLocked(); t != nil {
+			p.mu.Unlock()
+			t.touch()
+			return t, nil
+		}
+
+		capacity := p.maxTransportsWithRotationOverlapLocked()
+		if len(p.transports)+p.creating >= capacity {
+			if p.creating > 0 {
+				p.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+					continue
+				}
+			}
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: cap=%d", ErrPoolBackpressure, capacity)
+		}
+
+		p.creating++
+		p.mu.Unlock()
+
+		t, err := p.createFunc(ctx, TrafficBulk)
+		p.mu.Lock()
+		p.creating--
+		p.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		prepareTransportForClass(t, TrafficBulk)
+		p.prepareV1BulkShapeMode(t)
+		t.bytesSoftCap = randomizedBytesSoftCap(p.bytesSoftCap)
+		if !t.reserveStreamSlot() {
+			t.close()
+			return nil, fmt.Errorf("freshly created transport rejects reservation (closed/drain/cap=0)")
+		}
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			t.close()
+			return nil, context.Canceled
+		}
+		if len(p.transports) >= p.maxTransportsWithRotationOverlapLocked() {
+			p.mu.Unlock()
+			t.close()
+			continue
+		}
+		p.transports = append(p.transports, t)
+		p.updatePoolGaugesLocked()
+		p.mu.Unlock()
+
+		return t, nil
+	}
+}
+
+func (p *connPool) maxTransportsWithRotationOverlapLocked() int {
+	capacity := p.maxTransports
+	if p.rotationOverlapAllowance > 0 && p.hasDrainingBulkLocked() {
+		capacity += p.rotationOverlapAllowance
+	}
+	return capacity
+}
+
+func (p *connPool) hasDrainingBulkLocked() bool {
+	for _, t := range p.transports {
+		if t != nil && t.class == TrafficBulk && t.isDraining() {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *connPool) prepareV1BulkShapeMode(t *h2Transport) {
+	if t == nil || p.maxTransports != 1 || p.realtime == nil {
+		return
+	}
+	if p.realtime.Mode() == ShapeLite {
+		t.flipShapeMode(ShapeLite)
+	}
+}
+
+func (p *connPool) reserveBulkLocked() *h2Transport {
 	n := len(p.transports)
-	if n > 0 {
-		start := p.nextRR % n
-		for i := 0; i < n; i++ {
-			t := p.transports[(start+i)%n]
-			if t.reserveStreamSlot() {
-				p.nextRR = (start + i + 1) % n
+	if n == 0 {
+		return nil
+	}
+	start := p.bulkRR % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		t := p.transports[idx]
+		if t.class != TrafficBulk {
+			continue
+		}
+		if t.reserveStreamSlot() {
+			p.bulkRR = (idx + 1) % n
+			return t
+		}
+	}
+	return nil
+}
+
+func (p *connPool) getLiteTransport(ctx context.Context) (*h2Transport, error) {
+	if p.maxTransports <= 1 {
+		return p.getBulkTransport(ctx)
+	}
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, context.Canceled
+		}
+
+		p.cancelLiteCloseHysteresisLocked()
+		if t := p.liteTransport; t != nil {
+			if t.isClosed() {
+				p.clearLiteTransportLocked(t)
+			} else if t.reserveStreamSlot() {
 				p.mu.Unlock()
 				t.touch()
 				return t, nil
 			}
 		}
-	}
 
-	p.mu.Unlock()
+		if len(p.transports)+p.creating >= p.maxTransports {
+			if p.creating > 0 {
+				p.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+					continue
+				}
+			}
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: cap=%d", ErrPoolBackpressure, p.maxTransports)
+		}
 
-	t, err := p.createFunc(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// #6 multi-conn fallback: propagate soft-cap to the fresh transport.
-	t.bytesSoftCap = p.bytesSoftCap
-	// Pre-reserve a slot on the freshly-created transport so the caller can
-	// safely openTunnel without racing the next getTransport caller.
-	if !t.reserveStreamSlot() {
-		t.close()
-		return nil, fmt.Errorf("freshly created transport rejects reservation (closed/drain/cap=0)")
-	}
-
-	p.mu.Lock()
-	// MED-5: if the pool was Closed while we were dialing outside the lock,
-	// don't add the new transport to a dead pool -- close it immediately.
-	if p.closed {
+		p.creating++
 		p.mu.Unlock()
-		t.close()
-		return nil, context.Canceled
-	}
-	p.transports = append(p.transports, t)
-	p.mu.Unlock()
 
-	return t, nil
+		t, err := p.createFunc(ctx, TrafficRealtime)
+		p.mu.Lock()
+		p.creating--
+		p.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		prepareTransportForClass(t, TrafficRealtime)
+		t.bytesSoftCap = 0
+		if !t.reserveStreamSlot() {
+			t.close()
+			return nil, fmt.Errorf("freshly created lite transport rejects reservation (closed/drain/cap=0)")
+		}
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			t.close()
+			return nil, context.Canceled
+		}
+		if existing := p.liteTransport; existing != nil && !existing.isClosed() && !existing.isDraining() {
+			p.mu.Unlock()
+			t.close()
+			continue
+		}
+		if len(p.transports) >= p.maxTransports {
+			p.mu.Unlock()
+			t.close()
+			continue
+		}
+		p.transports = append(p.transports, t)
+		p.liteTransport = t
+		p.updatePoolGaugesLocked()
+		poolLogf("[tamizdat] lite transport opened")
+		p.mu.Unlock()
+
+		return t, nil
+	}
+}
+
+func prepareTransportForClass(t *h2Transport, class TrafficClass) {
+	if t == nil {
+		return
+	}
+	t.class = class
+	if class == TrafficRealtime {
+		t.shapeMode.Store(int32(ShapeLite))
+	} else {
+		t.shapeMode.Store(int32(ShapeFull))
+	}
+}
+
+func (p *connPool) clearLiteTransportLocked(t *h2Transport) {
+	if t != nil && t.class == TrafficRealtime && p.liteTransport == t {
+		p.liteTransport = nil
+		p.cancelLiteCloseHysteresisLocked()
+	}
+}
+
+func (p *connPool) cancelLiteCloseHysteresisLocked() {
+	if p.liteCloseTimer != nil {
+		p.liteCloseTimer.Stop()
+		p.liteCloseTimer = nil
+	}
+	p.liteCloseDeadline.Store(0)
+}
+
+func (p *connPool) setRealtimeController(controller *RealtimeController) {
+	p.mu.Lock()
+	p.realtime = controller
+	p.mu.Unlock()
+}
+
+func (p *connPool) flipAllBulkTransports(m ShapeMode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, t := range p.transports {
+		if t == nil || t.class != TrafficBulk || t.isClosed() {
+			continue
+		}
+		t.flipShapeMode(m)
+	}
+}
+
+func (p *connPool) cancelLiteCloseHysteresis() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cancelLiteCloseHysteresisLocked()
+}
+
+func (p *connPool) armLiteCloseHysteresis() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.liteTransport == nil {
+		return
+	}
+	p.cancelLiteCloseHysteresisLocked()
+	delay := p.liteCloseMin
+	if p.liteCloseMax > p.liteCloseMin {
+		delay = randomDuration(p.liteCloseMin, p.liteCloseMax+time.Nanosecond)
+	}
+	deadline := time.Now().Add(delay)
+	p.liteCloseDeadline.Store(deadline.UnixNano())
+	p.liteCloseTimer = time.AfterFunc(delay, p.liteCloseTick)
+}
+
+func (p *connPool) liteCloseTick() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.liteCloseTimer = nil
+	deadline := p.liteCloseDeadline.Load()
+	if deadline == 0 {
+		return
+	}
+	if now := time.Now().UnixNano(); now < deadline {
+		delay := time.Duration(deadline - now)
+		p.liteCloseTimer = time.AfterFunc(delay, p.liteCloseTick)
+		return
+	}
+	p.liteCloseDeadline.Store(0)
+
+	t := p.liteTransport
+	if t == nil {
+		return
+	}
+	if p.realtime != nil && p.realtime.ActiveRealtimeCount() != 0 {
+		return
+	}
+	if t.streamCount() != 0 {
+		delay := 10 * time.Millisecond
+		deadline := time.Now().Add(delay)
+		p.liteCloseDeadline.Store(deadline.UnixNano())
+		p.liteCloseTimer = time.AfterFunc(delay, p.liteCloseTick)
+		return
+	}
+	t.markDraining()
+	t.close()
+	p.removeTransportLocked(t)
+	poolLogf("[tamizdat] lite transport closed")
+	p.clearLiteTransportLocked(t)
+	p.updatePoolGaugesLocked()
+}
+
+func (p *connPool) removeTransportLocked(target *h2Transport) {
+	if target == nil {
+		return
+	}
+	kept := p.transports[:0]
+	for _, t := range p.transports {
+		if t != target {
+			kept = append(kept, t)
+		}
+	}
+	p.transports = kept
+}
+
+func (p *connPool) updatePoolGaugesLocked() {
+	bulkAlive := 0
+	realtimeAlive := 0
+	for _, t := range p.transports {
+		if t.isClosed() || t.isDraining() {
+			continue
+		}
+		switch t.class {
+		case TrafficRealtime:
+			realtimeAlive++
+		default:
+			bulkAlive++
+		}
+	}
+	setPoolTransportGauges(bulkAlive, realtimeAlive)
 }
 
 // cleanupLoop periodically removes closed and idle transports. The tick
@@ -141,24 +466,27 @@ func (p *connPool) cleanup() {
 	alive := make([]*h2Transport, 0, len(p.transports))
 	for _, t := range p.transports {
 		if t.isClosed() {
+			p.clearLiteTransportLocked(t)
 			continue
 		}
 		if t.isDraining() && t.streamCount() == 0 {
 			t.close()
+			p.clearLiteTransportLocked(t)
 			continue
 		}
 		if t.streamCount() == 0 {
 			last := t.lastActive()
 			if !last.IsZero() && time.Since(last) > p.idleTimeout {
 				t.close()
+				p.clearLiteTransportLocked(t)
 				continue
 			}
 		}
 		alive = append(alive, t)
 	}
 	p.transports = alive
+	p.updatePoolGaugesLocked()
 }
-
 
 // reaperLoop tops up the pool to minTransports. If the byte soft-cap was hit
 // on a transport (drained itself), reaper notices and dials a replacement.
@@ -209,36 +537,53 @@ func (p *connPool) observeCurtainSignal() {
 // Best-effort: dial errors silent (next tick retries). Caller must NOT hold
 // p.mu (createFunc dials outside the lock).
 func (p *connPool) topUp() {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	alive := 0
-	for _, tr := range p.transports {
-		if !tr.isClosed() && !tr.isDraining() {
-			alive++
-		}
-	}
-	need := p.minTransports - alive
-	p.mu.Unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	for i := 0; i < need; i++ {
-		tr, err := p.createFunc(ctx)
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
+
+		bulkAlive := 0
+		for _, tr := range p.transports {
+			if tr.class == TrafficBulk && !tr.isClosed() && !tr.isDraining() {
+				bulkAlive++
+			}
+		}
+		if bulkAlive >= p.minTransports || len(p.transports)+p.creating >= p.maxTransportsWithRotationOverlapLocked() {
+			p.mu.Unlock()
+			return
+		}
+		p.creating++
+		p.mu.Unlock()
+
+		tr, err := p.createFunc(ctx, TrafficBulk)
+		p.mu.Lock()
+		p.creating--
+		p.mu.Unlock()
 		if err != nil {
 			return
 		}
-		tr.bytesSoftCap = p.bytesSoftCap
+		prepareTransportForClass(tr, TrafficBulk)
+		p.prepareV1BulkShapeMode(tr)
+		tr.bytesSoftCap = randomizedBytesSoftCap(p.bytesSoftCap)
+
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
 			tr.close()
 			return
 		}
+		if len(p.transports) >= p.maxTransportsWithRotationOverlapLocked() {
+			p.mu.Unlock()
+			tr.close()
+			return
+		}
 		p.transports = append(p.transports, tr)
+		p.updatePoolGaugesLocked()
 		p.mu.Unlock()
 	}
 }
@@ -253,10 +598,12 @@ func (p *connPool) close() error {
 	}
 	p.closed = true
 	close(p.closeCh)
+	p.cancelLiteCloseHysteresisLocked()
 
 	for _, t := range p.transports {
 		t.close()
 	}
 	p.transports = nil
+	setPoolTransportGauges(0, 0)
 	return nil
 }

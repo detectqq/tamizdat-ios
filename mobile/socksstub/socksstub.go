@@ -297,15 +297,24 @@ func SetSamizdatConfig(blob string) error {
 		// Audit fix (final IPA-F): cap concurrent H2 streams at 50.
 		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
+		// IPA-G: V1-full pool variant. applyDefaults() pins
+		// MinTransports=1 / MaxTransports=1 / RotationOverlapAllowance=1
+		// and leaves BytesPerTransportSoftCap=0 (no mid-session rotation).
+		// The library's realtime.Detector then auto-flips the bulk
+		// transport to "lite shape" when it sees UDP destined for the
+		// whitelisted ports (Roblox / AnyDesk / Discord voice / IANA
+		// dynamic 49152-65535) or matching jitter signatures —
+		// suspending cover traffic, skipping fragmentation, disabling
+		// jitter, enabling TCP_QUICKACK on Linux for the duration of
+		// the realtime flow, with 30-60s hysteresis on return.
+		PoolVariant: "v1",
 		// IPA-T: Game-optimized mode flips DisableDefaultSecurity on
-		// tamizdat's ClientConfig. The library's applyDefaults() then
-		// skips: BytesPerTransportSoftCap=13312, TCPFragmentation,
-		// RecordFragmentation, CoverTrafficEnabled, MinTransports=2.
-		// Result: a single stable TLS+H2 transport for the whole
-		// session — no rotation handshakes during gameplay, no
-		// Geneva-fragmented frames stalling UDP-in-TCP relay, no
-		// cover-traffic competing for bandwidth.
-		// Off by default; flipped via Settings -> Game-optimized.
+		// tamizdat's ClientConfig. With V1 already pinning the single
+		// transport, this toggle now mostly disables the remaining
+		// outer-wire defenses (TCPFragmentation, RecordFragmentation,
+		// CoverTrafficEnabled) permanently — useful as a manual
+		// override if the realtime classifier ever misses a flow.
+		// Off by default; flipped via Settings -> Performance mode.
 		DisableDefaultSecurity: rt.gameOptimized.Load(),
 	}
 	if rt.gameOptimized.Load() {
