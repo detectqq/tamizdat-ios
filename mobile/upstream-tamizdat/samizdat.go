@@ -136,7 +136,7 @@ func (c *ClientConfig) applyDefaults() {
 		c.TCPFragmentation = true
 		c.RecordFragmentation = true
 		c.CoverTrafficEnabled = true
-		if c.PoolVariant != "v1" && c.PoolVariant != "v2" && c.MinTransports < 2 {
+		if c.PoolVariant != "v1" && c.PoolVariant != "v2" && c.PoolVariant != "v3" && c.MinTransports < 2 {
 			c.MinTransports = 2
 		}
 	} else if c.MinTransports < 1 {
@@ -153,6 +153,13 @@ func (c *ClientConfig) applyDefaults() {
 	case "v2":
 		c.MinTransports = 1
 		c.MaxTransports = 2
+	case "v3":
+		// Opus pool sizing (compass review): two prewarmed transports for
+		// throughput parallelism, up to four under load. Trades a slightly
+		// taller TLS-conn-count fingerprint vs #546 threshold (~12) for
+		// significantly better tail latency and per-flow throughput.
+		c.MinTransports = 2
+		c.MaxTransports = 4
 	default:
 		if c.MaxTransports == 0 {
 			c.MaxTransports = c.MinTransports

@@ -1,6 +1,7 @@
 package tamizdat
 
 import (
+	"container/heap"
 	"crypto/sha256"
 	"expvar"
 	"sync"
@@ -36,17 +37,45 @@ func initReplayExpvars() {
 	})
 }
 
+type replayHeapEntry struct {
+	insertTime time.Time
+	key        [replayKeyLen]byte
+}
+
+type replayMinHeap []replayHeapEntry
+
+func (h replayMinHeap) Len() int { return len(h) }
+
+func (h replayMinHeap) Less(i, j int) bool {
+	return h[i].insertTime.Before(h[j].insertTime)
+}
+
+func (h replayMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *replayMinHeap) Push(x any) {
+	*h = append(*h, x.(replayHeapEntry))
+}
+
+func (h *replayMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	*h = old[:n-1]
+	return entry
+}
+
 // replayGuard keeps a sliding window of recently-seen replay keys and rejects
 // duplicates. P0.3 v1 replay keys are SHA-256(SessionID || eph_pub)[:16],
 // computed by the caller before interacting with the guard. Legacy callers keep
 // using check(sessionID), which hashes the SessionID into the same 16-byte key
 // space to preserve duplicate-rejection semantics until ECDH-C wires v1 auth.
 type replayGuard struct {
-	mu      sync.Mutex
-	seen    map[[replayKeyLen]byte]time.Time
-	window  time.Duration
-	hardCap int
-	now     func() time.Time
+	mu           sync.Mutex
+	seen         map[[replayKeyLen]byte]time.Time
+	evictionHeap replayMinHeap
+	window       time.Duration
+	hardCap      int
+	now          func() time.Time
 
 	// lastReap records the last time we walked the map pruning expired entries
 	// so steady-state auth traffic does not pay O(N) on every hit.
@@ -101,6 +130,7 @@ func (g *replayGuard) Insert(key [replayKeyLen]byte, t time.Time) {
 	}
 	g.reapLocked(t, true)
 	g.seen[key] = t
+	heap.Push(&g.evictionHeap, replayHeapEntry{insertTime: t, key: key})
 	g.evictOverCapLocked()
 	g.publishWindowSizeLocked()
 }
@@ -134,6 +164,7 @@ func (g *replayGuard) checkKey(key [replayKeyLen]byte) bool {
 		return false
 	}
 	g.seen[key] = now
+	heap.Push(&g.evictionHeap, replayHeapEntry{insertTime: now, key: key})
 	g.evictOverCapLocked()
 	g.publishWindowSizeLocked()
 	return true
@@ -180,17 +211,15 @@ func (g *replayGuard) evictOverCapLocked() {
 	}
 	evicted := int64(0)
 	for len(g.seen) > g.hardCap {
-		var oldestKey [replayKeyLen]byte
-		var oldestTime time.Time
-		first := true
-		for k, v := range g.seen {
-			if first || v.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v
-				first = false
-			}
+		if len(g.evictionHeap) == 0 {
+			break
 		}
-		delete(g.seen, oldestKey)
+		oldest := heap.Pop(&g.evictionHeap).(replayHeapEntry)
+		insertTime, ok := g.seen[oldest.key]
+		if !ok || !insertTime.Equal(oldest.insertTime) {
+			continue
+		}
+		delete(g.seen, oldest.key)
 		evicted++
 	}
 	if evicted > 0 {

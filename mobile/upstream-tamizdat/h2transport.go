@@ -1,6 +1,7 @@
 package tamizdat
 
 import (
+	"strings"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -190,6 +191,14 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		stop()
 		tunnelCancel()
 		pw.Close()
+		// If the underlying TCP/TLS conn died, mark this transport closed so
+		// future pool selections skip it and create a fresh one. Common
+		// patterns: "use of closed network connection", "EOF", "stream error",
+		// "broken pipe" — all indicate the outer pipe is gone, not just this
+		// stream.
+		if isOuterDeadErr(err) {
+			t.closeFromError(err)
+		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
 
@@ -272,6 +281,9 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 		stop()
 		tunnelCancel()
 		pw.Close()
+		if isOuterDeadErr(err) {
+			t.closeFromError(err)
+		}
 		return nil, fmt.Errorf("UDP CONNECT to %s: %w", destination, err)
 	}
 
@@ -621,4 +633,40 @@ func (c *h2AdaptiveConn) observeFrames(p []byte) {
 		copy(c.readBuf, c.readBuf[frameLen:])
 		c.readBuf = c.readBuf[:len(c.readBuf)-frameLen]
 	}
+}
+
+// isOuterDeadErr reports whether the error indicates the outer TCP/TLS pipe
+// is dead (not just a per-stream issue). When true, the whole h2Transport
+// must be discarded — no further streams will succeed on it.
+func isOuterDeadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "GOAWAY") ||
+		strings.Contains(s, "ENOTCONN") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "no route to host")
+}
+
+// closeFromError marks this transport closed *because* of an outer-pipe
+// failure detected from a RoundTrip. Idempotent — safe to call repeatedly.
+// Goal is to flip the closed flag so the pool stops handing this transport
+// to new dials. The actual H2/TLS teardown runs in a background goroutine.
+func (t *h2Transport) closeFromError(err error) {
+	t.mu.Lock()
+	already := t.closed
+	t.closed = true
+	t.mu.Unlock()
+	if already {
+		return
+	}
+	go func() {
+		t.closeH2RoundTripper()
+		_ = t.closeTLSConn()
+	}()
 }

@@ -1,9 +1,11 @@
 package tamizdat
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestRealtimeDetectorClassifyOpen(t *testing.T) {
@@ -217,5 +219,283 @@ func TestRealtimeDetectorAppHintExplicitEmptyDisables(t *testing.T) {
 		Network: "tcp", Address: "example.com:443", AppHint: "anydesk",
 	}); got != TrafficBulk {
 		t.Fatalf("hint with empty hints list = %s, want bulk", got)
+	}
+}
+
+func testSTUNPayload() []byte {
+	p := make([]byte, 20)
+	binary.BigEndian.PutUint32(p[4:8], 0x2112a442)
+	return p
+}
+
+func testDTLSHandshakePayload() []byte {
+	p := make([]byte, 13)
+	p[0], p[1], p[2] = 0x16, 0xfe, 0xfd
+	return p
+}
+
+func testTURNChannelDataPayload() []byte {
+	p := make([]byte, 8)
+	binary.BigEndian.PutUint16(p[0:2], 0x4001)
+	binary.BigEndian.PutUint16(p[2:4], 4)
+	return p
+}
+
+func testRTPPayload(seq uint16, ssrc uint32) []byte {
+	p := make([]byte, 80)
+	p[0], p[1] = 0x80, 0x60
+	binary.BigEndian.PutUint16(p[2:4], seq)
+	binary.BigEndian.PutUint32(p[8:12], ssrc)
+	return p
+}
+
+func detectorFlowStateForTest(t *testing.T, det *RealtimeDetector, flowID uint64) flowState {
+	t.Helper()
+	det.mu.Lock()
+	defer det.mu.Unlock()
+	st := det.flows[flowID]
+	if st == nil {
+		t.Fatalf("missing flow state for flow %d", flowID)
+	}
+	return *st
+}
+
+func TestStateBudget_FlowSizeUnder256B(t *testing.T) {
+	if got := unsafe.Sizeof(flowState{}); got > 256 {
+		t.Fatalf("flowState size = %d, want <= 256", got)
+	}
+}
+
+func TestTier1_STUNCookieAlone(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(200, 0)
+	class := det.Observe(ObservedPacket{FlowID: 1, At: base, Payload: testSTUNPayload(), Size: 20, Direction: DirOutbound})
+	if class != TrafficBulk {
+		t.Fatalf("single STUN packet class = %s, want bulk until confirm", class)
+	}
+	st := detectorFlowStateForTest(t, det, 1)
+	if st.state != flowStateProvisionalRT {
+		t.Fatalf("single STUN state = %d, want PROVISIONAL_RT", st.state)
+	}
+	if got := st.scoreT1; got != det.cfg.StunScoreQ8 {
+		t.Fatalf("STUN scoreT1 = %d, want %d", got, det.cfg.StunScoreQ8)
+	}
+}
+
+func TestTier1_STUNPlusAppHintClassifiesRealtime(t *testing.T) {
+	det := newRealtimeDetector()
+	if got := det.ClassifyOpen(FlowMeta{Network: "udp", Address: "1.2.3.4:9999", Payload: testSTUNPayload(), AppHint: "anydesk-service"}); got != TrafficRealtime {
+		t.Fatalf("STUN+apphint class = %s, want realtime", got)
+	}
+}
+
+func TestTier1_RTPSinglePacketDoesNotPromote(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(210, 0)
+	class := det.Observe(ObservedPacket{FlowID: 2, At: base, Payload: testRTPPayload(10, 0x01020304), Size: 80, Direction: DirOutbound})
+	if class != TrafficBulk {
+		t.Fatalf("single RTP packet class = %s, want bulk", class)
+	}
+	st := detectorFlowStateForTest(t, det, 2)
+	if st.state != flowStateProvisionalBulk {
+		t.Fatalf("single RTP state = %d, want PROVISIONAL_BULK", st.state)
+	}
+}
+
+func TestTier1_RTPThreePacketConfirmsCandidateOnlyToProvisionalRT(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(220, 0)
+	for i := 0; i < 3; i++ {
+		det.Observe(ObservedPacket{FlowID: 3, At: base.Add(time.Duration(i) * 20 * time.Millisecond), Payload: testRTPPayload(uint16(100+i), 0x0a0b0c0d), Size: 80, Direction: DirOutbound})
+	}
+	st := detectorFlowStateForTest(t, det, 3)
+	if st.state != flowStateProvisionalRT {
+		t.Fatalf("3-packet RTP state = %d, want PROVISIONAL_RT", st.state)
+	}
+	if got := st.scoreT1; got != det.cfg.RtpConfirmedScoreQ8 {
+		t.Fatalf("RTP confirmed scoreT1 = %d, want %d", got, det.cfg.RtpConfirmedScoreQ8)
+	}
+}
+
+func TestTier1_DTLSAndTURNStrongPrefixes(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(230, 0)
+	det.Observe(ObservedPacket{FlowID: 4, At: base, Payload: testDTLSHandshakePayload(), Size: 13, Direction: DirOutbound})
+	if st := detectorFlowStateForTest(t, det, 4); st.state != flowStateProvisionalRT || st.scoreT1 != det.cfg.DtlsHandshakeScoreQ8 {
+		t.Fatalf("DTLS state/score = %d/%d, want PROVISIONAL_RT/%d", st.state, st.scoreT1, det.cfg.DtlsHandshakeScoreQ8)
+	}
+	det.Observe(ObservedPacket{FlowID: 5, At: base, Payload: testTURNChannelDataPayload(), Size: 8, Direction: DirOutbound})
+	if st := detectorFlowStateForTest(t, det, 5); st.state != flowStateProvisionalRT || st.scoreT1 != det.cfg.TurnChannelDataScoreQ8 {
+		t.Fatalf("TURN state/score = %d/%d, want PROVISIONAL_RT/%d", st.state, st.scoreT1, det.cfg.TurnChannelDataScoreQ8)
+	}
+}
+
+func TestTier1_QuicAndTLSLargePenalties(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(240, 0)
+	quic := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0}
+	det.Observe(ObservedPacket{FlowID: 6, At: base, Payload: quic, Size: len(quic), Direction: DirOutbound})
+	if st := detectorFlowStateForTest(t, det, 6); st.scoreT1 != det.cfg.QuicLongHeaderScoreQ8 {
+		t.Fatalf("QUIC scoreT1 = %d, want %d", st.scoreT1, det.cfg.QuicLongHeaderScoreQ8)
+	}
+	tls := make([]byte, 1413)
+	tls[0], tls[1], tls[2] = 0x17, 0x03, 0x03
+	binary.BigEndian.PutUint16(tls[3:5], 1408)
+	det.Observe(ObservedPacket{FlowID: 7, At: base, Payload: tls, Size: len(tls), Direction: DirInbound})
+	if st := detectorFlowStateForTest(t, det, 7); st.scoreT1 != det.cfg.TlsLargeAppDataScoreQ8 {
+		t.Fatalf("TLS-large scoreT1 = %d, want %d", st.scoreT1, det.cfg.TlsLargeAppDataScoreQ8)
+	}
+}
+
+func TestTier2_OpusVoiceCadence(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(250, 0)
+	class := TrafficBulk
+	for i := 0; i < 30; i++ {
+		dir := DirOutbound
+		if i%2 == 1 {
+			dir = DirInbound
+		}
+		payload := make([]byte, 80)
+		class = det.Observe(ObservedPacket{FlowID: 8, At: base.Add(time.Duration(i) * 20 * time.Millisecond), Payload: payload, Size: len(payload), Direction: dir})
+	}
+	if class != TrafficRealtime {
+		t.Fatalf("voice cadence class = %s, want realtime", class)
+	}
+	if st := detectorFlowStateForTest(t, det, 8); st.state != flowStateConfirmedRT {
+		t.Fatalf("voice cadence state = %d, want CONFIRMED_RT", st.state)
+	}
+}
+
+func TestTier2_BulkMTUConfirmsBulk(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(260, 0)
+	for i := 0; i < 60; i++ {
+		payload := make([]byte, 1460)
+		det.Observe(ObservedPacket{FlowID: 9, At: base.Add(time.Duration(i) * 120 * time.Millisecond), Payload: payload, Size: len(payload), Direction: DirInbound})
+	}
+	st := detectorFlowStateForTest(t, det, 9)
+	if st.state != flowStateConfirmedBulk {
+		t.Fatalf("MTU bulk state = %d, want CONFIRMED_BULK", st.state)
+	}
+	if st.scoreT2 > det.cfg.MtuBulkScoreQ8 {
+		t.Fatalf("MTU bulk scoreT2 = %d, want penalty at least %d", st.scoreT2, det.cfg.MtuBulkScoreQ8)
+	}
+}
+
+func TestTier2_PaddedRealtimeDoesNotGetMTUPenalty(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(270, 0)
+	class := TrafficBulk
+	for i := 0; i < 30; i++ {
+		dir := DirOutbound
+		if i%2 == 1 {
+			dir = DirInbound
+		}
+		payload := make([]byte, 1500)
+		class = det.Observe(ObservedPacket{FlowID: 10, At: base.Add(time.Duration(i) * 20 * time.Millisecond), Payload: payload, Size: len(payload), Direction: dir})
+	}
+	if class != TrafficRealtime {
+		t.Fatalf("padded realtime class = %s, want realtime", class)
+	}
+	st := detectorFlowStateForTest(t, det, 10)
+	if st.scoreT2 <= 0 {
+		t.Fatalf("padded realtime scoreT2 = %d, want positive cadence without MTU penalty", st.scoreT2)
+	}
+}
+
+func TestTier2_TCPSkipsCadence(t *testing.T) {
+	det := newRealtimeDetector()
+	class := det.ClassifyOpen(NewFlowMeta("tcp", "example.com:12345"))
+	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
+	flowID := controller.Open(class)
+	base := time.Unix(280, 0)
+	for i := 0; i < 10; i++ {
+		det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(time.Duration(i) * 20 * time.Millisecond), Payload: make([]byte, 80), Size: 80, Direction: DirUnknown})
+	}
+	st := detectorFlowStateForTest(t, det, flowID)
+	if st.scoreT2 != 0 || st.state == flowStateConfirmedRT {
+		t.Fatalf("TCP cadence score/state = %d/%d, want no Tier2 promotion", st.scoreT2, st.state)
+	}
+}
+
+func TestStateMachine_AntiFlap_BulkPinned(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(290, 0)
+	for i := 0; i < 6; i++ {
+		det.Observe(ObservedPacket{FlowID: 11, At: base.Add(time.Duration(i) * 200 * time.Millisecond), Payload: make([]byte, 1460), Size: 1460, Direction: DirInbound})
+	}
+	if st := detectorFlowStateForTest(t, det, 11); st.state != flowStateConfirmedBulk {
+		t.Fatalf("pre-STUN state = %d, want CONFIRMED_BULK", st.state)
+	}
+	det.Observe(ObservedPacket{FlowID: 11, At: base.Add(2 * time.Second), Payload: testSTUNPayload(), Size: 20, Direction: DirOutbound})
+	if st := detectorFlowStateForTest(t, det, 11); st.state != flowStateConfirmedBulk {
+		t.Fatalf("post-STUN state = %d, want pinned CONFIRMED_BULK", st.state)
+	}
+}
+
+func TestStateMachine_SilentDemote(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(300, 0)
+	det.Observe(ObservedPacket{FlowID: 12, At: base, Payload: testSTUNPayload(), Size: 20, Direction: DirOutbound})
+	// Accumulate cadence breaks so score drops below demote after the silent-demote age.
+	for i := 1; i <= 15; i++ {
+		det.Observe(ObservedPacket{FlowID: 12, At: base.Add(time.Duration(i) * 200 * time.Millisecond), Payload: []byte{1}, Size: 1, Direction: DirOutbound})
+	}
+	st := detectorFlowStateForTest(t, det, 12)
+	if st.state != flowStateProvisionalBulk {
+		t.Fatalf("silent-demoted state = %d, want PROVISIONAL_BULK", st.state)
+	}
+}
+
+func TestStateMachine_IdleRelease(t *testing.T) {
+	det := newRealtimeDetector()
+	controller := newRealtimeControllerWithConfig(det, 10*time.Millisecond, 10*time.Millisecond)
+	flowID := controller.Open(TrafficBulk)
+	base := time.Unix(310, 0)
+	for i := 0; i < 30; i++ {
+		dir := DirOutbound
+		if i%2 == 1 {
+			dir = DirInbound
+		}
+		controller.observePacketAt(flowID, make([]byte, 80), dir, base.Add(time.Duration(i)*20*time.Millisecond))
+	}
+	if controller.ActiveRealtimeCount() != 1 {
+		t.Fatalf("active realtime after promote = %d, want 1", controller.ActiveRealtimeCount())
+	}
+	det.sweepIdleForTest(base.Add(31 * time.Second))
+	if controller.ActiveRealtimeCount() != 0 {
+		t.Fatalf("active realtime after idle release = %d, want 0", controller.ActiveRealtimeCount())
+	}
+}
+
+func TestEndpointCache_SiblingFlowBoostAndTTL(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(320, 0)
+	class := det.ClassifyOpen(FlowMeta{Network: "udp", Address: "1.2.3.4:9999", Payload: testSTUNPayload(), AppHint: "anydesk"})
+	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
+	flowID := controller.Open(class)
+	// Bind and confirm the first endpoint in the cache.
+	det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(250 * time.Millisecond), Payload: make([]byte, 80), Size: 80, Direction: DirOutbound})
+	if got := det.ClassifyOpen(FlowMeta{Network: "udp", Address: "1.2.3.5:9999"}); got != TrafficBulk {
+		// Cache hit alone is a watch/provisional signal, not enough to confirm via ClassifyOpen.
+		t.Fatalf("sibling cache class = %s, want bulk until corroborated", got)
+	}
+	pending := det.pendingOpenStateForTest()
+	if pending.scoreT3 <= det.cfg.UdpPriorScoreQ4 {
+		t.Fatalf("sibling cache scoreT3 = %d, want endpoint cache boost above UDP prior", pending.scoreT3)
+	}
+	det.expireEndpointCacheForTest(base.Add(61 * time.Second))
+	det.ClassifyOpen(FlowMeta{Network: "udp", Address: "1.2.3.6:9999"})
+	pending = det.pendingOpenStateForTest()
+	if pending.scoreT3 != det.cfg.UdpPriorScoreQ4 {
+		t.Fatalf("expired cache scoreT3 = %d, want only UDP prior %d", pending.scoreT3, det.cfg.UdpPriorScoreQ4)
+	}
+}
+
+func TestRealtimeDetectorDropsIANADynamicRangeDefault(t *testing.T) {
+	det := newRealtimeDetector()
+	if got := det.ClassifyOpen(NewFlowMeta("udp", "example.com:50000")); got != TrafficBulk {
+		t.Fatalf("IANA dynamic UDP port class = %s, want bulk", got)
 	}
 }

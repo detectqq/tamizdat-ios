@@ -1,6 +1,7 @@
 package tamizdat
 
 import (
+	"container/heap"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -204,6 +205,7 @@ func TestReplayGuardConcurrency(t *testing.T) {
 		t.Fatalf("same-key race accepted %d calls, want exactly 1", accepted)
 	}
 }
+
 // TestReplayGuardEvictsAtCap verifies that the LRU eviction triggers when
 // the window exceeds the configured hard cap. Uses a manually-constructed
 // guard with a tiny capacity so we don't have to insert 65k keys.
@@ -218,5 +220,63 @@ func TestReplayGuardEvictsAtCap(t *testing.T) {
 	}
 	if got := g.size(); got > g.hardCap {
 		t.Fatalf("size %d > hardCap %d (LRU eviction did not run)", got, g.hardCap)
+	}
+}
+
+func TestReplayGuardMinHeapOrdersEntriesByInsertTime(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	var h replayMinHeap
+	heap.Push(&h, replayHeapEntry{insertTime: base.Add(30 * time.Second), key: replayTestKey(3)})
+	heap.Push(&h, replayHeapEntry{insertTime: base.Add(10 * time.Second), key: replayTestKey(1)})
+	heap.Push(&h, replayHeapEntry{insertTime: base.Add(20 * time.Second), key: replayTestKey(2)})
+
+	for _, want := range []byte{1, 2, 3} {
+		got := heap.Pop(&h).(replayHeapEntry)
+		if got.key != replayTestKey(want) {
+			t.Fatalf("heap pop key = %x, want seed %d", got.key, want)
+		}
+	}
+}
+
+func TestReplayGuardHeapEvictionSkipsStaleEntriesFromReap(t *testing.T) {
+	resetReplayExpvarsForTest()
+	base := time.Unix(1700000000, 0)
+	now := base
+	g := newReplayGuard(time.Second)
+	g.hardCap = 3
+	g.now = func() time.Time { return now }
+
+	stale := replayTestKey(0)
+	g.Insert(stale, base)
+	now = base.Add(2 * time.Second)
+	if g.Seen(stale) {
+		t.Fatal("stale key should have been reaped from the map")
+	}
+
+	g.window = time.Hour
+	live := []struct {
+		seed byte
+		t    time.Time
+	}{
+		{1, now.Add(1 * time.Second)},
+		{2, now.Add(2 * time.Second)},
+		{3, now.Add(3 * time.Second)},
+		{4, now.Add(4 * time.Second)},
+	}
+	for _, entry := range live {
+		g.Insert(replayTestKey(entry.seed), entry.t)
+	}
+	now = now.Add(5 * time.Second)
+
+	if g.Seen(replayTestKey(1)) {
+		t.Fatal("oldest live key remained after hard-cap eviction")
+	}
+	for _, seed := range []byte{2, 3, 4} {
+		if !g.Seen(replayTestKey(seed)) {
+			t.Fatalf("live key with seed %d missing after heap eviction", seed)
+		}
+	}
+	if got := g.size(); got != g.hardCap {
+		t.Fatalf("window size = %d, want hardCap %d", got, g.hardCap)
 	}
 }

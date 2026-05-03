@@ -2,6 +2,7 @@ package tamizdat
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -19,10 +20,10 @@ import (
 // scanner stay under this; sustained attack is starved.
 
 const (
-	masqueradeRatePerMin    = 30
-	masqueradeBurstSize     = 10
-	masqueradeBucketTTL     = 5 * time.Minute
-	masqueradeReapInterval  = 60 * time.Second
+	masqueradeRatePerMin   = 30
+	masqueradeBurstSize    = 10
+	masqueradeBucketTTL    = 5 * time.Minute
+	masqueradeReapInterval = 60 * time.Second
 )
 
 type masqueradeRateLimiter struct {
@@ -95,14 +96,19 @@ func (rl *masqueradeRateLimiter) reaper() {
 		case <-rl.stop:
 			return
 		case <-t.C:
-			now := time.Now()
-			rl.mu.Lock()
-			for ip, b := range rl.buckets {
-				if now.Sub(b.lastRefil) > masqueradeBucketTTL && b.tokens >= b.capacity {
-					delete(rl.buckets, ip)
-				}
-			}
-			rl.mu.Unlock()
+			rl.reapExpiredBuckets(time.Now())
+		}
+	}
+}
+
+func (rl *masqueradeRateLimiter) reapExpiredBuckets(now time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for ip, b := range rl.buckets {
+		// If bucket has been idle longer than TTL, drop it. The previous
+		// tokens-based check was unreachable because reaper never recomputes refill.
+		if now.Sub(b.lastRefil) > masqueradeBucketTTL {
+			delete(rl.buckets, ip)
 		}
 	}
 }
@@ -111,8 +117,10 @@ func (rl *masqueradeRateLimiter) close() {
 	close(rl.stop)
 }
 
-// extractRemoteIP pulls the IP portion of a net.Addr.RemoteAddr() result.
-// Falls back to the full string if SplitHostPort fails.
+// extractRemoteIP pulls the IP portion of a net.Conn RemoteAddr() result.
+// Falls back to the full string if SplitHostPort fails. IPv6 addresses are
+// normalized to /64 prefixes so a single client allocation cannot create a fresh
+// rate-limit bucket per 128-bit address; IPv4 remains per-host.
 func extractRemoteIP(c net.Conn) string {
 	if c == nil {
 		return ""
@@ -123,7 +131,16 @@ func extractRemoteIP(c net.Conn) string {
 	}
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return addr.String()
+		host = addr.String()
 	}
-	return host
+	parsed, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	if parsed.Is6() && !parsed.Is4In6() {
+		if pfx, perr := parsed.Prefix(64); perr == nil {
+			return pfx.Masked().String()
+		}
+	}
+	return parsed.String()
 }
