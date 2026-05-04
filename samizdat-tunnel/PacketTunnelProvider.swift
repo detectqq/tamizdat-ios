@@ -400,7 +400,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // Field names must stay in sync with TamizdatStatusSnapshot
             // in TamizdatStatusStore.swift.
             let payload: [String: Any] = [
-                "realShape":   SocksstubRealShapeMode() ?? "",
+                "realShape":   SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
                 "liteAlive":   Int(SocksstubLiteAlive()),
                 "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),

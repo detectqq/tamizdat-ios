@@ -60,6 +60,10 @@ final class TamizdatStatusStore: ObservableObject {
     /// have headroom.
     static let pollInterval: TimeInterval = 0.5
 
+    /// Convenience pass-through so callers can write
+    /// `lampStore.realShape.isEmpty` without reaching into snapshot.
+    var realShape: String { snapshot.realShape }
+
     /// True when realtime-shape is active on the wire. Variant-
     /// agnostic; matches the Win-GUI single-OR rule.
     var isLit: Bool {
