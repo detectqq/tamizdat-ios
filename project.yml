@@ -87,6 +87,13 @@ targets:
       # transport rotation + cover-traffic + fragmentation, which
       # otherwise make real-time games stutter).
       - path: samizdat-ios/PerformancePreferences.swift
+      # IPA-X: PoolVariantPreferences shared so the SocksStub can
+      # read the V1/V2/V3 picker value at startTunnel and on
+      # refreshSamizdatClient (live UI flip). Same pattern as
+      # PerformancePreferences — App Group UserDefaults entry that
+      # gets converted into a SocksstubSetPoolVariant call before
+      # SocksstubSetSamizdatConfig builds the next ClientConfig.
+      - path: samizdat-ios/PoolVariantPreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

@@ -12,6 +12,8 @@ struct SettingsView: View {
 
     @State private var gameOptimized: Bool = PerformancePreferences.gameOptimized
 
+    @State private var poolVariant: PoolVariant = PoolVariantPreferences.current
+
     @State private var showConfig = false
     @State private var showTelegram = false
 
@@ -96,6 +98,37 @@ struct SettingsView: View {
                     Text("Performance")
                 } footer: {
                     Text("Turn ON for: Roblox / online games, YouTube streaming, WhatsApp voice & video calls, FaceTime, large downloads. The single TLS+H2 transport stays up for the whole session — no mid-session rotation handshakes that cause stutter. Trade-off: weaker DPI camouflage. Default OFF — keep on only while needed.")
+                }
+
+                // ── Pool variant ─────────────────────────────────────────
+                Section {
+                    Picker(selection: $poolVariant) {
+                        ForEach(PoolVariant.allCases) { variant in
+                            Text(variant.displayName).tag(variant)
+                        }
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Pool variant")
+                                Text(poolVariant.caption)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "rectangle.connected.to.line.below")
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .onChange(of: poolVariant) { _, newValue in
+                        PoolVariantPreferences.current = newValue
+                        Task {
+                            await VPNProfileStore.shared.refreshSamizdatClient()
+                        }
+                    }
+                } header: {
+                    Text("Connection pool")
+                } footer: {
+                    Text("How many simultaneous TCP/443 connections the client opens to the server. V1 = one (stealth, slow), V2 = up to two (balanced), V3 = adaptive 2..4 (fastest, taller TLS fingerprint per ISP). V1 also engages strict-single-H2 mode. Plan B+ realtime auto-shape (voice / games stay on the lite transport) runs identically across all three.")
                 }
 
                 // ── Diagnostics ──────────────────────────────────────────
