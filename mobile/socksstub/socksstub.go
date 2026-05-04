@@ -90,6 +90,13 @@ type runtimeState struct {
 	// samizdat.NewClient call. Toggled by Swift via SocksstubSetGameMode
 	// before re-calling SocksstubSetSamizdatConfig with the same blob.
 	gameOptimized atomic.Bool
+	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
+	// on the next samizdat.NewClient call. Empty == "v1" (preserves
+	// IPA-G default). Toggled by Swift via SocksstubSetPoolVariant
+	// before re-calling SocksstubSetSamizdatConfig with the same blob.
+	// When variant is "v1" we also flip StrictSingleH2=true to match
+	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
+	poolVariant atomic.Value // string
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -288,6 +295,10 @@ func SetSamizdatConfig(blob string) error {
 		shortIDPool = append(shortIDPool, v)
 	}
 
+	// IPA-X: read the user-selected pool variant. Default "v1" preserves
+	// the IPA-G hardcoded behaviour. Variant choice maps directly to
+	// tamizdat's applyDefaults() switch over PoolVariant.
+	variant := currentPoolVariant()
 	clientCfg := samizdat.ClientConfig{
 		ServerAddr:  net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
 		ServerName:  cfg.SNI,
@@ -297,17 +308,23 @@ func SetSamizdatConfig(blob string) error {
 		// Audit fix (final IPA-F): cap concurrent H2 streams at 50.
 		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
-		// IPA-G: V1-full pool variant. applyDefaults() pins
-		// MinTransports=1 / MaxTransports=1 / RotationOverlapAllowance=1
-		// and leaves BytesPerTransportSoftCap=0 (no mid-session rotation).
-		// The library's realtime.Detector then auto-flips the bulk
-		// transport to "lite shape" when it sees UDP destined for the
-		// whitelisted ports (Roblox / AnyDesk / Discord voice / IANA
-		// dynamic 49152-65535) or matching jitter signatures —
-		// suspending cover traffic, skipping fragmentation, disabling
-		// jitter, enabling TCP_QUICKACK on Linux for the duration of
-		// the realtime flow, with 30-60s hysteresis on return.
-		PoolVariant: "v1",
+		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
+		// "v1" since IPA-G). applyDefaults() pins:
+		//   v1: MinTransports=1, MaxTransports=1, RotationOverlapAllowance=1
+		//   v2: MinTransports=1, MaxTransports=2
+		//   v3: MinTransports=2, MaxTransports=4 (Opus pool sizing)
+		// In all variants the library's realtime.Detector (Plan B+ since
+		// commit 1a5868b) auto-flips the bulk transport to "lite shape"
+		// when it sees UDP destined for the whitelisted ports (Roblox /
+		// AnyDesk / Discord voice / IANA dynamic 49152-65535) or matching
+		// jitter signatures — suspending cover traffic, skipping
+		// fragmentation, disabling jitter, with 30-60s hysteresis.
+		PoolVariant: variant,
+		// IPA-X: V1 also engages StrictSingleH2 (mirrors Windows-GUI
+		// radio "V1" === --pool-variant=v1 --strict-single-h2). Strict
+		// mode locks the pool to exactly 1 TCP/443 forever, no overlap,
+		// no rotation — even tighter than vanilla v1.
+		StrictSingleH2: variant == "v1",
 		// IPA-T: Game-optimized mode flips DisableDefaultSecurity on
 		// tamizdat's ClientConfig. With V1 already pinning the single
 		// transport, this toggle now mostly disables the remaining
@@ -317,9 +334,7 @@ func SetSamizdatConfig(blob string) error {
 		// Off by default; flipped via Settings -> Performance mode.
 		DisableDefaultSecurity: rt.gameOptimized.Load(),
 	}
-	if rt.gameOptimized.Load() {
-		rt.appendLog("info: client built with DisableDefaultSecurity=true (game-optimized mode)")
-	}
+	rt.appendLog(fmt.Sprintf("info: client built with PoolVariant=%s StrictSingleH2=%v DisableDefaultSecurity=%v", variant, clientCfg.StrictSingleH2, clientCfg.DisableDefaultSecurity))
 	// IPA-M: opt-in SNI rotation pool when the URL carried snipool=…
 	// (legacy ServerNames field still present in tamizdat ClientConfig).
 	if len(cfg.SNIPool) > 1 {
@@ -534,6 +549,37 @@ func SetGameOptimizedMode(enabled bool) {
 	} else {
 		rt.appendLog("info: game-optimized mode = OFF (default tamizdat security applied)")
 	}
+}
+
+// SetPoolVariant selects the tamizdat connection-pool strategy on the
+// next samizdat.NewClient call. Accepted values: "v1", "v2", "v3"
+// (case-insensitive); anything else is normalised to "v1". As with
+// SetGameOptimizedMode, caller must follow up with SetSamizdatConfig
+// to actually rebuild the transport. Exported for gomobile bind
+// (becomes SocksstubSetPoolVariant on the Swift side).
+//
+// V1 additionally engages StrictSingleH2 mode (single TCP/443 forever,
+// no rotation, no overlap) to mirror the Windows-GUI radio behaviour
+// where "V1" === --pool-variant=v1 + --strict-single-h2.
+func SetPoolVariant(variant string) {
+	v := strings.ToLower(strings.TrimSpace(variant))
+	switch v {
+	case "v1", "v2", "v3":
+		// accepted
+	default:
+		v = "v1"
+	}
+	rt.poolVariant.Store(v)
+	rt.appendLog(fmt.Sprintf("info: pool variant = %s (next client build will use this)", v))
+}
+
+// currentPoolVariant returns the stored value or "v1" if unset.
+func currentPoolVariant() string {
+	v, _ := rt.poolVariant.Load().(string)
+	if v == "" {
+		return "v1"
+	}
+	return v
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.
