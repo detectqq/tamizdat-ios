@@ -21,6 +21,10 @@ const SamizdatProtocolHeader = "Samizdat-Protocol"
 // SamizdatProtocolUDP is the value used for UDP-over-CONNECT.
 const SamizdatProtocolUDP = "udp/1"
 
+// SamizdatForceClassHeader lets a reconnect forced by Plan B+ migration skip
+// server-side default UDP promotion and open directly as bulk.
+const SamizdatForceClassHeader = "Samizdat-Force-Class"
+
 // udpFramedPacketConn implements net.PacketConn over a length-prefixed
 // bidirectional stream (H2 stream body + ResponseWriter, or a server-side
 // equivalent). All datagrams travel as `uint16 BE length || payload`.

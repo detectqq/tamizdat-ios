@@ -1,0 +1,51 @@
+{
+  "flows": [
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "44993",
+      "s2c_bytes": 1450,
+      "server_ip": "127.0.0.1",
+      "server_port": "34674"
+    },
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "44993",
+      "s2c_bytes": 1388,
+      "server_ip": "127.0.0.1",
+      "server_port": "34684"
+    },
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "44993",
+      "s2c_bytes": 1388,
+      "server_ip": "127.0.0.1",
+      "server_port": "34686"
+    },
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "34674",
+      "s2c_bytes": 1379,
+      "server_ip": "127.0.0.1",
+      "server_port": "44993"
+    },
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "34684",
+      "s2c_bytes": 1378,
+      "server_ip": "127.0.0.1",
+      "server_port": "44993"
+    },
+    {
+      "client_ip": "127.0.0.1",
+      "client_port": "34686",
+      "s2c_bytes": 1439,
+      "server_ip": "127.0.0.1",
+      "server_port": "44993"
+    }
+  ],
+  "max_s2c": 1450,
+  "max_s2c_allowed": 12288,
+  "ok": true,
+  "rows": 82,
+  "violations": []
+}

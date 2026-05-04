@@ -2,6 +2,7 @@ package tamizdat
 
 import (
 	"encoding/binary"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -147,6 +148,22 @@ type RealtimeDetectorConfig struct {
 	// LegacyPortPromote preserves v1 ClassifyOpen behavior for known ports,
 	// app hints, protocol strings, and realtime-looking initial payloads.
 	LegacyPortPromote bool
+
+	// Plan B Hybrid knobs. Bool false and zero durations/rates are meaningful
+	// operator opt-outs, so fillRealtimeDefaults intentionally does not
+	// overwrite them; newRealtimeDetector() uses defaultRealtimeDetectorConfig()
+	// to provide the production defaults from the spec.
+	PlanBDefaultPromoteUDP  bool
+	PlanBRateCapWindow      time.Duration
+	PlanBRateCapBytesPerSec int64
+
+	// Plan B+ migration knobs. MigrationEnabled defaults true only in
+	// defaultRealtimeDetectorConfig(); explicit false disables migration for
+	// tests/operators constructing configs directly.
+	MigrationEnabled             bool
+	MigrationDebounceWindow      time.Duration
+	MigrationWindowByteThreshold uint32
+	MigrationCumulativeFloor     uint64
 }
 
 type Direction uint8
@@ -165,6 +182,21 @@ type ObservedPacket struct {
 	Direction Direction
 }
 
+// PlanBStats is a lock-free snapshot of Plan B-specific decisions.
+type PlanBStats struct {
+	Promotes uint64
+	Demotes  uint64
+	Lockins  uint64
+
+	MigrationFires            uint64
+	MigrationSkippedFloor     uint64
+	MigrationSkippedNoHandle  uint64
+	MigrationSkippedV1        uint64
+	MigrationFailedNoBulk     uint64
+	MigrationFailedForceClose uint64
+	MigrationDurationNanos    uint64
+}
+
 const (
 	q8Scale = 256
 
@@ -180,6 +212,7 @@ const (
 	flagT3Set        uint8 = 1 << 1
 	flagTCP          uint8 = 1 << 2
 	flagIdleReleased uint8 = 1 << 3
+	flagLiteLocked   uint8 = 1 << 4
 )
 
 const (
@@ -224,12 +257,19 @@ type flowState struct {
 	confirmedNS int64
 	lastInterNS int64
 
-	pkts      uint16
-	pktsIn    uint16
-	pktsOut   uint16
-	_ctrPad   uint16
-	bytesUp   uint32
-	bytesDown uint32
+	planBWindowStartNS int64
+
+	pkts             uint16
+	pktsIn           uint16
+	pktsOut          uint16
+	_ctrPad          uint16
+	bytesUp          uint32
+	bytesDown        uint32
+	planBWindowBytes uint32
+	windowByteSum    uint32
+
+	windowStartNS int64
+	totalBytes    uint64
 
 	iatRing  [16]uint16
 	sizeRing [16]uint16
@@ -255,7 +295,8 @@ type flowState struct {
 	proto   uint8
 
 	lowScorePkts uint8
-	_pad         [2]byte
+	migrating    bool
+	migrated     bool
 }
 
 type endpointInfo struct {
@@ -270,10 +311,42 @@ type pendingOpen struct {
 	created  time.Time
 }
 
+const forceBulkCacheTTL = 5 * time.Minute
+
+type forceBulkEntry struct {
+	untilNS int64
+}
+
+type migrationHandle struct {
+	fastCloseFn           func() error
+	ensureBulkFn          func() error
+	dstAddr               string
+	originalTransportLite bool
+}
+
+type migrationRequest struct {
+	flowID      uint64
+	dstAddr     string
+	windowBytes uint32
+	totalBytes  uint64
+}
+
 type RealtimeDetector struct {
 	ports    map[int]struct{}
 	appHints []string
 	cfg      RealtimeDetectorConfig
+
+	planBPromotes atomic.Uint64
+	planBDemotes  atomic.Uint64
+	planBLockins  atomic.Uint64
+
+	migrationFires            atomic.Uint64
+	migrationSkippedFloor     atomic.Uint64
+	migrationSkippedNoHandle  atomic.Uint64
+	migrationSkippedV1        atomic.Uint64
+	migrationFailedNoBulk     atomic.Uint64
+	migrationFailedForceClose atomic.Uint64
+	migrationDurationNanos    atomic.Uint64
 
 	promoteQ8 int16
 	demoteQ8  int16
@@ -292,6 +365,9 @@ type RealtimeDetector struct {
 	endpointByPref map[uint32]int64
 	controller     *RealtimeController
 	cleanupStarted sync.Once
+
+	forceBulkCache    sync.Map // string(canonical dst) -> forceBulkEntry
+	migrationDispatch sync.Map // uint64(flowID) -> *migrationHandle
 }
 
 func newRealtimeDetector() *RealtimeDetector {
@@ -313,43 +389,50 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 			"viber", "obs", "streamlabs", "mumble", "teamspeak",
 			"vmware-view", "rdp", "mstsc", "parsec", "steam",
 		},
-		SmoothnessSamples:       5,
-		SmoothnessWindows:       2,
-		SmoothnessMaxJitterFrac: 0.55,
-		SmoothnessMinInterval:   5 * time.Millisecond,
-		SmoothnessMaxInterval:   80 * time.Millisecond,
-		PromoteScore:            0.55,
-		DemoteScore:             0.25,
-		WatchScore:              0.30,
-		MinPromoteAge:           200 * time.Millisecond,
-		SilentDemoteAge:         1500 * time.Millisecond,
-		BulkConfirmAge:          5 * time.Second,
-		IdleReleaseAge:          30 * time.Second,
-		EndpointCacheTTL:        60 * time.Second,
-		JitterAlphaInv:          16,
-		StunScoreQ8:             115,
-		TurnChannelDataScoreQ8:  102,
-		DtlsHandshakeScoreQ8:    102,
-		DtlsAppDataScoreQ8:      64,
-		RtpCandidateScoreQ8:     38,
-		RtpConfirmedScoreQ8:     102,
-		RtcpScoreQ8:             77,
-		QuicLongHeaderScoreQ8:   -51,
-		TlsLargeAppDataScoreQ8:  -77,
-		SmoothWindowScoreQ8:     64,
-		OpusBonusScoreQ8:        38,
-		SmallPktScoreQ8:         26,
-		MtuBulkScoreQ8:          -77,
-		DirSymmetryScoreQ8:      26,
-		DirAsymmetryScoreQ8:     -51,
-		CadenceBreakScoreQ8:     -26,
-		AppHintScoreQ4:          5,
-		KnownPortScoreQ4:        2,
-		EndpointCacheHitScoreQ4: 2,
-		UdpPriorScoreQ4:         1,
-		TcpBulkPortScoreQ4:      -2,
-		MaxConcurrentFlows:      100_000,
-		LegacyPortPromote:       true,
+		SmoothnessSamples:            5,
+		SmoothnessWindows:            2,
+		SmoothnessMaxJitterFrac:      0.55,
+		SmoothnessMinInterval:        5 * time.Millisecond,
+		SmoothnessMaxInterval:        80 * time.Millisecond,
+		PromoteScore:                 0.55,
+		DemoteScore:                  0.25,
+		WatchScore:                   0.30,
+		MinPromoteAge:                200 * time.Millisecond,
+		SilentDemoteAge:              1500 * time.Millisecond,
+		BulkConfirmAge:               5 * time.Second,
+		IdleReleaseAge:               30 * time.Second,
+		EndpointCacheTTL:             60 * time.Second,
+		JitterAlphaInv:               16,
+		StunScoreQ8:                  115,
+		TurnChannelDataScoreQ8:       102,
+		DtlsHandshakeScoreQ8:         102,
+		DtlsAppDataScoreQ8:           64,
+		RtpCandidateScoreQ8:          38,
+		RtpConfirmedScoreQ8:          102,
+		RtcpScoreQ8:                  77,
+		QuicLongHeaderScoreQ8:        -51,
+		TlsLargeAppDataScoreQ8:       -77,
+		SmoothWindowScoreQ8:          64,
+		OpusBonusScoreQ8:             38,
+		SmallPktScoreQ8:              26,
+		MtuBulkScoreQ8:               -77,
+		DirSymmetryScoreQ8:           26,
+		DirAsymmetryScoreQ8:          -51,
+		CadenceBreakScoreQ8:          -26,
+		AppHintScoreQ4:               5,
+		KnownPortScoreQ4:             2,
+		EndpointCacheHitScoreQ4:      2,
+		UdpPriorScoreQ4:              1,
+		TcpBulkPortScoreQ4:           -2,
+		MaxConcurrentFlows:           100_000,
+		LegacyPortPromote:            true,
+		PlanBDefaultPromoteUDP:       true,
+		PlanBRateCapWindow:           500 * time.Millisecond,
+		PlanBRateCapBytesPerSec:      256 * 1024, // TODO calibrate under BBR.
+		MigrationEnabled:             true,
+		MigrationDebounceWindow:      1500 * time.Millisecond,
+		MigrationWindowByteThreshold: 384 * 1024,
+		MigrationCumulativeFloor:     10 * 1024 * 1024,
 	}
 }
 
@@ -509,6 +592,9 @@ func fillRealtimeDefaults(cfg RealtimeDetectorConfig) RealtimeDetectorConfig {
 	if !cfg.LegacyPortPromote {
 		cfg.LegacyPortPromote = def.LegacyPortPromote
 	}
+	// Plan B defaults are applied only by defaultRealtimeDetectorConfig(). The
+	// spec simultaneously requires default-on promotion and 0/false as disable
+	// values; preserving explicit opt-outs here is the least surprising choice.
 	return cfg
 }
 
@@ -545,8 +631,26 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 	}
 	meta = normalizeFlowMeta(meta)
 	now := time.Now()
+	if d.forceBulkClassify(meta, now) {
+		return TrafficBulk
+	}
 	st := newFlowStateForMeta(meta, now)
 	endpoint := endpointFromMeta(meta)
+	if d.planBDefaultPromoteOpen(meta) {
+		// Ambiguity resolved: Plan B's open-time promotion is recorded as
+		// CONFIRMED_RT, not merely PROVISIONAL_RT, so controller.Open(class)
+		// binds a flow whose first Observe already returns TrafficRealtime.
+		nowNS := now.UnixNano()
+		st.state = flowStateConfirmedRT
+		st.confirmedNS = nowNS
+		st.lastInterNS = nowNS
+		d.planBPromotes.Add(1)
+		d.mu.Lock()
+		d.enqueuePendingLocked(pendingOpen{st: st, endpoint: endpoint, created: now})
+		d.rememberEndpointLocked(endpoint, now)
+		d.mu.Unlock()
+		return TrafficRealtime
+	}
 	knownPort := d.hasRealtimePort(meta.Port)
 	appHint := d.appHintMatch(meta.AppHint)
 
@@ -575,6 +679,64 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 	}
 	d.mu.Unlock()
 	return class
+}
+
+func (d *RealtimeDetector) planBDefaultPromoteOpen(meta FlowMeta) bool {
+	return d.cfg.PlanBDefaultPromoteUDP && meta.Network == "udp" && meta.Port != 53 && meta.Port != 853
+}
+
+func (d *RealtimeDetector) forceBulkClassify(meta FlowMeta, now time.Time) bool {
+	if d == nil {
+		return false
+	}
+	key := forceBulkCacheKey(meta)
+	if key == "" {
+		return false
+	}
+	v, ok := d.forceBulkCache.Load(key)
+	if !ok {
+		return false
+	}
+	e, ok := v.(forceBulkEntry)
+	if !ok {
+		d.forceBulkCache.Delete(key)
+		return false
+	}
+	if now.UnixNano() < e.untilNS {
+		return true
+	}
+	d.forceBulkCache.Delete(key)
+	return false
+}
+
+func forceBulkCacheKey(meta FlowMeta) string {
+	meta = normalizeFlowMeta(meta)
+	if meta.Host != "" && meta.Port > 0 {
+		return net.JoinHostPort(meta.Host, strconv.Itoa(meta.Port))
+	}
+	return strings.ToLower(strings.TrimSpace(meta.Address))
+}
+
+func forceBulkCacheKeyFromAddress(address string) string {
+	return forceBulkCacheKey(NewFlowMeta("udp", address))
+}
+
+func (d *RealtimeDetector) PlanBStats() PlanBStats {
+	if d == nil {
+		return PlanBStats{}
+	}
+	return PlanBStats{
+		Promotes:                  d.planBPromotes.Load(),
+		Demotes:                   d.planBDemotes.Load(),
+		Lockins:                   d.planBLockins.Load(),
+		MigrationFires:            d.migrationFires.Load(),
+		MigrationSkippedFloor:     d.migrationSkippedFloor.Load(),
+		MigrationSkippedNoHandle:  d.migrationSkippedNoHandle.Load(),
+		MigrationSkippedV1:        d.migrationSkippedV1.Load(),
+		MigrationFailedNoBulk:     d.migrationFailedNoBulk.Load(),
+		MigrationFailedForceClose: d.migrationFailedForceClose.Load(),
+		MigrationDurationNanos:    d.migrationDurationNanos.Load(),
+	}
 }
 
 func newFlowStateForMeta(meta FlowMeta, now time.Time) flowState {
@@ -620,9 +782,13 @@ func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	if st.lastInterNS == 0 {
 		st.lastInterNS = nowNS
 	}
+	migrationReq := d.accountMigrationBytesLocked(p.FlowID, st, p, nowNS)
 	if st.state == flowStateConfirmedBulk {
 		st.lastSeenNS = nowNS
 		d.mu.Unlock()
+		if migrationReq != nil {
+			go d.runMigration(migrationReq)
+		}
 		return TrafficBulk
 	}
 	if st.lastSeenNS == 0 && nowNS < st.openTimeNS {
@@ -639,6 +805,7 @@ func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	if wasReleased {
 		st.flags &^= flagIdleReleased
 	}
+	wasConfirmedRT := st.state == flowStateConfirmedRT
 	before := st.totalScoreQ8()
 	d.observePacketLocked(st, p)
 	after := st.totalScoreQ8()
@@ -655,7 +822,15 @@ func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	if st.state == flowStateConfirmedRT {
 		class = TrafficRealtime
 	}
+	releaseActive := wasConfirmedRT && st.state != flowStateConfirmedRT
+	controller := d.controller
 	d.mu.Unlock()
+	if migrationReq != nil {
+		go d.runMigration(migrationReq)
+	}
+	if releaseActive && controller != nil {
+		controller.ReleaseActive(p.FlowID)
+	}
 	return class
 }
 
@@ -688,6 +863,10 @@ func (d *RealtimeDetector) observePacketLocked(st *flowState, p ObservedPacket) 
 		// Unknown direction is intentionally excluded from asymmetry scoring.
 	}
 
+	if !st.isTCP() {
+		d.applyPlanBPacketControlsLocked(st, p.Payload, p.Size, nowNS)
+	}
+
 	if !(st.isTCP() && st.pkts > 1) {
 		d.applyTier1(st, p.Payload, p.Direction)
 	}
@@ -709,6 +888,128 @@ func (d *RealtimeDetector) observePacketLocked(st *flowState, p ObservedPacket) 
 	st.lastSeenNS = nowNS
 }
 
+func (d *RealtimeDetector) applyPlanBRTPStickyLockLocked(st *flowState, payload []byte) {
+	if st == nil {
+		return
+	}
+	if len(payload) > 0 && payload[0]&0xc0 == 0x80 {
+		if st.flags&flagLiteLocked == 0 {
+			st.flags |= flagLiteLocked
+			d.planBLockins.Add(1)
+		}
+	}
+}
+
+func (d *RealtimeDetector) accountMigrationBytesLocked(flowID uint64, st *flowState, p ObservedPacket, nowNS int64) *migrationRequest {
+	if d == nil || st == nil || st.isTCP() || flowID == 0 {
+		return nil
+	}
+	d.applyPlanBRTPStickyLockLocked(st, p.Payload)
+	size := p.Size
+	if size < 0 {
+		size = 0
+	}
+	size32 := uint32FromNonNegativeInt(size)
+	st.totalBytes += uint64(size32)
+	window := d.cfg.MigrationDebounceWindow
+	threshold := d.cfg.MigrationWindowByteThreshold
+	if window <= 0 || threshold == 0 {
+		return nil
+	}
+	if st.windowStartNS == 0 || nowNS < st.windowStartNS || time.Duration(nowNS-st.windowStartNS) > window {
+		st.windowStartNS = nowNS
+		st.windowByteSum = size32
+	} else {
+		st.windowByteSum = satAddUint32(st.windowByteSum, size32)
+	}
+	if st.windowByteSum < threshold {
+		return nil
+	}
+	windowBytes := st.windowByteSum
+	totalBytes := st.totalBytes
+	dst := ""
+	if !d.cfg.MigrationEnabled {
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_disabled")
+		return nil
+	}
+	if st.flags&flagLiteLocked != 0 {
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_rtp_locked")
+		return nil
+	}
+	if st.migrated || st.migrating {
+		return nil
+	}
+	v, ok := d.migrationDispatch.Load(flowID)
+	if !ok {
+		d.migrationSkippedNoHandle.Add(1)
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_no_handle")
+		return nil
+	}
+	h, ok := v.(*migrationHandle)
+	if !ok || h == nil {
+		d.migrationSkippedNoHandle.Add(1)
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_no_handle")
+		return nil
+	}
+	dst = h.dstAddr
+	if !h.originalTransportLite {
+		d.migrationSkippedV1.Add(1)
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_v1_single_transport")
+		return nil
+	}
+	if totalBytes < d.cfg.MigrationCumulativeFloor {
+		d.migrationSkippedFloor.Add(1)
+		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_below_floor")
+		return nil
+	}
+	st.migrating = true
+	return &migrationRequest{flowID: flowID, dstAddr: dst, windowBytes: windowBytes, totalBytes: totalBytes}
+}
+
+func (d *RealtimeDetector) applyPlanBPacketControlsLocked(st *flowState, payload []byte, size int, nowNS int64) {
+	if st == nil || st.isTCP() {
+		return
+	}
+	// ORDER MATTERS per spec: a single RTP/RTCP version byte locks the flow
+	// before the same packet can be evaluated by the anti-bulk rate cap.
+	d.applyPlanBRTPStickyLockLocked(st, payload)
+	if st.flags&flagLiteLocked != 0 {
+		return
+	}
+	if st.state != flowStateProvisionalRT && st.state != flowStateConfirmedRT {
+		return
+	}
+	window := d.cfg.PlanBRateCapWindow
+	bytesPerSec := d.cfg.PlanBRateCapBytesPerSec
+	if window <= 0 || bytesPerSec <= 0 {
+		return
+	}
+	if size < 0 {
+		size = 0
+	}
+	if st.planBWindowStartNS == 0 || nowNS < st.planBWindowStartNS || time.Duration(nowNS-st.planBWindowStartNS) > window {
+		st.planBWindowStartNS = nowNS
+		st.planBWindowBytes = uint32FromNonNegativeInt(size)
+	} else {
+		st.planBWindowBytes = satAddUint32(st.planBWindowBytes, uint32FromNonNegativeInt(size))
+	}
+	limit := uint64(bytesPerSec) * uint64(window) / uint64(time.Second)
+	if uint64(st.planBWindowBytes) > limit {
+		st.state = flowStateConfirmedBulk
+		d.planBDemotes.Add(1)
+	}
+}
+
+func uint32FromNonNegativeInt(v int) uint32 {
+	if v <= 0 {
+		return 0
+	}
+	if uint64(v) > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(v)
+}
+
 func (st *flowState) isTCP() bool {
 	return st.proto == protoTCP || st.flags&flagTCP != 0
 }
@@ -718,6 +1019,102 @@ func satAddUint32(a, b uint32) uint32 {
 		return ^uint32(0)
 	}
 	return a + b
+}
+
+func (d *RealtimeDetector) registerMigrationHandle(flowID uint64, h *migrationHandle) {
+	if d == nil || flowID == 0 || h == nil {
+		return
+	}
+	d.migrationDispatch.Store(flowID, h)
+}
+
+func (d *RealtimeDetector) deregisterMigrationHandle(flowID uint64) {
+	if d == nil || flowID == 0 {
+		return
+	}
+	d.migrationDispatch.Delete(flowID)
+}
+
+func (d *RealtimeDetector) runMigration(req *migrationRequest) {
+	if d == nil || req == nil || req.flowID == 0 {
+		return
+	}
+	started := time.Now()
+	finish := func(outcome string, migrated bool) {
+		duration := time.Since(started)
+		d.finishMigrationState(req.flowID, migrated)
+		if migrated {
+			d.migrationDurationNanos.Add(uint64(duration.Nanoseconds()))
+			d.migrationFires.Add(1)
+		}
+		d.logMigrationAttempt(req.flowID, req.dstAddr, req.windowBytes, req.totalBytes, duration, outcome)
+	}
+
+	v, ok := d.migrationDispatch.Load(req.flowID)
+	if !ok {
+		d.migrationSkippedNoHandle.Add(1)
+		finish("skipped_no_handle", false)
+		return
+	}
+	h, ok := v.(*migrationHandle)
+	if !ok || h == nil {
+		d.migrationSkippedNoHandle.Add(1)
+		finish("skipped_no_handle", false)
+		return
+	}
+	if req.dstAddr == "" {
+		req.dstAddr = h.dstAddr
+	}
+	if !h.originalTransportLite {
+		d.migrationSkippedV1.Add(1)
+		finish("skipped_v1_single_transport", false)
+		return
+	}
+	if h.ensureBulkFn != nil {
+		if err := h.ensureBulkFn(); err != nil {
+			d.migrationFailedNoBulk.Add(1)
+			finish("error_no_bulk", false)
+			return
+		}
+	}
+	key := forceBulkCacheKeyFromAddress(h.dstAddr)
+	if key != "" {
+		d.forceBulkCache.Store(key, forceBulkEntry{untilNS: time.Now().Add(forceBulkCacheTTL).UnixNano()})
+	}
+	if h.fastCloseFn == nil {
+		d.migrationFailedForceClose.Add(1)
+		finish("error_force_close", false)
+		return
+	}
+	if err := h.fastCloseFn(); err != nil {
+		d.migrationFailedForceClose.Add(1)
+		finish("error_force_close", false)
+		return
+	}
+	if d.controller != nil {
+		d.controller.ReleaseActive(req.flowID)
+	}
+	finish("migrated", true)
+}
+
+func (d *RealtimeDetector) finishMigrationState(flowID uint64, migrated bool) {
+	if d == nil || flowID == 0 {
+		return
+	}
+	d.mu.Lock()
+	if st := d.flows[flowID]; st != nil {
+		st.migrating = false
+		if migrated {
+			st.migrated = true
+			st.state = flowStateConfirmedBulk
+		}
+	}
+	d.mu.Unlock()
+}
+
+func (d *RealtimeDetector) logMigrationAttempt(flowID uint64, dst string, windowBytes uint32, totalBytes uint64, duration time.Duration, outcome string) {
+	log.Printf("[tamizdat] migration: flowID=%d dst=%s window_bytes=%d total_bytes=%d duration_ms=%d outcome=%s",
+		flowID, dst, windowBytes, totalBytes, duration.Milliseconds(), outcome)
 }
 
 func durationTo100us(d time.Duration) uint16 {
@@ -1041,7 +1438,7 @@ func (d *RealtimeDetector) transitionState(st *flowState, now time.Time) bool {
 			st.lowScorePkts = 0
 		}
 	case flowStateConfirmedRT:
-		if score <= d.demoteQ8 && age >= 30*time.Second {
+		if st.flags&flagLiteLocked == 0 && score <= d.demoteQ8 && age >= 30*time.Second {
 			st.state = flowStateProvisionalBulk
 			st.lowScorePkts = 0
 		}
@@ -1246,6 +1643,7 @@ func (d *RealtimeDetector) Forget(flowID uint64) {
 	delete(d.flows, flowID)
 	delete(d.flowEndpoints, flowID)
 	d.mu.Unlock()
+	d.deregisterMigrationHandle(flowID)
 }
 
 func (d *RealtimeDetector) Score(flowID uint64) float64 {
@@ -1446,7 +1844,7 @@ type RealtimeController struct {
 }
 
 func newRealtimeController() *RealtimeController {
-	return newRealtimeControllerWithConfig(newRealtimeDetector(), 30*time.Second, 60*time.Second)
+	return newRealtimeControllerWithConfig(newRealtimeDetector(), 15*time.Second, 30*time.Second)
 }
 
 func newRealtimeControllerWithConfig(detector *RealtimeDetector, hysteresisMin, hysteresisMax time.Duration) *RealtimeController {
@@ -1454,7 +1852,7 @@ func newRealtimeControllerWithConfig(detector *RealtimeDetector, hysteresisMin, 
 		detector = newRealtimeDetector()
 	}
 	if hysteresisMin <= 0 {
-		hysteresisMin = 30 * time.Second
+		hysteresisMin = 15 * time.Second
 	}
 	if hysteresisMax < hysteresisMin {
 		hysteresisMax = hysteresisMin
@@ -1710,6 +2108,14 @@ func (c *realtimeTrackedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error
 
 func (c *realtimeTrackedPacketConn) Close() error {
 	var err error
-	c.closeOnce.Do(func() { c.controller.Close(c.flowID); err = c.PacketConn.Close() })
+	c.closeOnce.Do(func() {
+		if c.controller != nil {
+			c.controller.Close(c.flowID)
+			if c.controller.Detector != nil {
+				c.controller.Detector.deregisterMigrationHandle(c.flowID)
+			}
+		}
+		err = c.PacketConn.Close()
+	})
 	return err
 }

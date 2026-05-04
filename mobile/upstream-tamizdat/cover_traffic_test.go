@@ -90,7 +90,7 @@ func (rt *coverClassRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 func TestPool_CoverNeverLandsOnLite(t *testing.T) {
 	const target = "mc.yandex.ru:443"
 	rt := &coverClassRoundTripper{target: target}
-	p := newConnPool(10, time.Hour, 1, 2, 0, -1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	p := newConnPool(10, time.Hour, 1, 2, 0, -1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		tr := &h2Transport{
 			maxStreams:   10,
 			serverAddr:   "tamizdat.test:443",

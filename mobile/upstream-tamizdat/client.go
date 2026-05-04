@@ -20,6 +20,77 @@ import (
 
 var setClientTCPQuickAck = setTCPQuickAck
 
+// pickServerNameExcluding returns a random SNI from the pool, biased away
+// from any SNI in `exclude`. Used to guarantee that a freshly-spawned lite
+// transport picks a different cover SNI than the active bulk transport so
+// the TSPU #546 counter (src_IP, SNI, JA3) for any single SNI stays at 1.
+//
+// If filtering yields an empty candidate set (pool exhausted by excludes),
+// falls back to the unfiltered weighted pick — the safety property is
+// best-effort, not absolute.
+func (c *Client) pickServerNameExcluding(exclude []string) string {
+	if len(exclude) == 0 {
+		return c.pickServerName()
+	}
+	excludeSet := make(map[string]struct{}, len(exclude))
+	for _, e := range exclude {
+		if e != "" {
+			excludeSet[e] = struct{}{}
+		}
+	}
+	if pushed := c.serverPushedSNIPool.Load(); pushed != nil && len(*pushed) > 0 {
+		primary := c.config.PrimarySNI
+		if primary == "" {
+			primary = c.config.ServerName
+		}
+		entries := []SNIEntry{}
+		if _, skip := excludeSet[primary]; !skip {
+			entries = append(entries, SNIEntry{SNI: primary, Weight: 100})
+		}
+		for _, e := range *pushed {
+			if e.SNI == "" {
+				continue
+			}
+			if _, skip := excludeSet[e.SNI]; skip {
+				continue
+			}
+			if len(entries) > 0 && entries[0].SNI == primary && e.SNI == primary {
+				if e.Weight > entries[0].Weight {
+					entries[0].Weight = e.Weight
+				}
+				continue
+			}
+			entries = append(entries, e)
+		}
+		if len(entries) > 0 {
+			if picked := pickWeightedSNI(entries); picked != "" {
+				return picked
+			}
+		}
+	}
+	pool := c.config.ServerNames
+	if len(pool) == 0 {
+		return c.pickServerName()
+	}
+	filtered := pool[:0:0]
+	for _, s := range pool {
+		if _, skip := excludeSet[s]; skip {
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	if len(filtered) == 0 {
+		return c.pickServerName()
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	var idx [8]byte
+	_, _ = rand.Read(idx[:])
+	i := int(binary.BigEndian.Uint64(idx[:])>>1) % len(filtered)
+	return filtered[i]
+}
+
 // pickServerName returns a randomly-chosen SNI from the configured pool.
 // Falls back to legacy single ServerName when no pool is configured.
 // Per-transport rotation breaks the "all clients of one IP share one SNI"
@@ -131,11 +202,21 @@ func NewClient(config ClientConfig) (*Client, error) {
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
 	c.fingerprintChooser = newFingerprintRotator(config.Fingerprint)
-	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.MaxTransports, config.BytesPerTransportSoftCap, config.RotationOverlapAllowance, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	// liteSpawnDelay default 3 sec — operator-supplied filter against short
+	// STUN probes (analyst #3 recommendation 2026-05-03). Disabled in strict
+	// mode (no lite spawn at all under strict).
+	liteSpawnDelay := 3 * time.Second
+	if config.StrictSingleH2 {
+		liteSpawnDelay = 0
+	}
+	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.MaxTransports, config.BytesPerTransportSoftCap, config.RotationOverlapAllowance, config.StrictSingleH2, liteSpawnDelay, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		return c.createTransport(ctx, class)
 	})
 	c.pool.setRealtimeController(c.realtime)
-	c.realtime.onLastRealtimeClose = c.pool.armLiteCloseHysteresis
+	c.realtime.onLastRealtimeClose = func() {
+		c.pool.armLiteCloseHysteresis()
+		c.pool.resetFirstRealtimeNanos()
+	}
 	if config.MaxTransports == 1 {
 		c.realtime.onRealtimeOpen = func() {
 			c.pool.cancelLiteCloseHysteresis()
@@ -248,11 +329,31 @@ func (c *Client) DialUDP(ctx context.Context, address string) (net.PacketConn, e
 		return nil, fmt.Errorf("getting transport: %w", err)
 	}
 
-	rwc, err := transport.openUDPTunnel(ctx, address)
+	rwc, err := transport.openUDPTunnel(ctx, address, class)
 	if err != nil {
 		transport.releaseStreamSlot()
 		closeRealtime()
 		return nil, fmt.Errorf("opening UDP tunnel to %s: %w", address, err)
+	}
+
+	if c.realtime != nil && c.realtime.Detector != nil && flowID != 0 {
+		if stream, ok := rwc.(*h2StreamRWC); ok {
+			c.realtime.Detector.registerMigrationHandle(flowID, &migrationHandle{
+				fastCloseFn:           stream.fastClose,
+				dstAddr:               address,
+				originalTransportLite: transport.class == TrafficRealtime,
+				ensureBulkFn: func() error {
+					bulkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					bulkTransport, err := c.pool.getTransportForClass(bulkCtx, TrafficBulk)
+					if err != nil {
+						return err
+					}
+					bulkTransport.releaseStreamSlot()
+					return nil
+				},
+			})
+		}
 	}
 
 	target := &streamAddr{network: "udp", address: address}
@@ -314,7 +415,15 @@ func (c *Client) createTransport(ctx context.Context, class TrafficClass) (*h2Tr
 		conn = fragmenter
 	}
 
-	sni := c.pickServerName()
+	var sni string
+	if class == TrafficRealtime {
+		// Lite transport: avoid the SNI(s) used by the bulk transport(s).
+		// Counter (src_IP, SNI, JA3) for any single SNI stays at 1 even
+		// under multi-transport (V1 default + lite, or V2/V3).
+		sni = c.pickServerNameExcluding(c.pool.activeSNIs())
+	} else {
+		sni = c.pickServerName()
+	}
 	tlsConfig := &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
@@ -397,7 +506,7 @@ func (c *Client) createTransport(ctx context.Context, class TrafficClass) (*h2Tr
 		fragmenter.ReportOutcome(true)
 	}
 
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout, class)
+	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout, class, sni)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)

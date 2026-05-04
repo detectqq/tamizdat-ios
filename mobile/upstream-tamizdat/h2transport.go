@@ -1,7 +1,6 @@
 package tamizdat
 
 import (
-	"strings"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +52,11 @@ type h2Transport struct {
 	// shapeMode controls per-stream shaping inherited from this transport.
 	shapeMode atomic.Int32
 	class     TrafficClass
+	// sni is the SNI presented by THIS transport's TLS handshake. Connpool
+	// reads it to feed pickServerNameExcluding() so a freshly-spawned lite
+	// transport gets a different SNI than the active bulk transport(s).
+	// Empty string = unknown / not tracked.
+	sni string
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
@@ -60,7 +65,9 @@ type h2Transport struct {
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration, class TrafficClass) (*h2Transport, error) {
+// sni is the SNI presented during the TLS handshake (used by connpool
+// excludeSNIs accounting); empty string allowed for back-compat callers.
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration, class TrafficClass, sni string) (*h2Transport, error) {
 	t := &h2Transport{
 		tlsConn:      tlsConn,
 		serverAddr:   serverAddr,
@@ -71,6 +78,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		fragmenter:   fragmenter,
 		drainTimeout: drainTimeout,
 		class:        class,
+		sni:          sni,
 	}
 	if class == TrafficRealtime {
 		t.shapeMode.Store(int32(ShapeLite))
@@ -145,7 +153,6 @@ func (t *h2Transport) addBytesSent(n int) {
 // TODO(pool-foundation): operator should recalibrate this multiplier from
 // live pcaps before treating BytesPerTransportSoftCap as an outer-wire budget.
 func estimatedOuterWireBytes(n int) int64 { return int64(n) * 6 }
-
 
 // appHintCtxKey is the context key used by client-side process attribution
 // to pass an "app hint" (process name) through DialContext into the H2
@@ -248,7 +255,7 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 // `destination`. The returned io.ReadWriteCloser carries length-prefixed UDP
 // datagrams (uint16 BE length || payload, see udp_packetconn.go MaxUDPDatagram).
 // Wrapped by Client.DialUDP into a net.PacketConn for callers.
-func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io.ReadWriteCloser, error) {
+func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string, class TrafficClass) (io.ReadWriteCloser, error) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -275,6 +282,9 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 	}
 	req.Host = destination
 	req.Header.Set(SamizdatProtocolHeader, SamizdatProtocolUDP)
+	if class == TrafficBulk {
+		req.Header.Set(SamizdatForceClassHeader, "bulk")
+	}
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
@@ -414,6 +424,24 @@ func (s *h2StreamRWC) Close() error {
 				_ = s.transport.close()
 			}
 		}()
+	})
+	return closeErr
+}
+
+func (s *h2StreamRWC) fastClose() error {
+	var closeErr error
+	s.once.Do(func() {
+		closeErr = s.closeWriter()
+		_ = s.reader.Close()
+		if s.tunnelCancel != nil {
+			s.tunnelCancel()
+		}
+		if s.transport != nil {
+			remaining := s.transport.activeStreams.Add(-1)
+			if remaining == 0 && s.transport.isDraining() {
+				_ = s.transport.close()
+			}
+		}
 	})
 	return closeErr
 }

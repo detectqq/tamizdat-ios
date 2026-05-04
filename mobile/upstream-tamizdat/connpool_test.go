@@ -10,7 +10,7 @@ import (
 
 func TestConnPoolMaxTransportsCap(t *testing.T) {
 	var created atomic.Int32
-	pool := newConnPool(1, time.Minute, 1, 2, 0, -1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	pool := newConnPool(1, time.Minute, 1, 2, 0, -1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		created.Add(1)
 		return &h2Transport{maxStreams: 1}, nil
 	})
@@ -33,7 +33,7 @@ func TestConnPoolMaxTransportsCap(t *testing.T) {
 
 func TestConnPoolTopUpRespectsMaxTransports(t *testing.T) {
 	var created atomic.Int32
-	pool := newConnPool(100, time.Minute, 3, 3, 0, -1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	pool := newConnPool(100, time.Minute, 3, 3, 0, -1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		created.Add(1)
 		return &h2Transport{maxStreams: 100}, nil
 	})

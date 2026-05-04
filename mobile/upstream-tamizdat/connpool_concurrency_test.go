@@ -44,7 +44,7 @@ func TestConnPool_TopUpDialsToMin(t *testing.T) {
 		return &h2Transport{maxStreams: 100}, nil
 	}
 
-	p := newConnPool(100, 5*time.Minute, 3, 3, 0, -1, create)
+	p := newConnPool(100, 5*time.Minute, 3, 3, 0, -1, false, 0, create)
 	// pool/transport stubs are intentionally bare; no close() to avoid nil-deref
 
 	// Manually trigger topUp (don't wait for the 5s ticker).

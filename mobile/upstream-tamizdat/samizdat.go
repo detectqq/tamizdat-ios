@@ -91,6 +91,19 @@ type ClientConfig struct {
 	// transports; pool reaper spawns a replacement. 0 = disabled.
 	BytesPerTransportSoftCap int64
 
+	// StrictSingleH2 enforces "one TCP/443 per user, always" mode. When true:
+	//   - MinTransports = MaxTransports = 1 (no lite transport ever spawned)
+	//   - BytesPerTransportSoftCap pinned to 0 (no rotation)
+	//   - RotationOverlapAllowance pinned to 0
+	//   - Realtime classifier still runs, but on promote it transport-wide
+	//     flips the bulk H2's shapeMode to Lite for ALL streams. On last
+	//     realtime close + hysteresis the bulk transport flips back to Full.
+	// Trade-off: HoL blocking on shared TCP (bulk packet loss stalls voice
+	// frames for ~RTO=200ms). Wins: max one entry in TSPU #546 counter
+	// (src_IP, cover-SNI, JA3) per user, regardless of activity type.
+	// Default false = current V1 behaviour (lite-transport spawned on demand).
+	StrictSingleH2 bool
+
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
 }
@@ -143,11 +156,24 @@ func (c *ClientConfig) applyDefaults() {
 		// even with security disabled, MinTransports must be >=1
 		c.MinTransports = 1
 	}
-	switch c.PoolVariant {
-	case "v1":
+	if c.StrictSingleH2 {
 		c.MinTransports = 1
 		c.MaxTransports = 1
-		if c.RotationOverlapAllowance == 0 {
+		c.RotationOverlapAllowance = 0
+		c.BytesPerTransportSoftCap = 0
+		// Strict mode owns the pool sizing; ignore PoolVariant overrides
+		// below by clearing them. Operator can still set PoolVariant for
+		// telemetry/labeling, but transport count is locked to 1.
+		c.PoolVariant = "v1-strict"
+	}
+	switch c.PoolVariant {
+	case "v1", "v1-strict":
+		c.MinTransports = 1
+		c.MaxTransports = 1
+		if c.PoolVariant == "v1-strict" {
+			c.RotationOverlapAllowance = 0
+			c.BytesPerTransportSoftCap = 0
+		} else if c.RotationOverlapAllowance == 0 {
 			c.RotationOverlapAllowance = 1
 		}
 	case "v2":

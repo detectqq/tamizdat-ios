@@ -1,0 +1,117 @@
+package node
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"strconv"
+
+	"github.com/detectqq/tamizdat"
+)
+
+// SamizdatOutbound dials through a samizdat tunnel. It owns a tamizdat.Client
+// keyed by the configured server pubkey + shortid pool; one outbound entry
+// → one client → one (or N) persistent TLS+H2 transports.
+//
+// To build a multi-hop chain, simply declare two samizdat outbounds and
+// route the first's traffic into the second via a SOCKS inbound on the
+// intermediate hop. (Direct outbound→outbound chaining without an inbound
+// in between is not supported in v1; the inbound seam keeps each hop's
+// auth/routing self-contained.)
+type SamizdatOutbound struct {
+	tag    string
+	client *tamizdat.Client
+}
+
+// NewSamizdatOutbound builds the outbound from JSON settings.
+func NewSamizdatOutbound(tag string, raw json.RawMessage) (*SamizdatOutbound, error) {
+	var s SamizdatClientSettings
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("samizdat outbound %q settings: %w", tag, err)
+		}
+	}
+	if s.URI != "" {
+		profile, err := ParseURI(s.URI)
+		if err != nil {
+			return nil, fmt.Errorf("samizdat outbound %q uri: %w", tag, err)
+		}
+		cfg := tamizdat.ClientConfig{
+			ServerAddr:          net.JoinHostPort(profile.Host, strconv.Itoa(profile.Port)),
+			PrimarySNI:          profile.PrimarySNI,
+			ServerName:          profile.PrimarySNI,
+			PublicKey:           profile.Pubkey,
+			MasterShortID:       profile.MasterShortID,
+			Fingerprint:         s.Fingerprint,
+			PoolVariant:         s.PoolVariant,
+			CoverTrafficEnabled: s.CoverTrafficEnabled,
+			CoverTrafficTargets: profile.CoverTrafficTargets,
+			IdleTimeout:         durationMs(s.IdleTimeoutMs),
+			ConnectTimeout:      durationMs(s.ConnectTimeoutMs),
+		}
+		cli, err := tamizdat.NewClient(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("samizdat outbound %q: build client: %w", tag, err)
+		}
+		return &SamizdatOutbound{tag: tag, client: cli}, nil
+	}
+	if s.ServerAddr == "" {
+		return nil, fmt.Errorf("samizdat outbound %q: server_addr required", tag)
+	}
+	if len(s.ServerNames) == 0 {
+		return nil, fmt.Errorf("samizdat outbound %q: server_names required", tag)
+	}
+	pub, err := hex.DecodeString(s.PublicKeyHex)
+	if err != nil || len(pub) != 32 {
+		return nil, fmt.Errorf("samizdat outbound %q: public_key_hex must be 64 hex chars", tag)
+	}
+	if len(s.ShortIDsHex) == 0 {
+		return nil, fmt.Errorf("samizdat outbound %q: shortids_hex required", tag)
+	}
+	shortIDs := make([][8]byte, 0, len(s.ShortIDsHex))
+	for _, h := range s.ShortIDsHex {
+		b, err := hex.DecodeString(h)
+		if err != nil || len(b) != 8 {
+			return nil, fmt.Errorf("samizdat outbound %q: shortid %q must be 16 hex chars", tag, h)
+		}
+		var id [8]byte
+		copy(id[:], b)
+		shortIDs = append(shortIDs, id)
+	}
+
+	cfg := tamizdat.ClientConfig{
+		ServerAddr:               s.ServerAddr,
+		PrimarySNI:               s.ServerNames[0],
+		ServerName:               s.ServerNames[0],
+		ServerNames:              s.ServerNames,
+		PublicKey:                pub,
+		MasterShortID:            shortIDs[0],
+		Fingerprint:              s.Fingerprint,
+		PoolVariant:              s.PoolVariant,
+		MinTransports:            s.MinTransports,
+		BytesPerTransportSoftCap: s.BytesPerTransportSoftCap,
+		CoverTrafficEnabled:      s.CoverTrafficEnabled,
+		CoverTrafficTargets:      s.CoverTrafficTargets,
+		IdleTimeout:              durationMs(s.IdleTimeoutMs),
+		ConnectTimeout:           durationMs(s.ConnectTimeoutMs),
+	}
+	cli, err := tamizdat.NewClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("samizdat outbound %q: build client: %w", tag, err)
+	}
+	return &SamizdatOutbound{tag: tag, client: cli}, nil
+}
+
+func (s *SamizdatOutbound) Tag() string { return s.tag }
+
+func (s *SamizdatOutbound) Dial(ctx context.Context, req *Request) (net.Conn, error) {
+	return s.client.DialContext(ctx, "tcp", req.Address())
+}
+
+func (s *SamizdatOutbound) DialPacket(ctx context.Context, req *Request) (net.PacketConn, error) {
+	return s.client.DialUDP(ctx, req.Address())
+}
+
+func (s *SamizdatOutbound) Close() error { return s.client.Close() }

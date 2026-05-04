@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -543,7 +544,16 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 		if proto == SamizdatProtocolUDP {
 			network = "udp"
 		}
+		switch proto {
+		case "", "tcp/1", SamizdatProtocolUDP:
+			// supported below
+		default:
+			http.Error(w, "unsupported tamizdat-protocol", http.StatusBadRequest)
+			return
+		}
+
 		class := TrafficBulk
+		var flowID uint64
 		if s.realtime != nil {
 			// Server-side first-RTT realtime still uses the accepted socket's
 			// delayed-ACK posture: class is only knowable after CONNECT parsing,
@@ -556,19 +566,22 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			// realtime classification (slightly weaker shape) for that flow.
 			meta := NewFlowMeta(network, destination)
 			meta.AppHint = r.Header.Get("Tamizdat-App-Hint")
-			class = s.realtime.Detector.ClassifyOpen(meta)
+			switch strings.ToLower(strings.TrimSpace(r.Header.Get(SamizdatForceClassHeader))) {
+			case "bulk":
+				class = TrafficBulk
+			case "realtime":
+				class = TrafficRealtime
+			default:
+				class = s.realtime.Detector.ClassifyOpen(meta)
+			}
+			flowID = s.realtime.Open(class)
 			s.logf("[tamizdat] classify: dst=%s proto=%s app_hint=%q class=%s",
 				destination, network, meta.AppHint, class)
 		}
 
 		switch proto {
-		case "", "tcp/1":
-			// fallthrough to TCP CONNECT handler below
 		case SamizdatProtocolUDP:
-			s.handleUDPCONNECT(w, r, destination)
-			return
-		default:
-			http.Error(w, "unsupported tamizdat-protocol", http.StatusBadRequest)
+			s.handleUDPCONNECT(w, r, destination, flowID)
 			return
 		}
 
@@ -590,9 +603,13 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			fragmenter:   s.fragmenter,
 			debug:        s.config.Debug,
 			trafficClass: class,
+			controller:   s.realtime,
 		}
 
 		defer streamConn.shutdown()
+		if s.realtime != nil && flowID != 0 {
+			defer s.realtime.Close(flowID)
+		}
 
 		s.config.Handler(r.Context(), streamConn, destination)
 
@@ -686,6 +703,7 @@ type serverStreamConn struct {
 	fragmenter   *RecordFragmenter
 	debug        bool
 	trafficClass TrafficClass
+	controller   *RealtimeController
 	closed       atomic.Bool
 	mu           sync.Mutex
 
@@ -736,7 +754,11 @@ func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
 		}
 	}()
 
-	if sc.trafficClass == TrafficRealtime {
+	mode := ShapeFull
+	if sc.controller != nil {
+		mode = sc.controller.Mode()
+	}
+	if sc.trafficClass == TrafficRealtime || mode == ShapeLite {
 		n, err = sc.writer.Write(b)
 		if err == nil {
 			sc.writer.Flush()

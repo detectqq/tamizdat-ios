@@ -2,7 +2,9 @@ package tamizdat
 
 import (
 	"encoding/binary"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -219,6 +221,87 @@ func TestRealtimeDetectorAppHintExplicitEmptyDisables(t *testing.T) {
 		Network: "tcp", Address: "example.com:443", AppHint: "anydesk",
 	}); got != TrafficBulk {
 		t.Fatalf("hint with empty hints list = %s, want bulk", got)
+	}
+}
+
+func TestPlanB_DefaultPromoteUDPNonDNS(t *testing.T) {
+	det := newRealtimeDetector()
+
+	if got := det.ClassifyOpen(NewFlowMeta("udp", "example.com:50000")); got != TrafficRealtime {
+		t.Fatalf("UDP/50000 class = %s, want realtime", got)
+	}
+	if got := det.ClassifyOpen(NewFlowMeta("udp", "example.com:443")); got != TrafficRealtime {
+		t.Fatalf("UDP/443 class = %s, want realtime", got)
+	}
+	if got := det.ClassifyOpen(NewFlowMeta("tcp", "example.com:443")); got != TrafficBulk {
+		t.Fatalf("TCP/443 class = %s, want bulk", got)
+	}
+	if got := det.PlanBStats().Promotes; got < 2 {
+		t.Fatalf("PlanB promotes = %d, want >= 2", got)
+	}
+}
+
+func TestPlanB_DNSAndDoTExcluded(t *testing.T) {
+	det := newRealtimeDetector()
+
+	if got := det.ClassifyOpen(NewFlowMeta("udp", "resolver.example:53")); got != TrafficBulk {
+		t.Fatalf("UDP/53 class = %s, want bulk", got)
+	}
+	if got := det.ClassifyOpen(NewFlowMeta("udp", "resolver.example:853")); got != TrafficBulk {
+		t.Fatalf("UDP/853 class = %s, want bulk", got)
+	}
+}
+
+func TestPlanB_RTPStickyLockSurvivesBulkBlast(t *testing.T) {
+	det := newRealtimeDetector()
+	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
+	class := det.ClassifyOpen(NewFlowMeta("udp", "voice.example:50000"))
+	flowID := controller.Open(class)
+	base := time.Unix(330, 0)
+
+	if got := det.Observe(ObservedPacket{FlowID: flowID, At: base, Payload: testRTPPayload(1, 0x01020304), Size: 80, Direction: DirOutbound}); got != TrafficRealtime {
+		t.Fatalf("first RTP observe class = %s, want realtime", got)
+	}
+	bulk := make([]byte, 512*1024)
+	for i := 0; i < 20; i++ { // 10 MiB over 500 ms: well above the non-RTP cap.
+		at := base.Add(time.Duration(i+1) * 25 * time.Millisecond)
+		if got := det.Observe(ObservedPacket{FlowID: flowID, At: at, Payload: bulk, Size: len(bulk), Direction: DirOutbound}); got != TrafficRealtime {
+			t.Fatalf("bulk blast observe %d class = %s, want realtime", i, got)
+		}
+	}
+	stats := det.PlanBStats()
+	if stats.Demotes != 0 {
+		t.Fatalf("PlanB demotes = %d, want 0", stats.Demotes)
+	}
+	if stats.Lockins != 1 {
+		t.Fatalf("PlanB lockins = %d, want 1", stats.Lockins)
+	}
+}
+
+func TestPlanB_RateCapDemotesSustainedNonRTPBulk(t *testing.T) {
+	det := newRealtimeDetector()
+	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
+	class := det.ClassifyOpen(NewFlowMeta("udp", "bulk.example:50000"))
+	flowID := controller.Open(class)
+	base := time.Unix(340, 0)
+	bulk := make([]byte, 64*1024)
+	seenBulk := false
+
+	for i := 0; i < 20; i++ { // >1 MiB/s for ~1 second, with no RTP-version byte.
+		at := base.Add(time.Duration(i) * 50 * time.Millisecond)
+		if got := det.Observe(ObservedPacket{FlowID: flowID, At: at, Payload: bulk, Size: len(bulk), Direction: DirOutbound}); got == TrafficBulk {
+			seenBulk = true
+		}
+	}
+	if !seenBulk {
+		t.Fatal("non-RTP sustained bulk never demoted to bulk")
+	}
+	stats := det.PlanBStats()
+	if stats.Demotes < 1 {
+		t.Fatalf("PlanB demotes = %d, want >= 1", stats.Demotes)
+	}
+	if stats.Lockins != 0 {
+		t.Fatalf("PlanB lockins = %d, want 0", stats.Lockins)
 	}
 }
 
@@ -471,6 +554,8 @@ func TestStateMachine_IdleRelease(t *testing.T) {
 
 func TestEndpointCache_SiblingFlowBoostAndTTL(t *testing.T) {
 	det := newRealtimeDetector()
+	// Opt out: this legacy cache test asserts pre-Plan-B UDP/9999 opens stay bulk.
+	det.cfg.PlanBDefaultPromoteUDP = false
 	base := time.Unix(320, 0)
 	class := det.ClassifyOpen(FlowMeta{Network: "udp", Address: "1.2.3.4:9999", Payload: testSTUNPayload(), AppHint: "anydesk"})
 	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
@@ -495,7 +580,261 @@ func TestEndpointCache_SiblingFlowBoostAndTTL(t *testing.T) {
 
 func TestRealtimeDetectorDropsIANADynamicRangeDefault(t *testing.T) {
 	det := newRealtimeDetector()
+	// Opt out: Plan B intentionally default-promotes non-DNS UDP dynamic ports.
+	det.cfg.PlanBDefaultPromoteUDP = false
 	if got := det.ClassifyOpen(NewFlowMeta("udp", "example.com:50000")); got != TrafficBulk {
 		t.Fatalf("IANA dynamic UDP port class = %s, want bulk", got)
+	}
+}
+
+type planBPlusBlockingRWC struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newPlanBPlusBlockingRWC() *planBPlusBlockingRWC {
+	return &planBPlusBlockingRWC{closed: make(chan struct{})}
+}
+
+func (r *planBPlusBlockingRWC) Read(p []byte) (int, error) {
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *planBPlusBlockingRWC) Write(p []byte) (int, error) { return len(p), nil }
+
+func (r *planBPlusBlockingRWC) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
+}
+
+func waitForPlanBPlusMigrationFires(t *testing.T, det *RealtimeDetector, want uint64) {
+	t.Helper()
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		if got := det.PlanBStats().MigrationFires; got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("MigrationFires = %d, want %d", det.PlanBStats().MigrationFires, want)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func newPlanBPlusDetectorForTest(cfg RealtimeDetectorConfig) (*RealtimeDetector, *RealtimeController) {
+	cfg.RealtimePorts = []int{3478}
+	cfg.PlanBDefaultPromoteUDP = true
+	cfg.PlanBRateCapWindow = 500 * time.Millisecond
+	cfg.PlanBRateCapBytesPerSec = 256 * 1024
+	if cfg.MigrationDebounceWindow == 0 {
+		cfg.MigrationDebounceWindow = 1500 * time.Millisecond
+	}
+	if cfg.MigrationWindowByteThreshold == 0 {
+		cfg.MigrationWindowByteThreshold = 384 * 1024
+	}
+	if cfg.MigrationCumulativeFloor == 0 {
+		cfg.MigrationCumulativeFloor = 10 * 1024 * 1024
+	}
+	det := newRealtimeDetectorWithConfig(cfg)
+	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
+	return det, controller
+}
+
+func registerPlanBPlusMigrationHandle(t *testing.T, det *RealtimeDetector, flowID uint64, dst string, rwc *planBPlusBlockingRWC, originalLite bool) {
+	t.Helper()
+	det.registerMigrationHandle(flowID, &migrationHandle{
+		fastCloseFn:           rwc.Close,
+		dstAddr:               dst,
+		originalTransportLite: originalLite,
+		ensureBulkFn:          func() error { return nil },
+	})
+}
+
+func TestPlanBPlus_MigrationWindowByteThresholdFiresOnSustainedBulk(t *testing.T) {
+	det, controller := newPlanBPlusDetectorForTest(RealtimeDetectorConfig{MigrationEnabled: true})
+	dst := "bulk.example:443"
+	class := det.ClassifyOpen(NewFlowMeta("udp", dst))
+	flowID := controller.Open(class)
+	rwc := newPlanBPlusBlockingRWC()
+	registerPlanBPlusMigrationHandle(t, det, flowID, dst, rwc, true)
+	pc := wrapRealtimePacketConn(newUDPFramedPacketConn(rwc, &streamAddr{network: "udp", address: dst}), controller, flowID)
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		_, _, err := pc.ReadFrom(buf)
+		readErr <- err
+	}()
+
+	base := time.Unix(400, 0)
+	payload := make([]byte, 256*1024)
+	for i := 0; i < 48; i++ { // 12 MiB over ~2.9 s, enough to cross floor and per-window threshold.
+		at := base.Add(time.Duration(i) * 60 * time.Millisecond)
+		det.Observe(ObservedPacket{FlowID: flowID, At: at, Payload: payload, Size: len(payload), Direction: DirOutbound})
+	}
+	waitForPlanBPlusMigrationFires(t, det, 1)
+
+	select {
+	case err := <-readErr:
+		if err != io.EOF {
+			t.Fatalf("ReadFrom after migration err = %v, want io.EOF", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("original PacketConn ReadFrom did not unblock after migration")
+	}
+
+	st := detectorFlowStateForTest(t, det, flowID)
+	if st.windowByteSum < det.cfg.MigrationWindowByteThreshold {
+		t.Fatalf("windowByteSum = %d, want >= %d", st.windowByteSum, det.cfg.MigrationWindowByteThreshold)
+	}
+	if st.totalBytes < det.cfg.MigrationCumulativeFloor {
+		t.Fatalf("totalBytes = %d, want >= %d", st.totalBytes, det.cfg.MigrationCumulativeFloor)
+	}
+	if !st.migrated {
+		t.Fatal("flow state did not record migrated=true")
+	}
+	key := forceBulkCacheKey(NewFlowMeta("udp", dst))
+	v, ok := det.forceBulkCache.Load(key)
+	if !ok {
+		t.Fatalf("forceBulkCache missing key %q", key)
+	}
+	if until := v.(forceBulkEntry).untilNS; until <= time.Now().UnixNano() {
+		t.Fatalf("forceBulkCache untilNS = %d, want future", until)
+	}
+	if got := det.ClassifyOpen(NewFlowMeta("udp", dst)); got != TrafficBulk {
+		t.Fatalf("fresh same-dst ClassifyOpen = %s, want bulk from forceBulkCache", got)
+	}
+}
+
+func TestPlanBPlus_MigrationSkippedOnSingleBurst(t *testing.T) {
+	det, controller := newPlanBPlusDetectorForTest(RealtimeDetectorConfig{MigrationEnabled: true})
+	dst := "burst.example:443"
+	flowID := controller.Open(det.ClassifyOpen(NewFlowMeta("udp", dst)))
+	rwc := newPlanBPlusBlockingRWC()
+	defer rwc.Close()
+	registerPlanBPlusMigrationHandle(t, det, flowID, dst, rwc, true)
+	base := time.Unix(410, 0)
+	det.Observe(ObservedPacket{FlowID: flowID, At: base, Payload: make([]byte, 200*1024), Size: 200 * 1024, Direction: DirOutbound})
+	det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(2 * time.Second), Payload: []byte{1}, Size: 1, Direction: DirOutbound})
+	st := detectorFlowStateForTest(t, det, flowID)
+	if st.windowByteSum >= det.cfg.MigrationWindowByteThreshold {
+		t.Fatalf("windowByteSum = %d, want below threshold %d", st.windowByteSum, det.cfg.MigrationWindowByteThreshold)
+	}
+	if got := det.PlanBStats().MigrationFires; got != 0 {
+		t.Fatalf("MigrationFires = %d, want 0", got)
+	}
+}
+
+func TestPlanBPlus_MigrationSkippedBelowFloor(t *testing.T) {
+	det, controller := newPlanBPlusDetectorForTest(RealtimeDetectorConfig{MigrationEnabled: true})
+	dst := "below-floor.example:443"
+	flowID := controller.Open(det.ClassifyOpen(NewFlowMeta("udp", dst)))
+	rwc := newPlanBPlusBlockingRWC()
+	defer rwc.Close()
+	registerPlanBPlusMigrationHandle(t, det, flowID, dst, rwc, true)
+	base := time.Unix(420, 0)
+	payload := make([]byte, 256*1024)
+	for i := 0; i < 4; i++ { // 1 MiB in one tumbling window: candidate fires, 10 MiB floor blocks.
+		det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(time.Duration(i) * 200 * time.Millisecond), Payload: payload, Size: len(payload), Direction: DirOutbound})
+	}
+	stats := det.PlanBStats()
+	if stats.MigrationFires != 0 {
+		t.Fatalf("MigrationFires = %d, want 0", stats.MigrationFires)
+	}
+	if stats.MigrationSkippedFloor < 1 {
+		t.Fatalf("MigrationSkippedFloor = %d, want >= 1", stats.MigrationSkippedFloor)
+	}
+}
+
+func TestPlanBPlus_MigrationSkippedRTPLocked(t *testing.T) {
+	det, controller := newPlanBPlusDetectorForTest(RealtimeDetectorConfig{MigrationEnabled: true})
+	dst := "rtp.example:50000"
+	flowID := controller.Open(det.ClassifyOpen(NewFlowMeta("udp", dst)))
+	rwc := newPlanBPlusBlockingRWC()
+	defer rwc.Close()
+	registerPlanBPlusMigrationHandle(t, det, flowID, dst, rwc, true)
+	base := time.Unix(430, 0)
+	det.Observe(ObservedPacket{FlowID: flowID, At: base, Payload: testRTPPayload(1, 0x01020304), Size: 80, Direction: DirInbound})
+	payload := make([]byte, 256*1024)
+	for i := 0; i < 48; i++ {
+		det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(time.Duration(i+1) * 60 * time.Millisecond), Payload: payload, Size: len(payload), Direction: DirOutbound})
+	}
+	stats := det.PlanBStats()
+	if stats.Lockins < 1 {
+		t.Fatalf("Lockins = %d, want >= 1", stats.Lockins)
+	}
+	if stats.MigrationFires != 0 {
+		t.Fatalf("MigrationFires = %d, want 0", stats.MigrationFires)
+	}
+}
+
+func TestPlanBPlus_MigrationDisabled(t *testing.T) {
+	det, controller := newPlanBPlusDetectorForTest(RealtimeDetectorConfig{MigrationEnabled: false})
+	dst := "disabled.example:443"
+	flowID := controller.Open(det.ClassifyOpen(NewFlowMeta("udp", dst)))
+	rwc := newPlanBPlusBlockingRWC()
+	defer rwc.Close()
+	registerPlanBPlusMigrationHandle(t, det, flowID, dst, rwc, true)
+	base := time.Unix(440, 0)
+	payload := make([]byte, 256*1024)
+	for i := 0; i < 48; i++ {
+		det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(time.Duration(i) * 60 * time.Millisecond), Payload: payload, Size: len(payload), Direction: DirOutbound})
+	}
+	if got := det.PlanBStats().MigrationFires; got != 0 {
+		t.Fatalf("MigrationFires = %d, want 0", got)
+	}
+	if _, ok := det.forceBulkCache.Load(forceBulkCacheKey(NewFlowMeta("udp", dst))); ok {
+		t.Fatal("forceBulkCache populated even though migration disabled")
+	}
+}
+
+func TestPlanBPlus_HysteresisDefaults15s(t *testing.T) {
+	controller := newRealtimeController()
+	if controller.hysteresisMin != 15*time.Second {
+		t.Fatalf("hysteresisMin = %s, want 15s", controller.hysteresisMin)
+	}
+	if controller.hysteresisMax != 30*time.Second {
+		t.Fatalf("hysteresisMax = %s, want 30s", controller.hysteresisMax)
+	}
+}
+
+func TestPlanBPlus_ServerObservationOpenAndClose(t *testing.T) {
+	det := newRealtimeDetectorWithConfig(RealtimeDetectorConfig{PlanBDefaultPromoteUDP: true, MigrationEnabled: false})
+	s := &Server{realtime: newRealtimeControllerWithConfig(det, time.Second, time.Second)}
+	class := s.realtime.Detector.ClassifyOpen(NewFlowMeta("udp", "voice.example:50000"))
+	flowID := s.realtime.Open(class)
+	if got := s.realtime.ActiveRealtimeCount(); got != 1 {
+		t.Fatalf("server active realtime after UDP open = %d, want 1", got)
+	}
+	s.realtime.Close(flowID)
+	if got := s.realtime.ActiveRealtimeCount(); got != 0 {
+		t.Fatalf("server active realtime after UDP close = %d, want 0", got)
+	}
+}
+
+func TestPlanBPlus_ServerObservationDemoteOnRateCap(t *testing.T) {
+	det := newRealtimeDetectorWithConfig(RealtimeDetectorConfig{
+		PlanBDefaultPromoteUDP:  true,
+		PlanBRateCapWindow:      500 * time.Millisecond,
+		PlanBRateCapBytesPerSec: 256 * 1024,
+		MigrationEnabled:        false,
+	})
+	s := &Server{realtime: newRealtimeControllerWithConfig(det, time.Second, time.Second)}
+	flowID := s.realtime.Open(s.realtime.Detector.ClassifyOpen(NewFlowMeta("udp", "bulk.example:50000")))
+	if got := s.realtime.ActiveRealtimeCount(); got != 1 {
+		t.Fatalf("server active realtime after open = %d, want 1", got)
+	}
+	base := time.Unix(450, 0)
+	payload := make([]byte, 64*1024)
+	for i := 0; i < 20; i++ {
+		s.realtime.observePacketAt(flowID, payload, DirOutbound, base.Add(time.Duration(i)*50*time.Millisecond))
+	}
+	if got := s.realtime.ActiveRealtimeCount(); got != 0 {
+		t.Fatalf("server active realtime after rate-cap demote = %d, want 0", got)
+	}
+	if got := det.PlanBStats().Demotes; got < 1 {
+		t.Fatalf("PlanB Demotes = %d, want >= 1", got)
 	}
 }

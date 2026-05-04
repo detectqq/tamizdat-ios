@@ -1,0 +1,11 @@
+{
+  "artt_ms": 0.12803077697753906,
+  "artt_pairs": 53,
+  "label": "bbcr-localhost",
+  "note": "TRTT=SYN/SYNACK median, ARTT=client-payload to next server-payload median; numerical localhost helper only",
+  "ok": true,
+  "rows": 126,
+  "rttdiff_ms": 0.11110305786132812,
+  "trtt_ms": 0.016927719116210938,
+  "trtt_pairs": 3
+}

@@ -449,7 +449,7 @@ func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
 
 func TestConnPoolBasic(t *testing.T) {
 	createCount := 0
-	pool := newConnPool(100, 5*time.Minute, 1, 1, 0, -1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	pool := newConnPool(100, 5*time.Minute, 1, 1, 0, -1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		createCount++
 		server, client := net.Pipe()
 		_ = server
@@ -552,7 +552,7 @@ func TestConnPoolSkipsDraining(t *testing.T) {
 	defer client.Close()
 
 	created := 0
-	pool := newConnPool(100, 5*time.Minute, 1, 2, 0, -1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	pool := newConnPool(100, 5*time.Minute, 1, 2, 0, -1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		created++
 		return &h2Transport{
 			tlsConn:    client,

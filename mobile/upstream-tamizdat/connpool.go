@@ -49,6 +49,18 @@ type connPool struct {
 	rotationOverlapAllowance int   // extra transient bulk slots while a capped transport drains
 	bulkRR                   int   // round-robin index into transports for bulk getTransport
 	liteTransport            *h2Transport
+	// strictSingleH2: when true, getTransportForClass(TrafficRealtime)
+	// returns bulk directly instead of spawning a lite transport. The
+	// transport-wide flipShapeMode(ShapeLite) hook on the bulk transport
+	// (set up in client.go when MaxTransports==1) handles the per-flow
+	// shape change without a 2nd TCP. Trade-off: HoL on shared TCP.
+	strictSingleH2 bool
+	// liteSpawnDelay: only spawn a lite transport after a realtime flow
+	// has been requested for at least this duration (firstRealtimeNanos
+	// timestamps the first request). Filters out short STUN probes.
+	// 0 = disabled (legacy behavior, spawn lite immediately).
+	liteSpawnDelay      time.Duration
+	firstRealtimeNanos  atomic.Int64
 
 	liteCloseDeadline atomic.Int64 // Unix nanos, 0 = not armed
 	liteCloseTimer    *time.Timer
@@ -61,7 +73,11 @@ type connPool struct {
 // minTransports >= 1: pre-warm pool and keep at least N transports alive
 // (compass P1.2 multi-conn fallback against TSPU detector #490). bytesSoftCap
 // > 0 marks a transport draining once outbound bytes cross threshold.
-func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, maxTransports int, bytesSoftCap int64, rotationOverlapAllowance int, createFunc func(ctx context.Context, class TrafficClass) (*h2Transport, error)) *connPool {
+// strictSingleH2: when true, realtime traffic is routed to the bulk transport
+// (with transport-wide shape flip), not to a separate lite transport.
+// liteSpawnDelay: defer lite-transport spawn by this duration after first
+// realtime request, to filter short STUN probes (only used when !strict).
+func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, maxTransports int, bytesSoftCap int64, rotationOverlapAllowance int, strictSingleH2 bool, liteSpawnDelay time.Duration, createFunc func(ctx context.Context, class TrafficClass) (*h2Transport, error)) *connPool {
 	if minTransports < 1 {
 		minTransports = 1
 	}
@@ -79,6 +95,8 @@ func newConnPool(maxStreams int, idleTimeout time.Duration, minTransports int, m
 		}
 	}
 	p := &connPool{
+		strictSingleH2:           strictSingleH2,
+		liteSpawnDelay:           liteSpawnDelay,
 		maxStreams:               maxStreams,
 		idleTimeout:              idleTimeout,
 		createFunc:               createFunc,
@@ -105,11 +123,60 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 }
 
 // getTransportForClass routes V2 traffic classes to separate transport buckets.
+// Strict mode forces realtime onto the bulk transport (no lite spawn).
+// Non-strict mode honours liteSpawnDelay: for the first liteSpawnDelay
+// after the very first realtime request, traffic is routed to bulk so a
+// short STUN probe never spawns a lite transport. After the delay, the
+// regular getLiteTransport path is taken.
 func (p *connPool) getTransportForClass(ctx context.Context, class TrafficClass) (*h2Transport, error) {
-	if class == TrafficRealtime {
-		return p.getLiteTransport(ctx)
+	if class != TrafficRealtime {
+		return p.getBulkTransport(ctx)
 	}
-	return p.getBulkTransport(ctx)
+	if p.strictSingleH2 {
+		return p.getBulkTransport(ctx)
+	}
+	if p.liteSpawnDelay > 0 {
+		now := time.Now().UnixNano()
+		first := p.firstRealtimeNanos.Load()
+		if first == 0 {
+			p.firstRealtimeNanos.CompareAndSwap(0, now)
+			first = p.firstRealtimeNanos.Load()
+		}
+		if time.Duration(now-first) < p.liteSpawnDelay {
+			// Still in the warm-up window — route this realtime
+			// flow over bulk to avoid lite-spawn on short probes.
+			return p.getBulkTransport(ctx)
+		}
+	}
+	return p.getLiteTransport(ctx)
+}
+
+// activeSNIs returns the SNIs of all currently-alive transports in the pool.
+// Used by client.createTransport to call pickServerNameExcluding so a
+// freshly-spawned lite transport gets a different cover SNI than bulk.
+func (p *connPool) activeSNIs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.transports) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.transports))
+	for _, t := range p.transports {
+		if t == nil || t.isClosed() {
+			continue
+		}
+		if t.sni != "" {
+			out = append(out, t.sni)
+		}
+	}
+	return out
+}
+
+// resetFirstRealtimeNanos zeroes the delay-spawn timestamp. Called when
+// activeRealtimeCount drops to 0 so the next realtime burst gets a fresh
+// 3-sec warm-up before lite-spawn kicks in.
+func (p *connPool) resetFirstRealtimeNanos() {
+	p.firstRealtimeNanos.Store(0)
 }
 
 func (p *connPool) getBulkTransport(ctx context.Context) (*h2Transport, error) {
@@ -134,6 +201,44 @@ func (p *connPool) getBulkTransport(ctx context.Context) (*h2Transport, error) {
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-time.After(10 * time.Millisecond):
+					continue
+				}
+			}
+			// Inline-cleanup: dead/draining-with-zero-streams transports occupy
+			// pool slots but cannot serve new requests. Remove them here so a
+			// fresh spawn can proceed instead of erroring out with cap=1.
+			// Without this fix, strict mode (cap=1) blocks indefinitely when
+			// the single bulk transport gets closed (e.g., server-side reset)
+			// until the 60s cleanup tick runs, killing parallel HTTPS apps
+			// like Roblox login that retry within seconds.
+			//
+			// Gated to strict mode only — legacy V1/V2/V3 expect rotation-
+			// overlap accounting to backpressure when capacity is exhausted,
+			// even with a draining-zero-stream transport sitting in the slot.
+			// Tests TestPool_BulkRotationWhileLitePresent and
+			// TestPool_V1RotationOverlapZeroBackpressures pin that contract.
+			if !p.strictSingleH2 {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("%w: cap=%d", ErrPoolBackpressure, capacity)
+			}
+			alive := p.transports[:0:0]
+			for _, t := range p.transports {
+				if t == nil || t.isClosed() {
+					continue
+				}
+				if t.isDraining() && t.streamCount() == 0 {
+					t.close()
+					p.clearLiteTransportLocked(t)
+					continue
+				}
+				alive = append(alive, t)
+			}
+			if len(alive) != len(p.transports) {
+				p.transports = alive
+				p.updatePoolGaugesLocked()
+				if len(p.transports)+p.creating < capacity {
+					// Slot freed, retry the spawn loop.
+					p.mu.Unlock()
 					continue
 				}
 			}
