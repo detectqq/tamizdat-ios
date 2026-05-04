@@ -393,6 +393,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetPoolVariant(variant)
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
+        case "status":
+            // IPA-Z: main-screen lamp polls this every 500 ms. Snapshot
+            // is built from in-process Socksstub*() getters which read
+            // tamizdat.Client atomic counters — no locks, no I/O.
+            // Field names must stay in sync with TamizdatStatusSnapshot
+            // in TamizdatStatusStore.swift.
+            let payload: [String: Any] = [
+                "realShape":   SocksstubRealShapeMode() ?? "",
+                "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
+                "liteAlive":   Int(SocksstubLiteAlive()),
+                "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),
+                "rttBulkMs":   Int(SocksstubRTTBulkP50Ms()),
+            ]
+            let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            completionHandler?(json)
         default:
             completionHandler?(Data())
         }

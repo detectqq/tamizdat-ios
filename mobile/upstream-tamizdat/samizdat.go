@@ -129,8 +129,12 @@ func (c *ClientConfig) applyDefaults() {
 	if c.Fingerprint == "" {
 		c.Fingerprint = "mix"
 	}
-	if c.MaxStreamsPerConn == 0 {
-		c.MaxStreamsPerConn = 100
+	// MaxStreamsPerConn = 0 (default) means "no client-side cap; rely on
+	// the server's SETTINGS_MAX_CONCURRENT_STREAMS announced via h2 SETTINGS
+	// frame". Set to a positive value only as a per-platform safety floor
+	// (e.g. iOS PacketTunnelProvider memory-budget protection).
+	if c.MaxStreamsPerConn < 0 {
+		c.MaxStreamsPerConn = 0
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
@@ -230,6 +234,14 @@ type ServerConfig struct {
 	Debug           bool
 	DebugListenAddr string
 
+	// ShapeEventLogPath, when non-empty, opens a SEPARATE log file (NOT
+	// stderr/journalctl) and records V1 valve transitions:
+	//   - valve_open  when activeRealtimeCount transitions 0 → 1 (first realtime flow)
+	//   - valve_close when activeRealtimeCount transitions 1 → 0 (last realtime flow gone)
+	//   - stream_open per-flow with client identity (remoteAddr+shortid) + dst+class
+	// Operator-only debug aid, off by default (empty path).
+	ShapeEventLogPath string
+
 	DisableDefaultSecurity bool
 
 	EpochGraceWindow int
@@ -250,7 +262,7 @@ func (c *ServerConfig) applyDefaults() {
 		c.MasqueradeMaxDuration = 10 * time.Minute
 	}
 	if c.MaxConcurrentStreams == 0 {
-		c.MaxConcurrentStreams = 250
+		c.MaxConcurrentStreams = 1000
 	}
 	if c.ReplayWindow == 0 {
 		c.ReplayWindow = defaultReplayWindow

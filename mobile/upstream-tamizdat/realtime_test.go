@@ -349,6 +349,172 @@ func TestStateBudget_FlowSizeUnder256B(t *testing.T) {
 	}
 }
 
+func realtimeV2Observe(t *testing.T, det *RealtimeDetector, flowID uint64, at time.Time, payload []byte, size int, dir Direction) flowState {
+	t.Helper()
+	det.Observe(ObservedPacket{FlowID: flowID, At: at, Payload: payload, Size: size, Direction: dir})
+	return detectorFlowStateForTest(t, det, flowID)
+}
+
+func TestRealtimeV2_PositiveSignatures(t *testing.T) {
+	base := time.Unix(360, 0)
+	raknet := make([]byte, 17)
+	copy(raknet[1:9], []byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe})
+	cases := []struct {
+		name string
+		p    []byte
+		flag uint8
+	}{
+		{"rtp", testRTPPayload(1, 0x01020304), POS_RTP},
+		{"rtcp", []byte{0x80, 200, 0, 0, 0, 0, 0, 0}, POS_RTCP},
+		{"stun", testSTUNPayload(), POS_STUN},
+		{"turn", testTURNChannelDataPayload(), POS_TURN_DATA},
+		{"raknet", raknet, POS_RAKNET},
+		{"srceng", []byte{0xff, 0xff, 0xff, 0xff}, POS_SRCENG},
+		{"dtls", testDTLSHandshakePayload(), POS_DTLS},
+	}
+	for i, tc := range cases {
+		st := realtimeV2Observe(t, newRealtimeDetector(), uint64(10_000+i), base, tc.p, len(tc.p), DirOutbound)
+		if st.flags&flagLiteLocked == 0 || st.posFlags&tc.flag == 0 || st.flags&flagBulkLocked != 0 {
+			t.Fatalf("%s: flags=%08b pos=%02x", tc.name, st.flags, st.posFlags)
+		}
+	}
+}
+
+func TestRealtimeV2_NegativeSignatures(t *testing.T) {
+	base := time.Unix(361, 0)
+	ntp := make([]byte, 48)
+	ntp[0] = 0x1b
+	dns := make([]byte, 32)
+	binary.BigEndian.PutUint16(dns[2:4], 0x0100)
+	binary.BigEndian.PutUint16(dns[4:6], 1)
+	cases := []struct {
+		name string
+		p    []byte
+		flag uint8
+	}{
+		{"quic-long", []byte{0xc0, 0, 0, 0, 1, 0, 0}, NEG_QUIC_LONG},
+		{"ntp", ntp, NEG_NTP},
+		{"dns", dns, NEG_DNS},
+	}
+	for i, tc := range cases {
+		st := realtimeV2Observe(t, newRealtimeDetector(), uint64(10_100+i), base, tc.p, len(tc.p), DirOutbound)
+		if st.flags&flagBulkLocked == 0 || st.flags&flagLiteLocked != 0 || st.negFlags&tc.flag == 0 {
+			t.Fatalf("%s: flags=%08b neg=%02x", tc.name, st.flags, st.negFlags)
+		}
+	}
+}
+
+func TestRealtimeV2_QuicCidStability(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(362, 0)
+	for i := 0; i < 5; i++ {
+		p := make([]byte, 1300)
+		p[0] = 0x40
+		copy(p[1:9], []byte{0xaa, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+		realtimeV2Observe(t, det, 10_200, base.Add(time.Duration(i)*20*time.Millisecond), p, len(p), DirInbound)
+	}
+	st := detectorFlowStateForTest(t, det, 10_200)
+	if st.cidMatch < CID_MATCH_LOCK || st.negFlags&NEG_QUIC_CID == 0 || st.flags&flagLiteLocked != 0 {
+		t.Fatalf("cid=%d flags=%08b neg=%02x", st.cidMatch, st.flags, st.negFlags)
+	}
+}
+
+func TestRealtimeV2_TurnVsQuic(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(363, 0)
+	for i := 0; i < 5; i++ {
+		p := make([]byte, 1300)
+		binary.BigEndian.PutUint16(p[0:2], 0x4001)
+		binary.BigEndian.PutUint16(p[2:4], uint16(len(p)-4))
+		copy(p[4:9], []byte{0x44, 0x55, 0x66, 0x77, 0x88})
+		realtimeV2Observe(t, det, 10_300, base.Add(time.Duration(i)*20*time.Millisecond), p, len(p), DirInbound)
+	}
+	st := detectorFlowStateForTest(t, det, 10_300)
+	if st.posFlags&POS_TURN_DATA != 0 || st.negFlags&NEG_QUIC_CID == 0 || st.flags&flagLiteLocked != 0 {
+		t.Fatalf("flags=%08b pos=%02x neg=%02x", st.flags, st.posFlags, st.negFlags)
+	}
+}
+
+func TestRealtimeV2_RateLockNoSignature(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(364, 0)
+	payload := make([]byte, 300)
+	payload[0] = 0x31
+	for i := 0; i < 24; i++ {
+		dir := DirOutbound
+		if i%2 == 1 {
+			dir = DirInbound
+		}
+		realtimeV2Observe(t, det, 10_400, base.Add(time.Duration(i)*33*time.Millisecond), payload, len(payload), dir)
+	}
+	st := detectorFlowStateForTest(t, det, 10_400)
+	if st.flags&flagLiteLocked == 0 || st.posFlags != 0 || st.negFlags != 0 {
+		t.Fatalf("flags=%08b score=%d smooth=%d failed=%d pos=%02x neg=%02x", st.flags, st.score, st.clsSmoothWins, st.clsFailedWins, st.posFlags, st.negFlags)
+	}
+}
+
+func TestRealtimeV2_QuicAckBurstNoLock(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(365, 0)
+	for i := 0; i < 12; i++ {
+		sz := 50
+		if i%3 == 1 {
+			sz = 1300
+		}
+		p := make([]byte, sz)
+		p[0] = 0x31
+		realtimeV2Observe(t, det, 10_500, base.Add(time.Duration(i*i+1)*7*time.Millisecond), p, sz, DirInbound)
+	}
+	st := detectorFlowStateForTest(t, det, 10_500)
+	if st.flags&flagLiteLocked != 0 || st.flags&flagBulkLocked == 0 {
+		t.Fatalf("flags=%08b score=%d neg=%02x", st.flags, st.score, st.negFlags)
+	}
+}
+
+func TestRealtimeV2_VoiceWithSilenceHysteresis(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(366, 0)
+	for i := 0; i < 50; i++ {
+		realtimeV2Observe(t, det, 10_600, base.Add(time.Duration(i)*20*time.Millisecond), testRTPPayload(uint16(i), 0x0a0b0c0d), 80, DirOutbound)
+	}
+	st := realtimeV2Observe(t, det, 10_600, base.Add(4*time.Second), testRTPPayload(51, 0x0a0b0c0d), 80, DirOutbound)
+	if st.flags&flagLiteLocked == 0 || st.flags&flagBulkLocked != 0 {
+		t.Fatalf("flags=%08b score=%d", st.flags, st.score)
+	}
+}
+
+func TestRealtimeV2_CoolingReturnToLite(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(367, 0)
+	flowID := uint64(10_650)
+	ssrc := uint32(0x0a0b0c0d)
+
+	for i := 0; i < 50; i++ {
+		realtimeV2Observe(t, det, flowID, base.Add(time.Duration(i)*20*time.Millisecond), testRTPPayload(uint16(i), ssrc), 80, DirOutbound)
+	}
+	if st := detectorFlowStateForTest(t, det, flowID); st.flags&flagLiteLocked == 0 || st.flags&flagInCooling != 0 {
+		t.Fatalf("pre-cooling flags=%08b score=%d", st.flags, st.score)
+	}
+
+	var st flowState
+	for i := 0; i < 5; i++ {
+		st = realtimeV2Observe(t, det, flowID, base.Add(6*time.Second+time.Duration(i)*20*time.Millisecond), testRTPPayload(uint16(50+i), ssrc), 80, DirOutbound)
+	}
+	if st.flags&flagLiteLocked == 0 || st.flags&flagInCooling != 0 {
+		t.Fatalf("post-cooling flags=%08b score=%d", st.flags, st.score)
+	}
+}
+
+func TestRealtimeV2_BulkSticky(t *testing.T) {
+	det := newRealtimeDetector()
+	base := time.Unix(367, 0)
+	realtimeV2Observe(t, det, 10_700, base, []byte{0xc0, 0, 0, 0, 1, 0, 0}, 7, DirOutbound)
+	st := realtimeV2Observe(t, det, 10_700, base.Add(20*time.Millisecond), testRTPPayload(1, 0x01020304), 80, DirOutbound)
+	if st.flags&flagBulkLocked == 0 || st.flags&flagLiteLocked != 0 || st.posFlags != 0 {
+		t.Fatalf("flags=%08b pos=%02x", st.flags, st.posFlags)
+	}
+}
+
 func TestTier1_STUNCookieAlone(t *testing.T) {
 	det := newRealtimeDetector()
 	base := time.Unix(200, 0)

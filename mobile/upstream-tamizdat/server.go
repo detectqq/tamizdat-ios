@@ -55,6 +55,10 @@ type Server struct {
 	debugListener net.Listener
 	debugServer   *http.Server
 
+	// Shape-event log: separate file for V1 valve transitions when configured.
+	shapeEventMu  sync.Mutex
+	shapeEventOut *os.File
+
 	// MED-4: track in-flight TCP connections so Server.Close can actively
 	// terminate them. Without this, h2Server.ServeConn parks on tlsConn.Read
 	// and wg.Wait() blocks forever, breaking systemd graceful-shutdown.
@@ -111,6 +115,23 @@ func NewServer(config ServerConfig) (*Server, error) {
 		cancel:       cancel,
 		realtime:     newRealtimeController(),
 		shortIDPool:  newShortIDPool(config.MasterShortID, config.EpochGraceWindow),
+	}
+
+	// Optional shape-event-log: separate file for V1 valve transitions.
+	// Off by default (empty path). When configured, hook controller callbacks
+	// to record 0â1 (valve_open) and 1â0 (valve_close) transitions.
+	if config.ShapeEventLogPath != "" {
+		f, ferr := os.OpenFile(config.ShapeEventLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if ferr != nil {
+			return nil, fmt.Errorf("open shape-event-log %q: %w", config.ShapeEventLogPath, ferr)
+		}
+		s.shapeEventOut = f
+		s.realtime.onRealtimeOpen = func() {
+			s.logShapeEvent("valve_open total_active=1")
+		}
+		s.realtime.onLastRealtimeClose = func() {
+			s.logShapeEvent("valve_close total_active=0")
+		}
 	}
 
 	// Aparecium audit fix: pad cert chain to ~3.5 KB extra so encrypted
@@ -269,6 +290,12 @@ func (s *Server) Serve(ln net.Listener) error {
 // Close shuts down the server.
 func (s *Server) Close() error {
 	s.cancel(ErrServerClosed)
+	s.shapeEventMu.Lock()
+	if s.shapeEventOut != nil {
+		_ = s.shapeEventOut.Close()
+		s.shapeEventOut = nil
+	}
+	s.shapeEventMu.Unlock()
 	s.listenerMu.Lock()
 	ln := s.listener
 	s.listenerMu.Unlock()
@@ -566,17 +593,20 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 			// realtime classification (slightly weaker shape) for that flow.
 			meta := NewFlowMeta(network, destination)
 			meta.AppHint = r.Header.Get("Tamizdat-App-Hint")
+			var classifyToken *flowToken
 			switch strings.ToLower(strings.TrimSpace(r.Header.Get(SamizdatForceClassHeader))) {
 			case "bulk":
 				class = TrafficBulk
 			case "realtime":
 				class = TrafficRealtime
 			default:
-				class = s.realtime.Detector.ClassifyOpen(meta)
+				class, classifyToken = s.realtime.Detector.ClassifyOpenWithToken(meta)
 			}
-			flowID = s.realtime.Open(class)
+			flowID = s.realtime.OpenWithToken(class, classifyToken)
 			s.logf("[tamizdat] classify: dst=%s proto=%s app_hint=%q class=%s",
 				destination, network, meta.AppHint, class)
+			s.logShapeEvent(fmt.Sprintf("stream_open client=%s shortid=%x dst=%s proto=%s class=%s flowID=%d",
+				tlsConn.RemoteAddr().String(), identity[:], destination, network, class, flowID))
 		}
 
 		switch proto {
@@ -608,7 +638,15 @@ func (s *Server) serveH2(tlsConn net.Conn, identity [8]byte) {
 
 		defer streamConn.shutdown()
 		if s.realtime != nil && flowID != 0 {
-			defer s.realtime.Close(flowID)
+			closedClass := class
+			closedDst := destination
+			closedNet := network
+			closedFID := flowID
+			defer func() {
+				s.realtime.Close(closedFID)
+				s.logShapeEvent(fmt.Sprintf("stream_close client=%s shortid=%x dst=%s proto=%s class=%s flowID=%d",
+					tlsConn.RemoteAddr().String(), identity[:], closedDst, closedNet, closedClass, closedFID))
+			}()
 		}
 
 		s.config.Handler(r.Context(), streamConn, destination)
@@ -915,6 +953,24 @@ func (fw flushWriter) Flush() {
 
 // defaultConnHandler is a simple handler that dials the destination and
 // proxies data bidirectionally.
+
+// logShapeEvent writes one line to the configured ShapeEventLogPath, if any.
+// Off (no-op) when ShapeEventLogPath is empty. Format: ISO8601-time + msg + \n.
+// Caller passes the message body without timestamp or trailing newline.
+// Thread-safe via shapeEventMu.
+func (s *Server) logShapeEvent(msg string) {
+	if s == nil {
+		return
+	}
+	s.shapeEventMu.Lock()
+	defer s.shapeEventMu.Unlock()
+	if s.shapeEventOut == nil {
+		return
+	}
+	line := time.Now().UTC().Format("2006-01-02T15:04:05.000Z") + " " + msg + "\n"
+	_, _ = s.shapeEventOut.WriteString(line)
+}
+
 func defaultConnHandler(ctx context.Context, conn net.Conn, destination string) {
 	defer conn.Close()
 	safeIntAdd(tunnelsTCPOpened, 1)

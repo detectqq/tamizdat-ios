@@ -41,7 +41,7 @@ func (m ShapeMode) String() string {
 	case ShapeLite:
 		return "lite"
 	case ShapeFull:
-		return "full"
+		return "bulk"
 	default:
 		return "unknown"
 	}
@@ -115,6 +115,10 @@ type RealtimeDetectorConfig struct {
 	IdleReleaseAge   time.Duration // default 30s
 	EndpointCacheTTL time.Duration // default 60s
 	JitterAlphaInv   int           // default 16, RFC 3550 EWMA denominator
+	// RTDemoteAge is the minimum age a CONFIRMED_RT flow must reach before it
+	// can demote back to PROVISIONAL_BULK on a low score. Default 30s.
+	// Audit #11: previously hard-coded as a literal in transitionState.
+	RTDemoteAge time.Duration
 
 	// Tier 1 weights, Q8.8 fixed-point.
 	StunScoreQ8            int16
@@ -143,6 +147,33 @@ type RealtimeDetectorConfig struct {
 	UdpPriorScoreQ4         int8
 	TcpBulkPortScoreQ4      int8
 
+	// Per-score "explicitly set" flags. Audit #4: previously
+	// fillRealtimeDefaults treated zero as unset, which silently re-applied
+	// the default and prevented operators from disabling a tier-1 signal by
+	// setting its score to 0. When the corresponding XScoreSet bool is true,
+	// fillRealtimeDefaults preserves the configured value (including zero).
+	StunScoreQ8Set             bool
+	TurnChannelDataScoreQ8Set  bool
+	DtlsHandshakeScoreQ8Set    bool
+	DtlsAppDataScoreQ8Set      bool
+	RtpCandidateScoreQ8Set     bool
+	RtpConfirmedScoreQ8Set     bool
+	RtcpScoreQ8Set             bool
+	QuicLongHeaderScoreQ8Set   bool
+	TlsLargeAppDataScoreQ8Set  bool
+	SmoothWindowScoreQ8Set     bool
+	OpusBonusScoreQ8Set        bool
+	SmallPktScoreQ8Set         bool
+	MtuBulkScoreQ8Set          bool
+	DirSymmetryScoreQ8Set      bool
+	DirAsymmetryScoreQ8Set     bool
+	CadenceBreakScoreQ8Set     bool
+	AppHintScoreQ4Set          bool
+	KnownPortScoreQ4Set        bool
+	EndpointCacheHitScoreQ4Set bool
+	UdpPriorScoreQ4Set         bool
+	TcpBulkPortScoreQ4Set      bool
+
 	// MaxConcurrentFlows caps detector state; 0 disables the cap.
 	MaxConcurrentFlows int
 	// LegacyPortPromote preserves v1 ClassifyOpen behavior for known ports,
@@ -164,6 +195,32 @@ type RealtimeDetectorConfig struct {
 	MigrationDebounceWindow      time.Duration
 	MigrationWindowByteThreshold uint32
 	MigrationCumulativeFloor     uint64
+
+	// RateStickyLockMinPPS — Plan B+ rate-based stickylock: a UDP flow that
+	// sustains >= this packet rate (over its lifetime past RateStickyLockMinAge)
+	// AND has avg packet size <= RateStickyLockMaxAvgPktSize is treated as
+	// realtime (RakNet game traffic, ENet, Steam Networking, etc.) and
+	// stickylock-fires the V1 valve. 0 disables this path entirely.
+	// Default: 30 pps.
+	RateStickyLockMinPPS uint32
+	// RateStickyLockMinAge — minimum flow age before rate-stickylock can fire.
+	// Gives the rate computation a meaningful denominator + lets the existing
+	// RTP-payload-stickylock have first crack on RTP flows. Default: 1s.
+	RateStickyLockMinAge time.Duration
+	// RateStickyLockMaxAvgPktSize — flows with avg packet size above this
+	// are NOT rate-stickylocked even if pps >= MinPPS. Filters out QUIC
+	// large transfers, video bulk-over-UDP, etc. Default: 1000 bytes.
+	RateStickyLockMaxAvgPktSize uint32
+	// RateStickyLockHoldDown — once a flow is rate-locked, we refuse to
+	// unlock-on-decay for this long. Prevents lite/bulk oscillation when
+	// rate hovers near MinPPS. Default 5s.
+	RateStickyLockHoldDown time.Duration
+
+	// Realtime detector v2 classifier knobs. Zero means default.
+	ClassifierLockScore       int8
+	ClassifierMaxPktRT        uint16
+	ClassifierIATCV2MaxX10000 uint32
+	ClassifierWindowNeeded    uint8
 }
 
 type Direction uint8
@@ -213,6 +270,46 @@ const (
 	flagTCP          uint8 = 1 << 2
 	flagIdleReleased uint8 = 1 << 3
 	flagLiteLocked   uint8 = 1 << 4
+	flagBulkLocked   uint8 = 1 << 6
+	flagInCooling    uint8 = 1 << 7
+)
+
+const (
+	POS_RTP       uint8 = 0x01
+	POS_RTCP      uint8 = 0x02
+	POS_STUN      uint8 = 0x04
+	POS_TURN_DATA uint8 = 0x08
+	POS_RAKNET    uint8 = 0x10
+	POS_SRCENG    uint8 = 0x20
+	POS_DTLS      uint8 = 0x40
+
+	NEG_QUIC_LONG uint8 = 0x01
+	NEG_NTP       uint8 = 0x02
+	NEG_DNS       uint8 = 0x04
+	NEG_LARGE     uint8 = 0x08
+	NEG_QUIC_CID  uint8 = 0x10
+	NEG_STREAM    uint8 = 0x20
+	NEG_MDNS      uint8 = 0x40
+)
+
+const (
+	LOCK_SCORE         = 60
+	UNLOCK_SCORE       = 20
+	BULK_SCORE         = -30
+	PPS_MIN_RT_MX      = 18_000
+	PPS_MAX_RT_MX      = 200_000
+	AVG_SIZE_RT_MAX    = 500
+	MAX_PKT_RT         = 900
+	MAX_PKT_HARD_BULK  = 1200
+	IAT_MIN_RT         = 30
+	IAT_MAX_RT         = 500
+	IAT_CV2_MAX_X10000 = 3600
+	WIN_NS             = 200_000_000
+	WIN_NEEDED         = 3
+	COOLING_QUIET_NS   = 2_000_000_000
+	SYMM_MIN_RATIO_PCT = 25
+	ASYMM_HARD_PCT     = 10
+	CID_MATCH_LOCK     = 4
 )
 
 const (
@@ -271,6 +368,24 @@ type flowState struct {
 	windowStartNS int64
 	totalBytes    uint64
 
+	// Rate-stickylock sliding window state. Updated in
+	// applyPlanBRateStickyLockLocked. Window length = cfg.RateStickyLockMinAge.
+	rateWinStartNS    int64
+	rateWinStartPkts  uint16
+	rateWinStartBytes uint32
+	lockedAtNS        int64 // time of most recent lock-on-rise; used for unlock hold-down
+
+	cidHash       uint32
+	maxPktSize    uint16
+	clsSmoothWins uint8
+	clsFailedWins uint8
+	score         int8
+	posFlags      uint8
+	negFlags      uint8
+	bigPkts       uint8
+	smallPkts     uint8
+	cidMatch      uint8
+
 	iatRing  [16]uint16
 	sizeRing [16]uint16
 	ringHead uint8
@@ -309,6 +424,14 @@ type pendingOpen struct {
 	st       flowState
 	endpoint endpointInfo
 	created  time.Time
+}
+
+// flowToken is an opaque handle returned by ClassifyOpenWithToken and consumed
+// by RealtimeController.OpenWithToken. It uniquely identifies one pending
+// flow-state record so that bindOpen retrieves the correct entry even when
+// multiple goroutines interleave Open calls (audit finding #1).
+type flowToken struct {
+	id uint64
 }
 
 const forceBulkCacheTTL = 5 * time.Minute
@@ -360,14 +483,22 @@ type RealtimeDetector struct {
 	flowEndpoints  map[uint64]endpointInfo
 	flowOrder      []uint64
 	flowOrderHead  int
-	pending        []pendingOpen
+	pendingByID    map[uint64]pendingOpen
+	nextPendingID  uint64
 	endpointByHost map[string]int64
 	endpointByPref map[uint32]int64
 	controller     *RealtimeController
 	cleanupStarted sync.Once
+	stopOnce       sync.Once
+	stop           chan struct{}
 
 	forceBulkCache    sync.Map // string(canonical dst) -> forceBulkEntry
 	migrationDispatch sync.Map // uint64(flowID) -> *migrationHandle
+
+	// Tier 2.5 fix: lockedFlows tracks flows with flagLiteLocked set
+	// (RTP-stickylocked = real realtime traffic, NOT default-promoted UDP).
+	// V1 valve toggle wires to this so it only opens for real RTP/RTCP/STUN.
+	lockedFlows atomic.Int32
 }
 
 func newRealtimeDetector() *RealtimeDetector {
@@ -402,6 +533,7 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 		BulkConfirmAge:               5 * time.Second,
 		IdleReleaseAge:               30 * time.Second,
 		EndpointCacheTTL:             60 * time.Second,
+		RTDemoteAge:                  30 * time.Second,
 		JitterAlphaInv:               16,
 		StunScoreQ8:                  115,
 		TurnChannelDataScoreQ8:       102,
@@ -433,6 +565,14 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 		MigrationDebounceWindow:      1500 * time.Millisecond,
 		MigrationWindowByteThreshold: 384 * 1024,
 		MigrationCumulativeFloor:     10 * 1024 * 1024,
+		RateStickyLockMinPPS:         20,
+		RateStickyLockMinAge:         200 * time.Millisecond,
+		RateStickyLockMaxAvgPktSize:  600,
+		RateStickyLockHoldDown:       5 * time.Second,
+		ClassifierLockScore:          LOCK_SCORE,
+		ClassifierMaxPktRT:           MAX_PKT_RT,
+		ClassifierIATCV2MaxX10000:    IAT_CV2_MAX_X10000,
+		ClassifierWindowNeeded:       WIN_NEEDED,
 	}
 }
 
@@ -462,8 +602,10 @@ func newRealtimeDetectorWithConfig(cfg RealtimeDetectorConfig) *RealtimeDetector
 		tightJitterPermille:  300,
 		flows:                make(map[uint64]*flowState),
 		flowEndpoints:        make(map[uint64]endpointInfo),
+		pendingByID:          make(map[uint64]pendingOpen),
 		endpointByHost:       make(map[string]int64),
 		endpointByPref:       make(map[uint32]int64),
+		stop:                 make(chan struct{}),
 	}
 	return d
 }
@@ -515,70 +657,73 @@ func fillRealtimeDefaults(cfg RealtimeDetectorConfig) RealtimeDetectorConfig {
 	if cfg.EndpointCacheTTL <= 0 {
 		cfg.EndpointCacheTTL = def.EndpointCacheTTL
 	}
+	if cfg.RTDemoteAge <= 0 {
+		cfg.RTDemoteAge = def.RTDemoteAge
+	}
 	if cfg.JitterAlphaInv <= 0 {
 		cfg.JitterAlphaInv = def.JitterAlphaInv
 	}
-	if cfg.StunScoreQ8 == 0 {
+	if !cfg.StunScoreQ8Set && cfg.StunScoreQ8 == 0 {
 		cfg.StunScoreQ8 = def.StunScoreQ8
 	}
-	if cfg.TurnChannelDataScoreQ8 == 0 {
+	if !cfg.TurnChannelDataScoreQ8Set && cfg.TurnChannelDataScoreQ8 == 0 {
 		cfg.TurnChannelDataScoreQ8 = def.TurnChannelDataScoreQ8
 	}
-	if cfg.DtlsHandshakeScoreQ8 == 0 {
+	if !cfg.DtlsHandshakeScoreQ8Set && cfg.DtlsHandshakeScoreQ8 == 0 {
 		cfg.DtlsHandshakeScoreQ8 = def.DtlsHandshakeScoreQ8
 	}
-	if cfg.DtlsAppDataScoreQ8 == 0 {
+	if !cfg.DtlsAppDataScoreQ8Set && cfg.DtlsAppDataScoreQ8 == 0 {
 		cfg.DtlsAppDataScoreQ8 = def.DtlsAppDataScoreQ8
 	}
-	if cfg.RtpCandidateScoreQ8 == 0 {
+	if !cfg.RtpCandidateScoreQ8Set && cfg.RtpCandidateScoreQ8 == 0 {
 		cfg.RtpCandidateScoreQ8 = def.RtpCandidateScoreQ8
 	}
-	if cfg.RtpConfirmedScoreQ8 == 0 {
+	if !cfg.RtpConfirmedScoreQ8Set && cfg.RtpConfirmedScoreQ8 == 0 {
 		cfg.RtpConfirmedScoreQ8 = def.RtpConfirmedScoreQ8
 	}
-	if cfg.RtcpScoreQ8 == 0 {
+	if !cfg.RtcpScoreQ8Set && cfg.RtcpScoreQ8 == 0 {
 		cfg.RtcpScoreQ8 = def.RtcpScoreQ8
 	}
-	if cfg.QuicLongHeaderScoreQ8 == 0 {
+	if !cfg.QuicLongHeaderScoreQ8Set && cfg.QuicLongHeaderScoreQ8 == 0 {
 		cfg.QuicLongHeaderScoreQ8 = def.QuicLongHeaderScoreQ8
 	}
-	if cfg.TlsLargeAppDataScoreQ8 == 0 {
+	if !cfg.TlsLargeAppDataScoreQ8Set && cfg.TlsLargeAppDataScoreQ8 == 0 {
 		cfg.TlsLargeAppDataScoreQ8 = def.TlsLargeAppDataScoreQ8
 	}
-	if cfg.SmoothWindowScoreQ8 == 0 {
+	if !cfg.SmoothWindowScoreQ8Set && cfg.SmoothWindowScoreQ8 == 0 {
 		cfg.SmoothWindowScoreQ8 = def.SmoothWindowScoreQ8
 	}
-	if cfg.OpusBonusScoreQ8 == 0 {
+	if !cfg.OpusBonusScoreQ8Set && cfg.OpusBonusScoreQ8 == 0 {
 		cfg.OpusBonusScoreQ8 = def.OpusBonusScoreQ8
 	}
-	if cfg.SmallPktScoreQ8 == 0 {
+	if !cfg.SmallPktScoreQ8Set && cfg.SmallPktScoreQ8 == 0 {
 		cfg.SmallPktScoreQ8 = def.SmallPktScoreQ8
 	}
-	if cfg.MtuBulkScoreQ8 == 0 {
+	if !cfg.MtuBulkScoreQ8Set && cfg.MtuBulkScoreQ8 == 0 {
 		cfg.MtuBulkScoreQ8 = def.MtuBulkScoreQ8
 	}
-	if cfg.DirSymmetryScoreQ8 == 0 {
+	if !cfg.DirSymmetryScoreQ8Set && cfg.DirSymmetryScoreQ8 == 0 {
 		cfg.DirSymmetryScoreQ8 = def.DirSymmetryScoreQ8
 	}
-	if cfg.DirAsymmetryScoreQ8 == 0 {
+	if !cfg.DirAsymmetryScoreQ8Set && cfg.DirAsymmetryScoreQ8 == 0 {
 		cfg.DirAsymmetryScoreQ8 = def.DirAsymmetryScoreQ8
 	}
-	if cfg.CadenceBreakScoreQ8 == 0 {
+	if !cfg.CadenceBreakScoreQ8Set && cfg.CadenceBreakScoreQ8 == 0 {
 		cfg.CadenceBreakScoreQ8 = def.CadenceBreakScoreQ8
 	}
-	if cfg.AppHintScoreQ4 == 0 {
+	if !cfg.AppHintScoreQ4Set && cfg.AppHintScoreQ4 == 0 {
 		cfg.AppHintScoreQ4 = def.AppHintScoreQ4
 	}
-	if cfg.KnownPortScoreQ4 == 0 {
+	if !cfg.KnownPortScoreQ4Set && cfg.KnownPortScoreQ4 == 0 {
 		cfg.KnownPortScoreQ4 = def.KnownPortScoreQ4
 	}
-	if cfg.EndpointCacheHitScoreQ4 == 0 {
+	if !cfg.EndpointCacheHitScoreQ4Set && cfg.EndpointCacheHitScoreQ4 == 0 {
 		cfg.EndpointCacheHitScoreQ4 = def.EndpointCacheHitScoreQ4
 	}
-	if cfg.UdpPriorScoreQ4 == 0 {
+	if !cfg.UdpPriorScoreQ4Set && cfg.UdpPriorScoreQ4 == 0 {
 		cfg.UdpPriorScoreQ4 = def.UdpPriorScoreQ4
 	}
-	if cfg.TcpBulkPortScoreQ4 == 0 {
+	if !cfg.TcpBulkPortScoreQ4Set && cfg.TcpBulkPortScoreQ4 == 0 {
 		cfg.TcpBulkPortScoreQ4 = def.TcpBulkPortScoreQ4
 	}
 	if cfg.MaxConcurrentFlows == 0 {
@@ -592,17 +737,42 @@ func fillRealtimeDefaults(cfg RealtimeDetectorConfig) RealtimeDetectorConfig {
 	if !cfg.LegacyPortPromote {
 		cfg.LegacyPortPromote = def.LegacyPortPromote
 	}
+	if cfg.ClassifierLockScore == 0 {
+		cfg.ClassifierLockScore = def.ClassifierLockScore
+	}
+	if cfg.ClassifierMaxPktRT == 0 {
+		cfg.ClassifierMaxPktRT = def.ClassifierMaxPktRT
+	}
+	if cfg.ClassifierIATCV2MaxX10000 == 0 {
+		cfg.ClassifierIATCV2MaxX10000 = def.ClassifierIATCV2MaxX10000
+	}
+	if cfg.ClassifierWindowNeeded == 0 {
+		cfg.ClassifierWindowNeeded = def.ClassifierWindowNeeded
+	}
 	// Plan B defaults are applied only by defaultRealtimeDetectorConfig(). The
 	// spec simultaneously requires default-on promotion and 0/false as disable
 	// values; preserving explicit opt-outs here is the least surprising choice.
 	return cfg
 }
 
+// q8FromFloat converts a float64 score into a Q8.8 fixed-point int16. It
+// clamps to the int16 representable range so that an operator typo (e.g.
+// PromoteScore = 200.0) cannot wrap modulo 65536 and produce a negative
+// promote threshold. Audit #12.
 func q8FromFloat(v float64) int16 {
+	var scaled float64
 	if v < 0 {
-		return int16(v*float64(q8Scale) - 0.5)
+		scaled = v*float64(q8Scale) - 0.5
+	} else {
+		scaled = v*float64(q8Scale) + 0.5
 	}
-	return int16(v*float64(q8Scale) + 0.5)
+	if scaled <= float64(int16(-32768)) {
+		return -32768
+	}
+	if scaled >= float64(int16(32767)) {
+		return 32767
+	}
+	return int16(scaled)
 }
 
 func permilleFromFloat(v float64, fallback int64) int64 {
@@ -625,14 +795,27 @@ func (d *RealtimeDetector) appHintMatch(hint string) bool {
 	return false
 }
 
+// ClassifyOpen is a backward-compatible wrapper that discards the flow token.
+// New code (production hot path) should use ClassifyOpenWithToken so that the
+// pending flow-state record can be retrieved unambiguously by bindOpen,
+// avoiding the FIFO race documented in audit finding #1.
 func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
+	class, _ := d.ClassifyOpenWithToken(meta)
+	return class
+}
+
+// ClassifyOpenWithToken classifies a candidate flow and returns both the
+// traffic class and an opaque token that callers must pass to
+// RealtimeController.OpenWithToken so bindOpen receives the correct pending
+// entry. Token is nil when no pending was recorded (e.g. forceBulk hit).
+func (d *RealtimeDetector) ClassifyOpenWithToken(meta FlowMeta) (TrafficClass, *flowToken) {
 	if d == nil {
-		return TrafficBulk
+		return TrafficBulk, nil
 	}
 	meta = normalizeFlowMeta(meta)
 	now := time.Now()
 	if d.forceBulkClassify(meta, now) {
-		return TrafficBulk
+		return TrafficBulk, nil
 	}
 	st := newFlowStateForMeta(meta, now)
 	endpoint := endpointFromMeta(meta)
@@ -646,10 +829,10 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 		st.lastInterNS = nowNS
 		d.planBPromotes.Add(1)
 		d.mu.Lock()
-		d.enqueuePendingLocked(pendingOpen{st: st, endpoint: endpoint, created: now})
+		token := d.enqueuePendingLocked(pendingOpen{st: st, endpoint: endpoint, created: now})
 		d.rememberEndpointLocked(endpoint, now)
 		d.mu.Unlock()
-		return TrafficRealtime
+		return TrafficRealtime, token
 	}
 	knownPort := d.hasRealtimePort(meta.Port)
 	appHint := d.appHintMatch(meta.AppHint)
@@ -673,12 +856,12 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 	}
 
 	d.mu.Lock()
-	d.enqueuePendingLocked(pendingOpen{st: st, endpoint: endpoint, created: now})
+	token := d.enqueuePendingLocked(pendingOpen{st: st, endpoint: endpoint, created: now})
 	if st.state == flowStateConfirmedRT || score >= d.promoteQ8 {
 		d.rememberEndpointLocked(endpoint, now)
 	}
 	d.mu.Unlock()
-	return class
+	return class, token
 }
 
 func (d *RealtimeDetector) planBDefaultPromoteOpen(meta FlowMeta) bool {
@@ -782,10 +965,13 @@ func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	if st.lastInterNS == 0 {
 		st.lastInterNS = nowNS
 	}
-	migrationReq := d.accountMigrationBytesLocked(p.FlowID, st, p, nowNS)
+	migrationReq, deferredLog := d.accountMigrationBytesLocked(p.FlowID, st, p, nowNS)
 	if st.state == flowStateConfirmedBulk {
 		st.lastSeenNS = nowNS
 		d.mu.Unlock()
+		if deferredLog != nil {
+			d.logMigrationAttempt(deferredLog.flowID, deferredLog.dst, deferredLog.windowBytes, deferredLog.totalBytes, 0, deferredLog.outcome)
+		}
 		if migrationReq != nil {
 			go d.runMigration(migrationReq)
 		}
@@ -825,6 +1011,9 @@ func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	releaseActive := wasConfirmedRT && st.state != flowStateConfirmedRT
 	controller := d.controller
 	d.mu.Unlock()
+	if deferredLog != nil {
+		d.logMigrationAttempt(deferredLog.flowID, deferredLog.dst, deferredLog.windowBytes, deferredLog.totalBytes, 0, deferredLog.outcome)
+	}
 	if migrationReq != nil {
 		go d.runMigration(migrationReq)
 	}
@@ -864,6 +1053,12 @@ func (d *RealtimeDetector) observePacketLocked(st *flowState, p ObservedPacket) 
 	}
 
 	if !st.isTCP() {
+		if st.lastSeenNS != 0 && nowNS > st.lastSeenNS {
+			iatUnits := durationTo100us(time.Duration(nowNS - st.lastSeenNS))
+			st.writeRing(iatUnits, uint16(size))
+		} else {
+			st.writeSizeOnly(uint16(size))
+		}
 		d.applyPlanBPacketControlsLocked(st, p.Payload, p.Size, nowNS)
 	}
 
@@ -872,12 +1067,6 @@ func (d *RealtimeDetector) observePacketLocked(st *flowState, p ObservedPacket) 
 	}
 
 	if !st.isTCP() {
-		if st.lastSeenNS != 0 && nowNS > st.lastSeenNS {
-			iatUnits := durationTo100us(time.Duration(nowNS - st.lastSeenNS))
-			st.writeRing(iatUnits, uint16(size))
-		} else {
-			st.writeSizeOnly(uint16(size))
-		}
 		window := d.windowSize()
 		if window > 0 && int(st.pkts) >= window && int(st.pkts)%window == 0 {
 			d.recomputeTier2(st)
@@ -886,25 +1075,487 @@ func (d *RealtimeDetector) observePacketLocked(st *flowState, p ObservedPacket) 
 		_ = dirIdx
 	}
 	st.lastSeenNS = nowNS
+	d.sweepRateLockOnIdleFlowsLocked(nowNS)
 }
 
 func (d *RealtimeDetector) applyPlanBRTPStickyLockLocked(st *flowState, payload []byte) {
-	if st == nil {
+	if st == nil || len(payload) == 0 {
 		return
 	}
-	if len(payload) > 0 && payload[0]&0xc0 == 0x80 {
-		if st.flags&flagLiteLocked == 0 {
-			st.flags |= flagLiteLocked
-			d.planBLockins.Add(1)
+	nowNS := st.lastSeenNS
+	if nowNS == 0 {
+		nowNS = time.Now().UnixNano()
+	}
+	d.applyClassifierLocked(st, payload, -len(payload), nowNS)
+}
+
+var rateStickyLockEnabled = true
+
+func SetRateStickyLockEnabled(on bool) { rateStickyLockEnabled = on }
+
+func RateStickyLockEnabled() bool { return rateStickyLockEnabled }
+
+func (d *RealtimeDetector) applyPlanBRateStickyLockLocked(st *flowState, nowNS int64) {
+	if st == nil || !rateStickyLockEnabled {
+		return
+	}
+	d.applyClassifierLocked(st, nil, 0, nowNS)
+}
+
+func (d *RealtimeDetector) classifierLockScore() int {
+	if d != nil && d.cfg.ClassifierLockScore != 0 {
+		return int(d.cfg.ClassifierLockScore)
+	}
+	return LOCK_SCORE
+}
+
+func (d *RealtimeDetector) classifierMaxPktRT() uint16 {
+	if d != nil && d.cfg.ClassifierMaxPktRT != 0 {
+		return d.cfg.ClassifierMaxPktRT
+	}
+	return MAX_PKT_RT
+}
+
+func (d *RealtimeDetector) classifierIATCV2MaxX10000() uint64 {
+	if d != nil && d.cfg.ClassifierIATCV2MaxX10000 != 0 {
+		return uint64(d.cfg.ClassifierIATCV2MaxX10000)
+	}
+	return IAT_CV2_MAX_X10000
+}
+
+func (d *RealtimeDetector) classifierWindowNeeded() uint8 {
+	if d != nil && d.cfg.ClassifierWindowNeeded != 0 {
+		return d.cfg.ClassifierWindowNeeded
+	}
+	return WIN_NEEDED
+}
+
+func (d *RealtimeDetector) lockLiteLocked(st *flowState, nowNS int64) {
+	if d == nil || st == nil || st.flags&flagBulkLocked != 0 {
+		return
+	}
+	if st.flags&flagLiteLocked == 0 {
+		st.flags |= flagLiteLocked
+		d.planBLockins.Add(1)
+		newCount := d.lockedFlows.Add(1)
+		if newCount == 1 && d.controller != nil {
+			ctrl := d.controller
+			go ctrl.notifyLockedOpen()
 		}
+	}
+	st.flags &^= flagInCooling
+	st.lockedAtNS = nowNS
+	st.rateWinStartNS = nowNS
+	st.rateWinStartPkts = st.pkts
+	st.rateWinStartBytes = satAddUint32(st.bytesUp, st.bytesDown)
+}
+
+func (d *RealtimeDetector) unlockLiteLocked(st *flowState) {
+	if d == nil || st == nil || st.flags&flagLiteLocked == 0 {
+		return
+	}
+	st.flags &^= flagLiteLocked | flagInCooling
+	newCount := d.lockedFlows.Add(-1)
+	if newCount == 0 && d.controller != nil {
+		ctrl := d.controller
+		go ctrl.notifyLockedReturnToFull()
 	}
 }
 
-func (d *RealtimeDetector) accountMigrationBytesLocked(flowID uint64, st *flowState, p ObservedPacket, nowNS int64) *migrationRequest {
-	if d == nil || st == nil || st.isTCP() || flowID == 0 {
-		return nil
+func (d *RealtimeDetector) bulkLockLocked(st *flowState) {
+	if st == nil {
+		return
 	}
-	d.applyPlanBRTPStickyLockLocked(st, p.Payload)
+	if st.flags&flagLiteLocked != 0 {
+		d.unlockLiteLocked(st)
+	}
+	st.flags |= flagBulkLocked
+	st.flags &^= flagInCooling
+}
+
+func (d *RealtimeDetector) applyClassifierLocked(st *flowState, payload []byte, size int, nowNS int64) {
+	if d == nil || st == nil || st.isTCP() {
+		return
+	}
+	packetSize := size
+	signatureOnly := false
+	updateSize := size > 0
+	if packetSize < 0 {
+		signatureOnly = true
+		updateSize = false
+		packetSize = -packetSize
+	}
+	if packetSize == 0 && len(payload) > 0 {
+		packetSize = len(payload)
+	}
+	if packetSize > 65535 {
+		packetSize = 65535
+	}
+	n := uint16(packetSize)
+	if updateSize {
+		if n > st.maxPktSize {
+			st.maxPktSize = n
+		}
+		if n > d.classifierMaxPktRT() && st.bigPkts < 255 {
+			st.bigPkts++
+		}
+		if n <= 200 && st.smallPkts < 255 {
+			st.smallPkts++
+		}
+	}
+
+	if st.flags&flagBulkLocked != 0 {
+		return
+	}
+	if st.flags&flagLiteLocked != 0 && st.flags&flagInCooling == 0 {
+		holdDown := int64(d.cfg.RateStickyLockHoldDown)
+		if holdDown > 0 && nowNS-st.lockedAtNS < holdDown {
+			return
+		}
+		st.flags |= flagInCooling
+	}
+
+	d.applyPayloadSignatures(st, payload, n, !signatureOnly)
+	if st.negFlags&^NEG_LARGE != 0 {
+		d.bulkLockLocked(st)
+		return
+	}
+	if st.posFlags != 0 && st.flags&flagLiteLocked == 0 {
+		d.lockLiteLocked(st, nowNS)
+		return
+	}
+	if signatureOnly || !rateStickyLockEnabled {
+		return
+	}
+
+	if st.rateWinStartNS == 0 {
+		d.rollClassifierWindowLocked(st, nowNS)
+		return
+	}
+	if st.pkts < 8 || nowNS-st.openTimeNS < WIN_NS {
+		return
+	}
+	if nowNS-st.rateWinStartNS < WIN_NS && st.flags&flagInCooling == 0 {
+		return
+	}
+
+	s := d.evaluateWindow(st, nowNS)
+	if st.score == 0 {
+		st.score = clampI8(s)
+	} else {
+		st.score = clampI8((int(st.score)*3 + s) / 4)
+	}
+	lockScore := d.classifierLockScore()
+
+	if st.flags&flagInCooling != 0 {
+		idleNS := nowNS - st.lastSeenNS
+		if int(st.score) < UNLOCK_SCORE && (idleNS >= COOLING_QUIET_NS || d.windowPpsMX(st, nowNS) < 10_000) {
+			d.unlockLiteLocked(st)
+		} else if int(st.score) >= lockScore {
+			st.flags &^= flagInCooling
+			st.lockedAtNS = nowNS
+		}
+		d.rollClassifierWindowLocked(st, nowNS)
+		return
+	}
+
+	if s >= lockScore/2 {
+		if st.clsSmoothWins < 255 {
+			st.clsSmoothWins++
+		}
+		st.clsFailedWins = 0
+	} else {
+		if st.clsFailedWins < 255 {
+			st.clsFailedWins++
+		}
+		if st.clsSmoothWins > 0 {
+			st.clsSmoothWins--
+		}
+	}
+
+	if int(st.score) >= lockScore && st.clsSmoothWins >= d.classifierWindowNeeded() {
+		d.lockLiteLocked(st, nowNS)
+	} else if int(st.score) <= BULK_SCORE && (st.clsFailedWins >= 5 || st.negFlags&NEG_LARGE != 0) {
+		d.bulkLockLocked(st)
+	}
+	d.rollClassifierWindowLocked(st, nowNS)
+}
+
+func (d *RealtimeDetector) applyClassifierSignatureOnly(st *flowState, payload []byte) {
+	if d == nil || st == nil || st.isTCP() || st.flags&flagBulkLocked != 0 {
+		return
+	}
+	packetSize := len(payload)
+	if packetSize > 65535 {
+		packetSize = 65535
+	}
+	d.applyPayloadSignatures(st, payload, uint16(packetSize), false)
+}
+
+func (d *RealtimeDetector) applyPayloadSignatures(st *flowState, payload []byte, n uint16, updateSoftScore bool) {
+	if st == nil || len(payload) < 4 {
+		return
+	}
+	b0 := payload[0]
+
+	if n >= 12 && n <= 1500 && validRTPCandidate(payload) {
+		st.posFlags |= POS_RTP
+	}
+	if looksLikeRTCP(payload) {
+		st.posFlags |= POS_RTCP
+	}
+	if n >= 20 && b0&0xc0 == 0x00 && len(payload) >= 8 &&
+		payload[4] == 0x21 && payload[5] == 0x12 && payload[6] == 0xa4 && payload[7] == 0x42 {
+		st.posFlags |= POS_STUN
+	}
+	if b0&0xc0 == 0x40 && n >= 9 && len(payload) >= 9 {
+		h := fnv32a(payload[1:9])
+		if st.cidHash == 0 {
+			st.cidHash = h
+		} else if st.cidHash == h {
+			if st.cidMatch < 255 {
+				st.cidMatch++
+			}
+			if st.cidMatch >= CID_MATCH_LOCK && st.maxPktSize > d.classifierMaxPktRT() {
+				st.negFlags |= NEG_QUIC_CID
+			}
+		} else {
+			st.cidHash = h
+			st.cidMatch = 0
+		}
+	}
+	if looksLikeTURNChannelDataStrict(payload, n) && st.cidMatch < 3 && n <= d.classifierMaxPktRT() {
+		st.posFlags |= POS_TURN_DATA
+	}
+	if looksLikeQUICLongHeader(payload) {
+		st.negFlags |= NEG_QUIC_LONG
+	}
+	if n >= 13 && looksLikeDTLSRecord(payload, 0x16, 0x17) {
+		st.posFlags |= POS_DTLS
+	}
+	if n >= 17 && len(payload) >= 9 && payload[1] == 0x00 && payload[2] == 0xff &&
+		payload[3] == 0xff && payload[4] == 0x00 && payload[5] == 0xfe &&
+		payload[6] == 0xfe && payload[7] == 0xfe && payload[8] == 0xfe {
+		st.posFlags |= POS_RAKNET
+	}
+	if updateSoftScore && (b0 == 0xc0 || b0 == 0xa0 || (b0 >= 0x80 && b0 <= 0x8d)) && n >= 4 {
+		if st.score <= 95 {
+			st.score += 5
+		} else {
+			st.score = 100
+		}
+	}
+	if n >= 4 && payload[0] == 0xff && payload[1] == 0xff && payload[2] == 0xff &&
+		(payload[3] == 0xff || payload[3] == 0xfe) {
+		st.posFlags |= POS_SRCENG
+	}
+	if n == 48 && (b0 == 0x1b || b0 == 0x23 || b0 == 0x24 || b0 == 0xe3) {
+		st.negFlags |= NEG_NTP
+	}
+	if n >= 12 && n <= 512 && len(payload) >= 12 {
+		flags := binary.BigEndian.Uint16(payload[2:4])
+		qd := binary.BigEndian.Uint16(payload[4:6])
+		opcode := (flags >> 11) & 0x0f
+		if qd == 1 && opcode == 0 && flags&0x0070 == 0 {
+			st.negFlags |= NEG_DNS
+		}
+	}
+	if n > MAX_PKT_HARD_BULK && st.bigPkts >= 3 {
+		st.negFlags |= NEG_LARGE
+	}
+}
+
+func (d *RealtimeDetector) evaluateWindow(st *flowState, nowNS int64) int {
+	if st == nil || st.ringLen < 8 {
+		return 0
+	}
+	n := st.ringLen
+	var sum, sumSq uint64
+	for i := uint8(0); i < n; i++ {
+		idx := (int(st.ringHead) + 16 - 1 - int(i)) & 15
+		v := uint64(st.iatRing[idx])
+		sum += v
+		sumSq += v * v
+	}
+	mean := sum / uint64(n)
+	if mean == 0 {
+		mean = 1
+	}
+	variance := uint64(0)
+	if sumSq/uint64(n) > mean*mean {
+		variance = sumSq/uint64(n) - mean*mean
+	}
+	cvLow := variance*10000 < mean*mean*d.classifierIATCV2MaxX10000()
+
+	elapsed := uint64(nowNS - st.rateWinStartNS)
+	if elapsed == 0 {
+		elapsed = 1
+	}
+	wpkts := uint64(st.pkts - st.rateWinStartPkts)
+	ppsMX := wpkts * 1_000_000_000_000 / elapsed
+	totalBytes := satAddUint32(st.bytesUp, st.bytesDown)
+	var wbytes uint64
+	if totalBytes >= st.rateWinStartBytes {
+		wbytes = uint64(totalBytes - st.rateWinStartBytes)
+	}
+	avgSize := uint64(0)
+	if wpkts > 0 {
+		avgSize = wbytes / wpkts
+	}
+
+	score := 0
+	if ppsMX >= PPS_MIN_RT_MX && ppsMX <= PPS_MAX_RT_MX {
+		score += 20
+	}
+	if avgSize <= AVG_SIZE_RT_MAX {
+		score += 15
+	}
+	if st.maxPktSize <= d.classifierMaxPktRT() {
+		score += 15
+	}
+	if st.maxPktSize > MAX_PKT_HARD_BULK {
+		score -= 30
+	}
+	if cvLow {
+		score += 25
+	}
+	if cvLow && mean >= IAT_MIN_RT && mean <= IAT_MAX_RT {
+		score += 10
+	}
+	if st.pktsIn > 0 && st.pktsOut > 0 {
+		a, b := uint32(st.pktsIn), uint32(st.pktsOut)
+		if a > b {
+			a, b = b, a
+		}
+		if a*100 >= b*SYMM_MIN_RATIO_PCT {
+			score += 10
+		}
+		if a*100 < b*ASYMM_HARD_PCT {
+			score -= 10
+		}
+	}
+	if st.bigPkts >= 3 {
+		score -= 20
+	}
+	if st.smallPkts*2 < st.bigPkts {
+		score -= 15
+	}
+	return score
+}
+
+func (d *RealtimeDetector) windowPpsMX(st *flowState, nowNS int64) uint64 {
+	if st == nil || nowNS <= st.rateWinStartNS {
+		return 0
+	}
+	elapsed := uint64(nowNS - st.rateWinStartNS)
+	if elapsed == 0 {
+		return 0
+	}
+	return uint64(st.pkts-st.rateWinStartPkts) * 1_000_000_000_000 / elapsed
+}
+
+func (d *RealtimeDetector) rollClassifierWindowLocked(st *flowState, nowNS int64) {
+	if st == nil {
+		return
+	}
+	st.rateWinStartNS = nowNS
+	st.rateWinStartPkts = st.pkts
+	st.rateWinStartBytes = satAddUint32(st.bytesUp, st.bytesDown)
+}
+
+func clampI8(v int) int8 {
+	if v > 100 {
+		return 100
+	}
+	if v < -100 {
+		return -100
+	}
+	return int8(v)
+}
+
+func fnv32a(b []byte) uint32 {
+	h := uint32(0x811c9dc5)
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 0x01000193
+	}
+	return h
+}
+
+// sweepRateLockOnIdleFlowsLocked is called periodically from observe paths to
+// give silent (zero-traffic-since-window-start) locked flows a chance to
+// unlock. Without this, a flow that was locked then went completely silent
+// would never roll its window — its observe handler is no longer being called.
+// Pre-condition: caller holds d.mu.
+func (d *RealtimeDetector) sweepRateLockOnIdleFlowsLocked(nowNS int64) {
+	if d == nil || d.lockedFlows.Load() == 0 {
+		return
+	}
+	if !rateStickyLockEnabled || d.cfg.RateStickyLockMinPPS == 0 {
+		return
+	}
+	windowNS := int64(d.cfg.RateStickyLockMinAge)
+	if windowNS <= 0 {
+		return
+	}
+	var released int32
+	for _, st := range d.flows {
+		if st == nil || st.flags&flagLiteLocked == 0 {
+			continue
+		}
+		if st.rateWinStartNS == 0 {
+			continue
+		}
+		elapsedNS := nowNS - st.rateWinStartNS
+		if elapsedNS < windowNS {
+			continue
+		}
+		windowPkts := uint32(st.pkts - st.rateWinStartPkts)
+		elapsedSec := float64(elapsedNS) / float64(time.Second)
+		var pps float64
+		if elapsedSec > 0 {
+			pps = float64(windowPkts) / elapsedSec
+		}
+		if pps >= float64(d.cfg.RateStickyLockMinPPS) {
+			continue
+		}
+		holdDown := int64(d.cfg.RateStickyLockHoldDown)
+		if holdDown > 0 && nowNS-st.lockedAtNS < holdDown {
+			continue // still inside hold-down — don't release yet
+		}
+		st.flags &^= flagLiteLocked | flagInCooling
+		released++
+		st.rateWinStartNS = nowNS
+		st.rateWinStartPkts = st.pkts
+		st.rateWinStartBytes = satAddUint32(st.bytesUp, st.bytesDown)
+	}
+	if released == 0 {
+		return
+	}
+	newCount := d.lockedFlows.Add(-released)
+	if newCount == 0 && d.controller != nil {
+		ctrl := d.controller
+		go ctrl.notifyLockedReturnToFull()
+	}
+}
+
+// pendingMigrationLog captures fields the caller will log AFTER d.mu.Unlock.
+// Audit #8: log.Printf inside hot-path Observe under d.mu blocked all
+// observers when stderr was slow. Callers emit deferredLog via
+// flushMigrationLogs once d.mu is released.
+type pendingMigrationLog struct {
+	flowID      uint64
+	dst         string
+	windowBytes uint32
+	totalBytes  uint64
+	outcome     string
+}
+
+func (d *RealtimeDetector) accountMigrationBytesLocked(flowID uint64, st *flowState, p ObservedPacket, nowNS int64) (*migrationRequest, *pendingMigrationLog) {
+	if d == nil || st == nil || st.isTCP() || flowID == 0 {
+		return nil, nil
+	}
+	d.applyClassifierSignatureOnly(st, p.Payload)
 	size := p.Size
 	if size < 0 {
 		size = 0
@@ -914,7 +1565,7 @@ func (d *RealtimeDetector) accountMigrationBytesLocked(flowID uint64, st *flowSt
 	window := d.cfg.MigrationDebounceWindow
 	threshold := d.cfg.MigrationWindowByteThreshold
 	if window <= 0 || threshold == 0 {
-		return nil
+		return nil, nil
 	}
 	if st.windowStartNS == 0 || nowNS < st.windowStartNS || time.Duration(nowNS-st.windowStartNS) > window {
 		st.windowStartNS = nowNS
@@ -923,56 +1574,48 @@ func (d *RealtimeDetector) accountMigrationBytesLocked(flowID uint64, st *flowSt
 		st.windowByteSum = satAddUint32(st.windowByteSum, size32)
 	}
 	if st.windowByteSum < threshold {
-		return nil
+		return nil, nil
 	}
 	windowBytes := st.windowByteSum
 	totalBytes := st.totalBytes
 	dst := ""
 	if !d.cfg.MigrationEnabled {
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_disabled")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_disabled"}
 	}
 	if st.flags&flagLiteLocked != 0 {
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_rtp_locked")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_rtp_locked"}
 	}
 	if st.migrated || st.migrating {
-		return nil
+		return nil, nil
 	}
 	v, ok := d.migrationDispatch.Load(flowID)
 	if !ok {
 		d.migrationSkippedNoHandle.Add(1)
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_no_handle")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_no_handle"}
 	}
 	h, ok := v.(*migrationHandle)
 	if !ok || h == nil {
 		d.migrationSkippedNoHandle.Add(1)
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_no_handle")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_no_handle"}
 	}
 	dst = h.dstAddr
 	if !h.originalTransportLite {
 		d.migrationSkippedV1.Add(1)
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_v1_single_transport")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_v1_single_transport"}
 	}
 	if totalBytes < d.cfg.MigrationCumulativeFloor {
 		d.migrationSkippedFloor.Add(1)
-		d.logMigrationAttempt(flowID, dst, windowBytes, totalBytes, 0, "skipped_below_floor")
-		return nil
+		return nil, &pendingMigrationLog{flowID, dst, windowBytes, totalBytes, "skipped_below_floor"}
 	}
 	st.migrating = true
-	return &migrationRequest{flowID: flowID, dstAddr: dst, windowBytes: windowBytes, totalBytes: totalBytes}
+	return &migrationRequest{flowID: flowID, dstAddr: dst, windowBytes: windowBytes, totalBytes: totalBytes}, nil
 }
 
 func (d *RealtimeDetector) applyPlanBPacketControlsLocked(st *flowState, payload []byte, size int, nowNS int64) {
 	if st == nil || st.isTCP() {
 		return
 	}
-	// ORDER MATTERS per spec: a single RTP/RTCP version byte locks the flow
-	// before the same packet can be evaluated by the anti-bulk rate cap.
-	d.applyPlanBRTPStickyLockLocked(st, payload)
+	d.applyClassifierLocked(st, payload, size, nowNS)
 	if st.flags&flagLiteLocked != 0 {
 		return
 	}
@@ -1383,6 +2026,10 @@ func (d *RealtimeDetector) addTier1(st *flowState, delta int16) {
 }
 
 func (d *RealtimeDetector) transitionState(st *flowState, now time.Time) bool {
+	if st.flags&flagBulkLocked != 0 {
+		st.state = flowStateConfirmedBulk
+		return false
+	}
 	nowNS := now.UnixNano()
 	if st.openTimeNS == 0 {
 		st.openTimeNS = nowNS
@@ -1438,7 +2085,7 @@ func (d *RealtimeDetector) transitionState(st *flowState, now time.Time) bool {
 			st.lowScorePkts = 0
 		}
 	case flowStateConfirmedRT:
-		if st.flags&flagLiteLocked == 0 && score <= d.demoteQ8 && age >= 30*time.Second {
+		if st.flags&flagLiteLocked == 0 && score <= d.demoteQ8 && age >= d.cfg.RTDemoteAge {
 			st.state = flowStateProvisionalBulk
 			st.lowScorePkts = 0
 		}
@@ -1563,16 +2210,51 @@ func (d *RealtimeDetector) rememberEndpointLocked(ep endpointInfo, now time.Time
 	}
 }
 
-func (d *RealtimeDetector) enqueuePendingLocked(p pendingOpen) {
-	if len(d.pending) >= 128 {
-		copy(d.pending, d.pending[1:])
-		d.pending[len(d.pending)-1] = p
-		return
+// enqueuePendingLocked stores a pendingOpen entry keyed by a fresh token id and
+// returns the token. Caller must hold d.mu. The map is bounded by GC'ing
+// stale entries (TTL 5s) on each call; keeps memory sane under heavy churn.
+func (d *RealtimeDetector) enqueuePendingLocked(p pendingOpen) *flowToken {
+	if d.pendingByID == nil {
+		d.pendingByID = make(map[uint64]pendingOpen)
 	}
-	d.pending = append(d.pending, p)
+	// Evict stale entries to bound the map. Same 5s TTL as bindOpen accepts.
+	if len(d.pendingByID) > 0 {
+		cutoff := p.created.Add(-5 * time.Second)
+		for id, e := range d.pendingByID {
+			if e.created.Before(cutoff) {
+				delete(d.pendingByID, id)
+			}
+		}
+	}
+	// Hard cap to defend against pathological never-bound floods.
+	if len(d.pendingByID) >= 1024 {
+		// Drop oldest by created time.
+		var oldestID uint64
+		var oldest time.Time
+		for id, e := range d.pendingByID {
+			if oldest.IsZero() || e.created.Before(oldest) {
+				oldest = e.created
+				oldestID = id
+			}
+		}
+		if oldestID != 0 {
+			delete(d.pendingByID, oldestID)
+		}
+	}
+	d.nextPendingID++
+	if d.nextPendingID == 0 {
+		d.nextPendingID = 1
+	}
+	id := d.nextPendingID
+	d.pendingByID[id] = p
+	return &flowToken{id: id}
 }
 
-func (d *RealtimeDetector) bindOpen(flowID uint64, class TrafficClass) {
+// bindOpen consumes the pendingOpen identified by token (if any) and binds
+// the corresponding flowState to flowID. Token may be nil for legacy callers
+// that did not call ClassifyOpenWithToken; in that case bindOpen synthesises
+// a fresh flowState seeded only by class.
+func (d *RealtimeDetector) bindOpen(flowID uint64, class TrafficClass, token *flowToken) {
 	if d == nil || flowID == 0 {
 		return
 	}
@@ -1580,13 +2262,13 @@ func (d *RealtimeDetector) bindOpen(flowID uint64, class TrafficClass) {
 	d.mu.Lock()
 	var st flowState
 	var ep endpointInfo
-	if len(d.pending) > 0 {
-		p := d.pending[0]
-		copy(d.pending, d.pending[1:])
-		d.pending = d.pending[:len(d.pending)-1]
-		if now.Sub(p.created) <= 5*time.Second {
-			st = p.st
-			ep = p.endpoint
+	if token != nil && d.pendingByID != nil {
+		if p, ok := d.pendingByID[token.id]; ok {
+			delete(d.pendingByID, token.id)
+			if now.Sub(p.created) <= 5*time.Second {
+				st = p.st
+				ep = p.endpoint
+			}
 		}
 	}
 	if st.openTimeNS == 0 {
@@ -1640,10 +2322,125 @@ func (d *RealtimeDetector) Forget(flowID uint64) {
 		return
 	}
 	d.mu.Lock()
+	st, ok := d.flows[flowID]
+	wasLocked := ok && st != nil && st.flags&flagLiteLocked != 0
 	delete(d.flows, flowID)
 	delete(d.flowEndpoints, flowID)
 	d.mu.Unlock()
+	if wasLocked {
+		newCount := d.lockedFlows.Add(-1)
+		if newCount == 0 && d.controller != nil {
+			ctrl := d.controller
+			go ctrl.notifyLockedReturnToFull()
+		}
+	}
 	d.deregisterMigrationHandle(flowID)
+}
+
+func (d *RealtimeDetector) LockedRealtimeCount() int32 {
+	if d == nil {
+		return 0
+	}
+	return d.lockedFlows.Load()
+}
+
+type LockedFlowSnapshot struct {
+	FlowID      uint64
+	Pkts        uint16
+	AvgSize     uint64
+	PPSLifetime float64
+	AgeSec      float64
+	SawQUIC     bool
+}
+
+func (d *RealtimeDetector) LockedFlowsSnapshot() []LockedFlowSnapshot {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	nowNS := time.Now().UnixNano()
+	var out []LockedFlowSnapshot
+	for id, st := range d.flows {
+		if st == nil || st.flags&flagLiteLocked == 0 {
+			continue
+		}
+		elapsedNS := nowNS - st.openTimeNS
+		if elapsedNS <= 0 {
+			elapsedNS = 1
+		}
+		elapsedSec := float64(elapsedNS) / float64(time.Second)
+		totalB := uint64(st.bytesUp) + uint64(st.bytesDown)
+		var avg uint64
+		if st.pkts > 0 {
+			avg = totalB / uint64(st.pkts)
+		}
+		out = append(out, LockedFlowSnapshot{
+			FlowID:      id,
+			Pkts:        st.pkts,
+			AvgSize:     avg,
+			PPSLifetime: float64(st.pkts) / elapsedSec,
+			AgeSec:      elapsedSec,
+			SawQUIC:     st.negFlags&(NEG_QUIC_LONG|NEG_QUIC_CID) != 0,
+		})
+		if len(out) >= 16 {
+			break
+		}
+	}
+	return out
+}
+
+// TopRealtimeFlowStats returns a summary of the busiest UDP flow currently
+// tracked: dst (if available), pkts, bytes, computed PPS, avg-size, locked.
+// Snapshot only — for debug expvar consumption. Locks d.mu briefly.
+type TopRealtimeFlowStats struct {
+	FlowID  uint64
+	Pkts    uint16
+	Bytes   uint64
+	PPS     float64
+	AvgSize uint64
+	AgeSec  float64
+	Locked  bool
+}
+
+func (d *RealtimeDetector) TopRealtimeFlowSnapshot() TopRealtimeFlowStats {
+	if d == nil {
+		return TopRealtimeFlowStats{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	nowNS := time.Now().UnixNano()
+	var best TopRealtimeFlowStats
+	var bestPkts uint16
+	for id, st := range d.flows {
+		if st == nil || st.isTCP() {
+			continue
+		}
+		if st.pkts <= bestPkts {
+			continue
+		}
+		bestPkts = st.pkts
+		elapsedNS := nowNS - st.openTimeNS
+		if elapsedNS <= 0 {
+			elapsedNS = 1
+		}
+		elapsedSec := float64(elapsedNS) / float64(time.Second)
+		totalB := uint64(st.bytesUp) + uint64(st.bytesDown)
+		var avg uint64
+		if st.pkts > 0 {
+			avg = totalB / uint64(st.pkts)
+		}
+		best = TopRealtimeFlowStats{
+			FlowID:  id,
+			Pkts:    st.pkts,
+			Bytes:   totalB,
+			PPS:     float64(st.pkts) / elapsedSec,
+			AvgSize: avg,
+			AgeSec:  elapsedSec,
+			Locked:  st.flags&flagLiteLocked != 0,
+		}
+	}
+	return best
 }
 
 func (d *RealtimeDetector) Score(flowID uint64) float64 {
@@ -1690,9 +2487,28 @@ func (d *RealtimeDetector) setController(c *RealtimeController) {
 func (d *RealtimeDetector) cleanupLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
-	for now := range t.C {
-		d.sweepIdle(now)
+	for {
+		select {
+		case now := <-t.C:
+			d.sweepIdle(now)
+		case <-d.stop:
+			return
+		}
 	}
+}
+
+// Close signals the cleanupLoop to exit. Idempotent. Safe to call from any
+// goroutine; safe even if cleanupLoop never started (the close is a no-op
+// observed by the absent goroutine). Called from Client.Close. Audit #2.
+func (d *RealtimeDetector) Close() {
+	if d == nil {
+		return
+	}
+	d.stopOnce.Do(func() {
+		if d.stop != nil {
+			close(d.stop)
+		}
+	})
 }
 
 func (d *RealtimeDetector) sweepIdle(now time.Time) {
@@ -1718,10 +2534,54 @@ func (d *RealtimeDetector) sweepIdle(now time.Time) {
 		}
 	}
 	c := d.controller
+	d.sweepEndpointCacheLocked(now)
 	d.mu.Unlock()
 	if c != nil {
 		for _, id := range release {
 			c.ReleaseActive(id)
+		}
+	}
+}
+
+// sweepEndpointCacheLocked drops endpoint cache entries past EndpointCacheTTL
+// and also caps absolute size at 10000 entries via random-eviction (Go map
+// iteration order). Caller must hold d.mu. Audit #3.
+func (d *RealtimeDetector) sweepEndpointCacheLocked(now time.Time) {
+	const hardCap = 10000
+	ttl := d.cfg.EndpointCacheTTL
+	if ttl <= 0 {
+		return
+	}
+	cutoff := now.Add(-ttl).UnixNano()
+	nowNS := now.UnixNano()
+	for k, ts := range d.endpointByPref {
+		if ts <= cutoff || ts > nowNS {
+			delete(d.endpointByPref, k)
+		}
+	}
+	for k, ts := range d.endpointByHost {
+		if ts <= cutoff || ts > nowNS {
+			delete(d.endpointByHost, k)
+		}
+	}
+	// Hard cap defends against a long-lived session against many distinct
+	// non-recurring destinations: random-evict until under cap.
+	if over := len(d.endpointByPref) - hardCap; over > 0 {
+		for k := range d.endpointByPref {
+			delete(d.endpointByPref, k)
+			over--
+			if over <= 0 {
+				break
+			}
+		}
+	}
+	if over := len(d.endpointByHost) - hardCap; over > 0 {
+		for k := range d.endpointByHost {
+			delete(d.endpointByHost, k)
+			over--
+			if over <= 0 {
+				break
+			}
 		}
 	}
 }
@@ -1731,10 +2591,17 @@ func (d *RealtimeDetector) sweepIdleForTest(now time.Time) { d.sweepIdle(now) }
 func (d *RealtimeDetector) pendingOpenStateForTest() flowState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if len(d.pending) == 0 {
+	if len(d.pendingByID) == 0 {
 		return flowState{}
 	}
-	return d.pending[len(d.pending)-1].st
+	// Return the entry with the largest token id (most recently enqueued).
+	var maxID uint64
+	for id := range d.pendingByID {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return d.pendingByID[maxID].st
 }
 
 func (d *RealtimeDetector) expireEndpointCacheForTest(now time.Time) {
@@ -1775,11 +2642,24 @@ func looksLikeTURNChannelData(payload []byte) bool {
 	return payload[0]&0xc0 == 0x40 && ch >= 0x4000 && ch <= 0x7fff && ln <= len(payload)-4
 }
 
+func looksLikeTURNChannelDataStrict(payload []byte, n uint16) bool {
+	if len(payload) < 4 || n < 4 || payload[0]&0xc0 != 0x40 {
+		return false
+	}
+	ch := binary.BigEndian.Uint16(payload[0:2])
+	if ch < 0x4000 || ch > 0x7fff {
+		return false
+	}
+	ln := uint32(binary.BigEndian.Uint16(payload[2:4]))
+	total := uint32(n)
+	return ln+4 == total || ln+4+((4-ln%4)&3) == total
+}
+
 func looksLikeDTLSRecord(payload []byte, types ...byte) bool {
 	if len(payload) < 13 || payload[1] != 0xfe {
 		return false
 	}
-	if payload[2] != 0xfd && payload[2] != 0xff && payload[2] != 0xfc {
+	if payload[2] != 0xfd && payload[2] != 0xff {
 		return false
 	}
 	for _, typ := range types {
@@ -1811,9 +2691,18 @@ func looksLikeQUICLongHeader(payload []byte) bool {
 		return false
 	}
 	ver := binary.BigEndian.Uint32(payload[1:5])
-	known := ver == 0x00000001 || ver == 0x00000000 || ver == 0x6b3343cf || ver == 0x709a50c4
-	grease := payload[1]&0x0f == 0x0a
-	return known || grease
+	return ver == 0x00000001 || ver == 0x6b3343cf || ver == 0x709a50c4 || ver&0xff000000 == 0xff000000
+}
+
+// looksLikeQUICShortHeader is a soft secondary signal: QUIC short header
+// has form bit 0 + fixed bit 1, so byte 0 is in 0x40-0x7F. Many random
+// UDP payloads can hit this range, so callers should ONLY trust this
+// when corroborated (e.g., flow already saw a long-header packet earlier).
+func looksLikeQUICShortHeader(payload []byte) bool {
+	if len(payload) < 6 {
+		return false
+	}
+	return payload[0]&0xc0 == 0x40
 }
 
 func looksLikeTLSLargeAppData(payload []byte) bool {
@@ -1841,6 +2730,11 @@ type RealtimeController struct {
 	onRealtimeOpen      func()
 	onLastRealtimeClose func()
 	onModeReturnToFull  func()
+
+	// Tier 2.5: locked-flow callbacks fire on RTP-stickylocked transitions
+	// only (real realtime), not on every default-promoted UDP. V1 valve uses these.
+	onLockedOpen         func()
+	onLockedReturnToFull func()
 }
 
 func newRealtimeController() *RealtimeController {
@@ -1870,7 +2764,16 @@ func (c *RealtimeController) Mode() ShapeMode {
 	return ShapeMode(c.mode.Load())
 }
 
+// Open is the legacy entry-point preserved for tests and internal callers
+// that did not classify with a token. Production hot path should use
+// OpenWithToken so the matching pending flowState is bound to flowID.
 func (c *RealtimeController) Open(class TrafficClass) uint64 {
+	return c.OpenWithToken(class, nil)
+}
+
+// OpenWithToken binds the pending flow-state identified by token to a fresh
+// flowID. Pass nil token if classification was done without one.
+func (c *RealtimeController) OpenWithToken(class TrafficClass, token *flowToken) uint64 {
 	if c == nil {
 		return 0
 	}
@@ -1890,7 +2793,7 @@ func (c *RealtimeController) Open(class TrafficClass) uint64 {
 	onRealtimeOpen := c.onRealtimeOpen
 	c.mu.Unlock()
 	if c.Detector != nil {
-		c.Detector.bindOpen(flowID, class)
+		c.Detector.bindOpen(flowID, class, token)
 	}
 	if callOpen {
 		onRealtimeOpen()
@@ -1973,6 +2876,37 @@ func (c *RealtimeController) Close(flowID uint64) {
 	}
 }
 
+func (c *RealtimeController) notifyLockedOpen() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	cb := c.onLockedOpen
+	c.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+func (c *RealtimeController) notifyLockedReturnToFull() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	cb := c.onLockedReturnToFull
+	c.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+func (c *RealtimeController) LockedRealtimeCount() int32 {
+	if c == nil || c.Detector == nil {
+		return 0
+	}
+	return c.Detector.LockedRealtimeCount()
+}
+
 func (c *RealtimeController) ActiveRealtimeCount() int {
 	if c == nil {
 		return 0
@@ -2050,7 +2984,9 @@ func wrapRealtimeConn(conn net.Conn, controller *RealtimeController, flowID uint
 func (c *realtimeTrackedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.controller.observePacket(c.flowID, p[:n], DirUnknown)
+		// Audit #14: pass DirInbound for ingress, DirOutbound for egress so
+		// tier-2 asymmetry scoring sees real direction info.
+		c.controller.observePacket(c.flowID, p[:n], DirInbound)
 	}
 	return n, err
 }
@@ -2058,7 +2994,7 @@ func (c *realtimeTrackedConn) Read(p []byte) (int, error) {
 func (c *realtimeTrackedConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
-		c.controller.observePacket(c.flowID, p[:n], DirUnknown)
+		c.controller.observePacket(c.flowID, p[:n], DirOutbound)
 	}
 	return n, err
 }

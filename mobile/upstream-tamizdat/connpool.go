@@ -304,7 +304,13 @@ func (p *connPool) prepareV1BulkShapeMode(t *h2Transport) {
 	if t == nil || p.maxTransports != 1 || p.realtime == nil {
 		return
 	}
-	if p.realtime.Mode() == ShapeLite {
+	// Tier 2.5: only spawn the V1 bulk truba in Lite shape when there is a
+	// PROVEN realtime flow (RTP-stickylocked). Reading p.realtime.Mode() —
+	// which reflects heuristic activeRealtimeCount including default-promoted
+	// background UDP (DNS/QUIC/NTP/mDNS) — caused fresh transports to come
+	// up in Lite immediately after reconnect simply because OS background
+	// noise was running. The valve is meant to fire only on stickylock.
+	if p.realtime.LockedRealtimeCount() > 0 {
 		t.flipShapeMode(ShapeLite)
 	}
 }
@@ -439,6 +445,43 @@ func (p *connPool) setRealtimeController(controller *RealtimeController) {
 	p.mu.Lock()
 	p.realtime = controller
 	p.mu.Unlock()
+}
+
+// BulkTransportShapeMode returns the actual shape mode of the bulk transport
+// (or first bulk if multiple). This is the GROUND-TRUTH wire-shape — what
+// outgoing TLS records are actually shaped as. Distinct from RealtimeController.Mode()
+// which is intent/controller-state. Returns ShapeFull if no bulk transport exists.
+func (p *connPool) BulkTransportShapeMode() ShapeMode {
+	if p == nil {
+		return ShapeFull
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, t := range p.transports {
+		if t == nil || t.class != TrafficBulk || t.isClosed() {
+			continue
+		}
+		return ShapeMode(t.shapeMode.Load())
+	}
+	return ShapeFull
+}
+
+// LiteTransportAlive reports whether a separate lite-class realtime transport
+// is currently live (V2/V3 architecture: bulk + dedicated lite truba). Returns
+// false for V1 (MaxTransports==1) where there is no separate lite transport —
+// the bulk truba flips ShapeMode in-place. Useful for variant-aware GUI lamp
+// logic: V1 reads bulk shape, V2/V3 reads this + locked-flow count.
+func (p *connPool) LiteTransportAlive() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.liteTransport
+	if t == nil {
+		return false
+	}
+	return !t.isClosed() && !t.isDraining()
 }
 
 func (p *connPool) flipAllBulkTransports(m ShapeMode) {

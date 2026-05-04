@@ -1,6 +1,7 @@
 package tamizdat
 
 import (
+	"fmt"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -24,7 +25,18 @@ const (
 
 func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destination string, flowID uint64) {
 	if s.realtime != nil && flowID != 0 {
-		defer s.realtime.Close(flowID)
+		clientAddr := "-"
+		if r != nil && r.RemoteAddr != "" {
+			clientAddr = r.RemoteAddr
+		}
+		closedFID := flowID
+		closedDst := destination
+		closedClient := clientAddr
+		defer func() {
+			s.realtime.Close(closedFID)
+			s.logShapeEvent(fmt.Sprintf("stream_close client=%s dst=%s proto=udp flowID=%d",
+				closedClient, closedDst, closedFID))
+		}()
 	}
 	// CRIT-0: validate destination + dial resolved IP -- defeats SSRF
 	// (private/loopback/cloud-metadata) and DNS-rebinding TOCTOU.

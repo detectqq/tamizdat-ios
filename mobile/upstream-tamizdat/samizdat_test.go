@@ -595,8 +595,8 @@ func TestClientConfigDefaults(t *testing.T) {
 	if config.Fingerprint != "mix" {
 		t.Errorf("Fingerprint = %s, want mix", config.Fingerprint)
 	}
-	if config.MaxStreamsPerConn != 100 {
-		t.Errorf("MaxStreamsPerConn = %d, want 100", config.MaxStreamsPerConn)
+	if config.MaxStreamsPerConn != 0 {
+		t.Errorf("MaxStreamsPerConn = %d, want 0 (unlimited)", config.MaxStreamsPerConn)
 	}
 	if config.IdleTimeout != 5*time.Minute {
 		t.Errorf("IdleTimeout = %v, want 5m", config.IdleTimeout)
@@ -619,8 +619,8 @@ func TestServerConfigDefaults(t *testing.T) {
 	if config.MasqueradeMaxDuration != 10*time.Minute {
 		t.Errorf("MasqueradeMaxDuration = %v, want 10m", config.MasqueradeMaxDuration)
 	}
-	if config.MaxConcurrentStreams != 250 {
-		t.Errorf("MaxConcurrentStreams = %d, want 250", config.MaxConcurrentStreams)
+	if config.MaxConcurrentStreams != 1000 {
+		t.Errorf("MaxConcurrentStreams = %d, want 1000", config.MaxConcurrentStreams)
 	}
 }
 

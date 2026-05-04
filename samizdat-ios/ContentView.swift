@@ -24,6 +24,12 @@ struct ContentView: View {
     @State private var whitelistActiveEndpoint: EndpointMode = .primary
     @State private var statusPollTimer: Timer?
 
+    // IPA-Z: live shape/RTT lamp identical to the Windows-GUI line
+    // ("○ bulk • RTT 17ms" / "● lite • RTT 23ms"). Polled at 500 ms
+    // via a Timer owned by TamizdatStatusStore (in-process gomobile
+    // calls, no HTTP).
+    @StateObject private var lampStore = TamizdatStatusStore()
+
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
@@ -61,6 +67,17 @@ struct ContentView: View {
                 }
                 if !bridge.socksAddr.isEmpty && bridge.state == .connected {
                     Text("SOCKS5: \(bridge.socksAddr)")
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                // IPA-Z: shape + RTT lamp. Same single-line format the
+                // Windows GUI shows ("○ bulk • RTT 17ms"). Hidden while
+                // tunnel is offline — TamizdatStatusStore returns
+                // "— offline —" but we just suppress the line entirely
+                // for less visual noise on the main screen.
+                if bridge.state == .connected && !lampStore.realShape.isEmpty {
+                    Text(lampStore.lampLabel)
                         .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
@@ -175,9 +192,11 @@ struct ContentView: View {
         }
         .onAppear {
             startStatusPolling()
+            lampStore.start()
         }
         .onDisappear {
             stopStatusPolling()
+            lampStore.stop()
         }
     }
 

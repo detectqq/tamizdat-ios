@@ -327,6 +327,9 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string, cla
 // hasCapacity returns true if the transport can accept more streams.
 // Read-only -- racy by design. Use reserveStreamSlot for atomic claim.
 func (t *h2Transport) hasCapacity() bool {
+	if t.maxStreams <= 0 {
+		return !t.isDraining()
+	}
 	return !t.isDraining() && int(t.activeStreams.Load()) < t.maxStreams
 }
 
@@ -335,6 +338,17 @@ func (t *h2Transport) hasCapacity() bool {
 // HIGH-4: prevents the TOCTOU oversubscription where two callers each pass
 // hasCapacity() at activeStreams=99 and then both Add(1) -> 101 > 100.
 func (t *h2Transport) reserveStreamSlot() bool {
+	if t.maxStreams <= 0 {
+		// No client-side cap configured: trust server's
+		// SETTINGS_MAX_CONCURRENT_STREAMS handled by net/http2 internally.
+		// Still increment activeStreams so observability + drain accounting work.
+		if t.isDraining() || t.isClosed() {
+			return false
+		}
+		t.activeStreams.Add(1)
+		return true
+	}
+
 	for {
 		if t.isClosed() || t.isDraining() {
 			return false

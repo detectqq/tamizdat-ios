@@ -126,6 +126,38 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshSamizdatClient")
     }
 
+    /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
+    /// the extension. Used by the main-screen lamp at 500 ms cadence.
+    /// Returns `.offline` on any failure (extension not running, RPC
+    /// timeout, JSON malformed) — caller renders this as "— offline —".
+    func fetchTamizdatStatus() async -> TamizdatStatusSnapshot {
+        guard let manager = await currentManager(),
+              let session = manager.connection as? NETunnelProviderSession else {
+            return .offline
+        }
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            break
+        default:
+            return .offline
+        }
+        let data = "status".data(using: .utf8) ?? Data()
+        let response: Data? = await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+            do {
+                try session.sendProviderMessage(data) { responseData in
+                    cont.resume(returning: responseData)
+                }
+            } catch {
+                cont.resume(returning: nil)
+            }
+        }
+        guard let response, !response.isEmpty else {
+            return .offline
+        }
+        let decoded = try? JSONDecoder().decode(TamizdatStatusSnapshot.self, from: response)
+        return decoded ?? .offline
+    }
+
     @discardableResult
     private func ensureProfile(configBlob: String, engineConfigBlob: String, serverIP: String?) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager
