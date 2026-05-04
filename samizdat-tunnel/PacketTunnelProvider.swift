@@ -161,6 +161,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // before building the client. The setter just stores the bit;
         // SetSamizdatConfig below reads it when constructing ClientConfig.
         SocksstubSetGameOptimizedMode(PerformancePreferences.gameOptimized)
+        // IPA-X: same pattern for the V1/V2/V3 picker. Default v1 if the
+        // user never visited Settings (matches IPA-G hardcoded value).
+        SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -382,12 +385,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         case "refreshSamizdatClient":
-            // IPA-T: Performance-mode toggle changed in main-app UI.
-            // Push the new flag into Go-side then rebuild the client
-            // with the matching DisableDefaultSecurity setting.
+            // IPA-T / IPA-X: Performance-mode toggle and/or V1/V2/V3
+            // picker changed in main-app UI. Push the new flags into
+            // Go-side then rebuild the client. We always push both —
+            // the setters are cheap stores and the user could have
+            // changed either or both since the last refresh.
             let perf = PerformancePreferences.gameOptimized
-            appendExtLog("info: app requested samizdat refresh (performance mode = \(perf))")
+            let variant = PoolVariantPreferences.current.rawValue
+            appendExtLog("info: app requested samizdat refresh (performance mode = \(perf), pool variant = \(variant))")
             SocksstubSetGameOptimizedMode(perf)
+            SocksstubSetPoolVariant(variant)
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
         default:
