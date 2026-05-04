@@ -86,10 +86,6 @@ type runtimeState struct {
 	samizdatClient *samizdat.Client // nil unless SetSamizdatConfig succeeded
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
-	// IPA-T: gameOptimized flips DisableDefaultSecurity on the next
-	// samizdat.NewClient call. Toggled by Swift via SocksstubSetGameMode
-	// before re-calling SocksstubSetSamizdatConfig with the same blob.
-	gameOptimized atomic.Bool
 	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
 	// on the next samizdat.NewClient call. Empty == "v1" (preserves
 	// IPA-G default). Toggled by Swift via SocksstubSetPoolVariant
@@ -325,16 +321,14 @@ func SetSamizdatConfig(blob string) error {
 		// mode locks the pool to exactly 1 TCP/443 forever, no overlap,
 		// no rotation — even tighter than vanilla v1.
 		StrictSingleH2: variant == "v1",
-		// IPA-T: Game-optimized mode flips DisableDefaultSecurity on
-		// tamizdat's ClientConfig. With V1 already pinning the single
-		// transport, this toggle now mostly disables the remaining
-		// outer-wire defenses (TCPFragmentation, RecordFragmentation,
-		// CoverTrafficEnabled) permanently — useful as a manual
-		// override if the realtime classifier ever misses a flow.
-		// Off by default; flipped via Settings -> Performance mode.
-		DisableDefaultSecurity: rt.gameOptimized.Load(),
+		// IPA-Y: Performance mode toggle removed. Plan B+'s realtime
+		// classifier auto-flips the bulk transport to ShapeLite (no
+		// cover, no fragmentation, no jitter) for the duration of any
+		// realtime flow + 45-90s hysteresis; the old "permanent kill
+		// switch" is no longer needed. Bulk traffic keeps full DPI
+		// camouflage at all times now.
 	}
-	rt.appendLog(fmt.Sprintf("info: client built with PoolVariant=%s StrictSingleH2=%v DisableDefaultSecurity=%v", variant, clientCfg.StrictSingleH2, clientCfg.DisableDefaultSecurity))
+	rt.appendLog(fmt.Sprintf("info: client built with PoolVariant=%s StrictSingleH2=%v", variant, clientCfg.StrictSingleH2))
 	// IPA-M: opt-in SNI rotation pool when the URL carried snipool=…
 	// (legacy ServerNames field still present in tamizdat ClientConfig).
 	if len(cfg.SNIPool) > 1 {
@@ -537,26 +531,12 @@ func FreeOSMemory() {
 	debug.FreeOSMemory()
 }
 
-// SetGameOptimizedMode flips the global flag that drives
-// DisableDefaultSecurity on the next samizdat.NewClient. Caller must
-// follow up with a SetSamizdatConfig(blob) to actually rebuild the
-// transport (the existing client keeps its old defaults until torn
-// down). Exported for gomobile bind.
-func SetGameOptimizedMode(enabled bool) {
-	rt.gameOptimized.Store(enabled)
-	if enabled {
-		rt.appendLog("info: game-optimized mode = ON (next client build will use DisableDefaultSecurity)")
-	} else {
-		rt.appendLog("info: game-optimized mode = OFF (default tamizdat security applied)")
-	}
-}
-
 // SetPoolVariant selects the tamizdat connection-pool strategy on the
 // next samizdat.NewClient call. Accepted values: "v1", "v2", "v3"
-// (case-insensitive); anything else is normalised to "v1". As with
-// SetGameOptimizedMode, caller must follow up with SetSamizdatConfig
-// to actually rebuild the transport. Exported for gomobile bind
-// (becomes SocksstubSetPoolVariant on the Swift side).
+// (case-insensitive); anything else is normalised to "v1". Caller
+// must follow up with SetSamizdatConfig to actually rebuild the
+// transport. Exported for gomobile bind (becomes
+// SocksstubSetPoolVariant on the Swift side).
 //
 // V1 additionally engages StrictSingleH2 mode (single TCP/443 forever,
 // no rotation, no overlap) to mirror the Windows-GUI radio behaviour

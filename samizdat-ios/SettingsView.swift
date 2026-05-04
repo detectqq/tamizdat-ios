@@ -10,8 +10,6 @@ struct SettingsView: View {
     @State private var permissionStatus: UNAuthorizationStatus = .notDetermined
     @State private var permissionDeniedAlert: Bool = false
 
-    @State private var gameOptimized: Bool = PerformancePreferences.gameOptimized
-
     @State private var poolVariant: PoolVariant = PoolVariantPreferences.current
 
     @State private var showConfig = false
@@ -72,32 +70,6 @@ struct SettingsView: View {
                     Text("Configuration")
                 } footer: {
                     Text("Paste tamizdat:// URLs for Main and (optionally) Whitelist server.")
-                }
-
-                // ── Performance ──────────────────────────────────────────
-                Section {
-                    Toggle(isOn: $gameOptimized) {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Performance mode")
-                                Text("Stable single transport, no rotation, no cover traffic")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "speedometer")
-                        }
-                    }
-                    .onChange(of: gameOptimized) { _, newValue in
-                        PerformancePreferences.gameOptimized = newValue
-                        Task {
-                            await VPNProfileStore.shared.refreshSamizdatClient()
-                        }
-                    }
-                } header: {
-                    Text("Performance")
-                } footer: {
-                    Text("Turn ON for: Roblox / online games, YouTube streaming, WhatsApp voice & video calls, FaceTime, large downloads. The single TLS+H2 transport stays up for the whole session — no mid-session rotation handshakes that cause stutter. Trade-off: weaker DPI camouflage. Default OFF — keep on only while needed.")
                 }
 
                 // ── Pool variant ─────────────────────────────────────────

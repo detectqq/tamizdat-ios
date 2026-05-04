@@ -157,12 +157,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return false
             }
         }
-        // IPA-T: seed Go-side with the persisted "Performance mode" flag
-        // before building the client. The setter just stores the bit;
+        // IPA-X: seed Go-side with the persisted V1/V2/V3 picker before
+        // building the client. The setter just stores the bit;
         // SetSamizdatConfig below reads it when constructing ClientConfig.
-        SocksstubSetGameOptimizedMode(PerformancePreferences.gameOptimized)
-        // IPA-X: same pattern for the V1/V2/V3 picker. Default v1 if the
-        // user never visited Settings (matches IPA-G hardcoded value).
+        // IPA-Y: Performance-mode toggle removed — Plan B+ realtime
+        // detector auto-flips the bulk transport to ShapeLite during
+        // any realtime flow (cover/fragmentation suspended for that
+        // window only), so no static kill switch is needed.
         SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
@@ -385,15 +386,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         case "refreshSamizdatClient":
-            // IPA-T / IPA-X: Performance-mode toggle and/or V1/V2/V3
-            // picker changed in main-app UI. Push the new flags into
-            // Go-side then rebuild the client. We always push both —
-            // the setters are cheap stores and the user could have
-            // changed either or both since the last refresh.
-            let perf = PerformancePreferences.gameOptimized
+            // IPA-X: V1/V2/V3 picker changed in main-app UI. Push the
+            // new variant into Go-side then rebuild the client.
             let variant = PoolVariantPreferences.current.rawValue
-            appendExtLog("info: app requested samizdat refresh (performance mode = \(perf), pool variant = \(variant))")
-            SocksstubSetGameOptimizedMode(perf)
+            appendExtLog("info: app requested samizdat refresh (pool variant = \(variant))")
             SocksstubSetPoolVariant(variant)
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
