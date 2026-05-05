@@ -41,18 +41,26 @@ jobs:
       - name: gomobile init
         run: gomobile init
 
-      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub)
+      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub + netstack)
         working-directory: mobile
         run: |
           mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
-          # Bundle BOTH packages into one xcframework. Path 3 puts the
-          # SocksStub listener in the main-app process; the existing
-          # samizdat package retains its config-parser API for the UI.
+          # IPA-B1 (Phase C / Path 4): added ./netstack to the bind set.
+          # Build tags:
+          #   with_gvisor   — required by sing-tun's gvisor stack; without
+          #                   it, NewGVisor returns ErrGVisorNotIncluded.
+          #   netstack_real — gates our handler.go + bridge.go + dial_cap.go.
+          #                   The build-time probe in
+          #                   mobile/netstack/with_gvisor_required.go fails
+          #                   compile if netstack_real is set without
+          #                   with_gvisor (defence in depth).
+          # Phase 3 cleanup will drop ./socksstub from this list.
           gomobile bind -v \
+            -tags=with_gvisor,netstack_real \
             -target=ios,iossimulator \
             -iosversion=17.0 \
             -o "${{ env.FRAMEWORK_OUT }}" \
-            ./samizdat ./socksstub
+            ./samizdat ./socksstub ./netstack
           ls -la "${{ env.FRAMEWORK_OUT }}"
 
       - name: Build HevSocks5Tunnel.xcframework
