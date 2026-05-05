@@ -686,16 +686,30 @@ misc:
             // don't sit on our jetsam ledger between heartbeats.
             SocksstubFreeOSMemory()
 
+            // IPA-Z8: bridge counters are useful for correlating
+            // memory pressure with packet rate. Compute deltas
+            // since last heartbeat so the log shows pps.
+            let counters = self.packetBridge?.counters() ?? (toHev: 0, fromHev: 0, hints: 0)
+            let inboundPPS  = Int64(counters.toHev) - self.lastBridgeToHev
+            let outboundPPS = Int64(counters.fromHev) - self.lastBridgeFromHev
+            self.lastBridgeToHev = Int64(counters.toHev)
+            self.lastBridgeFromHev = Int64(counters.fromHev)
+
             self.appendExtLog(String(
-                format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld",
+                format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
                 availKB,
                 goInUseKB, goSysKB, goRelKB,
-                numGC
+                numGC,
+                inboundPPS, outboundPPS
             ))
         }
         timer.resume()
         swiftHeartbeatTimer = timer
     }
+
+    // IPA-Z8 bookkeeping for pps delta in heartbeat.
+    private var lastBridgeToHev: Int64 = 0
+    private var lastBridgeFromHev: Int64 = 0
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()

@@ -157,42 +157,54 @@ final class PacketBridge {
     }
 
     private func handleInbound(packets: [NEPacket]) {
+        // IPA-Z8: wrap per-packet body in autoreleasepool to bound the
+        // accumulation of temporary Data / NSNumber / NEFlowMetaData
+        // objects inside this dispatch frame. Without an explicit
+        // pool, Apple's autorelease draining only happens when the
+        // event-loop returns to top — under speedtest at ~10000 pkt/s
+        // we'd accumulate tens of MB of "released but not yet drained"
+        // ObjC/Swift objects, which counts toward our jetsam ledger
+        // even though the Go heap is fine. Crash log 16:27:48 showed
+        // avail dropping 24 MB in 2 seconds while go.inuse stayed
+        // flat — exactly this pattern.
         for pkt in packets {
-            let payload = pkt.data
-            // protocolFamily is sa_family_t (UInt8 on Darwin).
-            let af = UInt32(pkt.protocolFamily)
-            let meta: NEFlowMetaData? = pkt.metadata
+            autoreleasepool {
+                let payload = pkt.data
+                // protocolFamily is sa_family_t (UInt8 on Darwin).
+                let af = UInt32(pkt.protocolFamily)
+                let meta: NEFlowMetaData? = pkt.metadata
 
-            // Step 1: extract dst, attribute to a process if metadata
-            // has a non-nil bundle-id. Apple delivers metadata for
-            // every packet but `sourceAppSigningIdentifier` is
-            // typically nil for system / kernel-originated traffic and
-            // populated for app traffic.
-            if let bundleID = meta?.sourceAppSigningIdentifier,
-               let tuple = parseDestinationTuple(packet: payload, af: af) {
-                let normalized = normalizeBundleID(bundleID)
-                if !normalized.isEmpty {
-                    SocksstubSubmitAppHint(tuple.proto, tuple.dest, normalized, 5000)
-                    countersLock.lock(); hintsSubmitted &+= 1; countersLock.unlock()
-                }
-            }
-
-            // Step 2: write 4-byte AF prefix + packet to hev side.
-            let prefixed = framePacket(packet: payload, af: af)
-            prefixed.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                guard let base = buf.baseAddress else { return }
-                let n = write(swiftSideFD, base, prefixed.count)
-                if n != prefixed.count {
-                    // Partial write to a SOCK_DGRAM socketpair shouldn't
-                    // happen unless EWOULDBLOCK / kernel drop. We don't
-                    // retry — at 1280 MTU, a momentary buffer overflow
-                    // is recoverable by upper-layer TCP retransmit.
-                    if n < 0 && (errno != EAGAIN && errno != EINTR) {
-                        log("warn: bridge write to hev: errno=\(errno)")
+                // Step 1: extract dst, attribute to a process if metadata
+                // has a non-nil bundle-id. Apple delivers metadata for
+                // every packet but `sourceAppSigningIdentifier` is
+                // typically nil for system / kernel-originated traffic and
+                // populated for app traffic.
+                if let bundleID = meta?.sourceAppSigningIdentifier,
+                   let tuple = parseDestinationTuple(packet: payload, af: af) {
+                    let normalized = normalizeBundleID(bundleID)
+                    if !normalized.isEmpty {
+                        SocksstubSubmitAppHint(tuple.proto, tuple.dest, normalized, 5000)
+                        countersLock.lock(); hintsSubmitted &+= 1; countersLock.unlock()
                     }
                 }
+
+                // Step 2: write 4-byte AF prefix + packet to hev side.
+                let prefixed = framePacket(packet: payload, af: af)
+                prefixed.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                    guard let base = buf.baseAddress else { return }
+                    let n = write(swiftSideFD, base, prefixed.count)
+                    if n != prefixed.count {
+                        // Partial write to a SOCK_DGRAM socketpair shouldn't
+                        // happen unless EWOULDBLOCK / kernel drop. We don't
+                        // retry — at 1280 MTU, a momentary buffer overflow
+                        // is recoverable by upper-layer TCP retransmit.
+                        if n < 0 && (errno != EAGAIN && errno != EINTR) {
+                            log("warn: bridge write to hev: errno=\(errno)")
+                        }
+                    }
+                }
+                countersLock.lock(); packetsToHev &+= 1; countersLock.unlock()
             }
-            countersLock.lock(); packetsToHev &+= 1; countersLock.unlock()
         }
     }
 
@@ -211,37 +223,40 @@ final class PacketBridge {
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { buffer.deallocate() }
 
+        // IPA-Z8: wrap each iteration in an autoreleasepool. This loop
+        // runs on a dedicated DispatchQueue with NO event-loop drain,
+        // so without an explicit pool every per-packet `Data(bytes:count:)`
+        // and `NSNumber(value:)` accumulates indefinitely.
         while running {
-            let n = read(swiftSideFD, buffer, bufferSize)
-            if n < 0 {
-                if errno == EINTR { continue }
-                if errno == EBADF { return } // we were stopped
-                log("warn: bridge read from hev: errno=\(errno)")
-                Thread.sleep(forTimeInterval: 0.01)
-                continue
+            autoreleasepool {
+                let n = read(swiftSideFD, buffer, bufferSize)
+                if n < 0 {
+                    if errno == EINTR { return }
+                    if errno == EBADF { return } // stop signal — outer while will exit
+                    log("warn: bridge read from hev: errno=\(errno)")
+                    Thread.sleep(forTimeInterval: 0.01)
+                    return
+                }
+                if n < 4 { return }
+
+                // Decode 4-byte big-endian AF prefix. iOS utun convention.
+                let af: UInt32 =
+                    (UInt32(buffer[0]) << 24) |
+                    (UInt32(buffer[1]) << 16) |
+                    (UInt32(buffer[2]) << 8) |
+                     UInt32(buffer[3])
+
+                // Slice off the prefix; the rest is a complete IP packet.
+                let payload = Data(bytes: buffer.advanced(by: 4), count: n - 4)
+
+                // packetFlow.writePackets is the documented Apple API for
+                // injecting packets back into the iOS app's network stack.
+                _ = provider?.packetFlow.writePackets(
+                    [payload], withProtocols: [NSNumber(value: af)]
+                )
+
+                countersLock.lock(); packetsFromHev &+= 1; countersLock.unlock()
             }
-            if n < 4 { continue }
-
-            // Decode 4-byte big-endian AF prefix. iOS utun convention.
-            let af: UInt32 =
-                (UInt32(buffer[0]) << 24) |
-                (UInt32(buffer[1]) << 16) |
-                (UInt32(buffer[2]) << 8) |
-                 UInt32(buffer[3])
-
-            // Slice off the prefix; the rest is a complete IP packet.
-            let payload = Data(bytes: buffer.advanced(by: 4), count: n - 4)
-
-            // packetFlow.writePackets is the documented Apple API for
-            // injecting packets back into the iOS app's network stack.
-            // writePacketObjects (the NEPacket-array form) would let us
-            // batch, but at one packet per syscall the single-call form
-            // is equivalent.
-            _ = provider?.packetFlow.writePackets(
-                [payload], withProtocols: [NSNumber(value: af)]
-            )
-
-            countersLock.lock(); packetsFromHev &+= 1; countersLock.unlock()
         }
     }
 
