@@ -96,7 +96,27 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 	}
 
 	handler := &Handler{client: client}
-	stack, err := tun.NewStack("gvisor", tun.StackOptions{
+	// IPA-B2: switch from forced "gvisor" to "" (auto). With the
+	// with_gvisor build tag and IncludeAllNetworks=false, sing-tun's
+	// auto-selector picks Mixed (system TCP + gvisor UDP) — the
+	// same mode sing-box-for-apple ships on iOS, and what
+	// Shadowrocket/Hiddify/V2Box use to hit 150+ Mbps.
+	//
+	// The "gvisor" mode has an iOS-specific TCP buffer cap at
+	// stack_gvisor.go:182-202 (32 KiB default / 128 KiB max via a
+	// runtime.GOOS=="ios" check). At 200 Mbps × ~30 ms RTT, BDP =
+	// 750 KB; the 128 KiB cap pins throughput at ~32 Mbps —
+	// matching the 30 Mbps we measured in IPA-B1. Mixed mode
+	// routes TCP through a localhost net.Listener (kernel TCP, no
+	// gvisor buffer cap) that our Handler.NewConnectionEx already
+	// serves; UDP stays on gvisor + udpnat + our udpDemux. The
+	// Handler interface is unchanged.
+	//
+	// Bonus: this also drops gvisor's per-flow TCP recv/send
+	// arenas from our process memory, recovering ~3 MB at the
+	// 32-stream-speedtest fanout point that pushed IPA-B1 over
+	// the 50 MB jetsam cap when Roblox launched.
+	stack, err := tun.NewStack("", tun.StackOptions{
 		Context:    ctx,
 		Tun:        tunIf,
 		TunOptions: tunOpts,

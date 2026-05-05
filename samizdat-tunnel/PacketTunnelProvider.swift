@@ -113,15 +113,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
         appendExtLog("info: endpoint mode = \(mode.rawValue) (backup configured: \(split.backup != nil))")
 
-        // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
-        // of the loopback bridge live in this extension, so there is no
-        // cross-process sandbox issue and the listener can never get
-        // host-app-suspended out from under us.
-        appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: activeBlob, log: appendExtLog) {
-            completionHandler(makeError("SocksStub failed to start"))
-            return
-        }
+        // IPA-B2: open the App Group log sinks (both samizdat-side and
+        // socksstub-side, even though socksstub is now idle, in case
+        // rewireUpstream wakes it later). This used to live inside
+        // startInProcessSocks; pulled out so we can skip the heavy
+        // tamizdat-client-build path (~10 MB heap-resident duplicate
+        // of what netstack already owns).
+        Self.openAppGroupLogSinks()
 
         let settings = makeNetworkSettings(serverIP: serverIP)
         appendExtLog("info: applying packet tunnel network settings")
@@ -132,20 +130,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler(error)
                 return
             }
-            // IPA-B1 (Phase C / Path 4): replaced hev xcframework + lwIP +
-            // SOCKS5 loopback with the in-process sing-tun + sagernet/gvisor
-            // netstack. The fd discovery + KVO logic still applies — we feed
-            // the same fd to NetstackStart that we used to feed to hev.
+            // IPA-B1 / B2 (Path 4): hand the utun fd + config blob to the
+            // in-process sing-tun stack (Mixed mode = system TCP + gvisor
+            // UDP, matching sing-box-for-apple). hev xcframework + lwIP +
+            // SOCKS5 loopback are no longer in the data path.
             //
-            // SocksStub from Path 3 stays alive (started above by
-            // startInProcessSocks) only as the source of truth for the
-            // shape/RTT lamp ("status" message handler) and for
-            // rewireUpstream's old config-push path. Its SOCKS5 listener
-            // sits idle — no flows arrive there in Path 4. Phase 3 deletes
-            // it once the netstack-side equivalents (status getters,
-            // rewire) are wired.
+            // The Path-3 socksstub package is still gomobile-bound (its
+            // status-getter symbols are referenced by the lamp UI) but
+            // we deliberately do NOT call startInProcessSocks anymore —
+            // building a second tamizdat.Client just to serve a
+            // never-accepted SOCKS5 listener wasted ~10 MB of heap and
+            // pushed IPA-B1 over the 50 MB iOS jetsam cap when Roblox
+            // launched mid-speedtest. The lamp will show stale "—offline—"
+            // data on Path 4 until Phase 2 wires NetstackStatus getters.
             self.startNetstack(configBlob: activeBlob, completionHandler: completionHandler)
         }
+    }
+
+    /// IPA-B2: minimum log-sink wiring without building any
+    /// tamizdat clients. Called from startTunnel on Path 4. Both
+    /// samizdat and socksstub Go packages keep their own
+    /// package-global file handles; we point both at the same App
+    /// Group file so messages from either side end up in the bridge
+    /// tail. Concurrent appends < PIPE_BUF (4 KiB on Darwin) are
+    /// atomic, so interleaved writes don't corrupt lines.
+    private static func openAppGroupLogSinks() {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupID
+        ) else {
+            return
+        }
+        let logURL = containerURL.appendingPathComponent(logFileName)
+        SocksstubSetLogSink(logURL.path)
+        SamizdatSetLogSink(logURL.path)
     }
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
@@ -310,18 +327,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
-        // Run off the path monitor queue to avoid serializing further
-        // updates while we sit inside Go-side teardown.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            var err: NSError?
-            SocksstubSetSamizdatConfig(blob, &err)
-            if let err {
-                self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
-            } else {
-                self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
-            }
-        }
+        // IPA-B2: rewire via SocksstubSetSamizdatConfig is now a no-op
+        // path because Path 4 doesn't run a SOCKS5 listener — the
+        // tamizdat client lives inside netstack/. Building a duplicate
+        // in socksstub here would re-introduce the ~10 MB heap pressure
+        // that pushed IPA-B1 over the iOS jetsam cap during Roblox
+        // launch. Phase 2 wires NetstackSetSamizdatConfig to
+        // rebuild netstack's tamizdat client on path-monitor flips
+        // (wifi ↔ cellular). For IPA-B2 the rewire just logs the path
+        // change; the existing in-flight tamizdat connections will
+        // either survive the interface change (sockets resume on the
+        // new default interface within a few RTTs) or fail and be
+        // reaped by IdleTimeout=30s, with new dials going through the
+        // current default interface naturally.
+        appendExtLog("info: path change rewire deferred (mode=\(mode.rawValue)) — Phase 2 NetstackSetSamizdatConfig pending")
     }
 
     /// Picks the appropriate blob for a given mode. In manual modes
