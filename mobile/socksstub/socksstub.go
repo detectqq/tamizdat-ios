@@ -110,16 +110,15 @@ var (
 // lines are suppressed. Errors, warnings, config events, and the
 // heartbeat from Swift still appear.
 //
-// IPA-A6: defaulting to ON. Operator's actual feedback after IPA-Z6:
-// "ничего не видно". For debugging functionality (is the tunnel
-// actually carrying traffic?) the per-flow lines are essential.
-// When pure memory diagnosis is needed, flip the gate via
-// SocksstubSetVerboseFlowLogs(false) from a future Settings toggle.
+// IPA-A8: back to default OFF. Each per-flow log line forces an fsync()
+// on the App Group log file (see appendLog below); under YouTube/
+// speedtest workload that's 10-50 fsync/sec, blocking real CPU on the
+// data path while we're trying to diagnose memory pressure.
+// Functional debug (is traffic flowing?) remains possible via
+// SocksstubSetVerboseFlowLogs(true) — a future Settings toggle will
+// surface it. Heartbeat + errors + lifecycle events are NOT gated and
+// always show.
 var verboseFlowLogs atomic.Bool
-
-func init() {
-	verboseFlowLogs.Store(true)
-}
 
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
@@ -665,6 +664,13 @@ func Logs() string {
 	return string(out)
 }
 
+// IPA-A8 fsync rate-limiter: was per-line fsync. Under YouTube/Roblox
+// workload that's 10-50 fsync/sec on the App Group log file, which
+// is real CPU + iowait on the data hot path. Now we sync at most
+// once per 1 sec; a small lag in Swift's tail visibility is
+// negligible vs the cost.
+var lastSyncNano atomic.Int64
+
 func (r *runtimeState) appendLog(line string) {
 	stamp := time.Now().Format("15:04:05.000")
 	full := stamp + " app/socks: " + line
@@ -681,12 +687,12 @@ func (r *runtimeState) appendLog(line string) {
 	logSinkMu.Unlock()
 	if sink != nil {
 		_, _ = sink.WriteString(full + "\n")
-		// IPA-G: force fsync so the Swift bridge's file poller sees
-		// every line immediately. Without this, the kernel can hold
-		// writes in the page cache long enough that synchronous
-		// startup messages (listener-up, dial mode) get coalesced
-		// behind later async writes — exactly the IPA-F mystery.
-		_ = sink.Sync()
+		// Rate-limit fsync to once per second.
+		now := time.Now().UnixNano()
+		last := lastSyncNano.Load()
+		if now-last >= int64(time.Second) && lastSyncNano.CompareAndSwap(last, now) {
+			_ = sink.Sync()
+		}
 	}
 }
 
