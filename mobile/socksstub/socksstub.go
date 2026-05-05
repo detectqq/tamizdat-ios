@@ -108,9 +108,18 @@ var (
 // IPA-Z6: per-flow noise gate. When false, the high-volume "accept #N",
 // "conn#N dial", "conn#N closed", "udp#N session open/end/new target"
 // lines are suppressed. Errors, warnings, config events, and the
-// heartbeat from Swift still appear. Default false — operator's
-// crash-diagnosis log was getting drowned in per-packet trivia.
+// heartbeat from Swift still appear.
+//
+// IPA-A6: defaulting to ON. Operator's actual feedback after IPA-Z6:
+// "ничего не видно". For debugging functionality (is the tunnel
+// actually carrying traffic?) the per-flow lines are essential.
+// When pure memory diagnosis is needed, flip the gate via
+// SocksstubSetVerboseFlowLogs(false) from a future Settings toggle.
 var verboseFlowLogs atomic.Bool
+
+func init() {
+	verboseFlowLogs.Store(true)
+}
 
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
