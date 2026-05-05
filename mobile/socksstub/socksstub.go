@@ -910,9 +910,20 @@ func (a *udpDestAddr) String() string  { return a.s }
 //
 // where hdrlen == 3 + addrlen-incl-atype-and-port.
 //
-// We open ONE samizdat UDP tunnel per unique (host, port) target,
-// cache it for the lifetime of this hev TCP conn, and funnel reverse-
-// path datagrams from all tunnels back to the same hev TCP stream.
+// IPA-A5 (Phase A from analyst review 2026-05-05): the per-target
+// PacketConn map (`pcs`) is bounded with both a hard cap and an idle
+// timeout. Without these, YouTube QUIC playback on iOS opens hundreds
+// of unique (host, port) destinations across googlevideo edges, ad
+// servers and telemetry endpoints — each entry costs ~80-120 KB
+// (64 KiB scratch buf + reverse goroutine + samizdat
+// udpFramedPacketConn + h2 stream window) and never gets evicted in
+// the original code (only freed on outer FWD_UDP TCP close, which
+// lasts the whole tunnel session). 9-minute YouTube → ~300 entries
+// → ~30 MiB silent leak → iOS jetsam.
+//
+// Now: hard cap 128 entries (LRU eviction), per-entry idle timer
+// (60 s, reset on every forward/reverse datagram), lazy sweep of
+// expired entries on each forward datagram.
 func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	if err := sendReply(client, socksReplySuccess); err != nil {
 		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
@@ -928,26 +939,73 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		port uint16
 	}
 	type pcEntry struct {
-		pc          net.PacketConn
-		atyp        byte // remember the atyp for the reverse frame header
-		addrEncoded []byte // pre-encoded addr+port bytes (without atyp)
+		pc           net.PacketConn
+		atyp         byte   // remember the atyp for the reverse frame header
+		addrEncoded  []byte // pre-encoded addr+port bytes (without atyp)
+		lastActive   atomic.Int64 // unix nanos, reset on every forward/reverse activity
 	}
-	var (
-		pcMu     sync.Mutex
-		pcs      = make(map[pcKey]*pcEntry)
-		writeMu  sync.Mutex // serialize TCP writes back to hev
-		datagrams atomic.Uint64
+	const (
+		fwdUDPMaxEntries = 128                 // hard cap on pcs map
+		fwdUDPIdleNanos  = 60 * 1_000_000_000  // 60 s idle → evict
 	)
+	var (
+		pcMu      sync.Mutex
+		pcs       = make(map[pcKey]*pcEntry, fwdUDPMaxEntries)
+		writeMu   sync.Mutex // serialize TCP writes back to hev
+		datagrams atomic.Uint64
+		evictions atomic.Uint64
+	)
+
+	// closeEntry tears down a pcEntry: closes the underlying samizdat
+	// UDP-over-CONNECT (which propagates to server, h2 stream RST), then
+	// the reverse goroutine exits naturally on its next ReadFrom err.
+	// Caller must hold pcMu (the entry should already be removed from
+	// the map before close to prevent double-close races with the
+	// reverse goroutine path).
+	closeEntry := func(e *pcEntry) {
+		_ = e.pc.Close()
+	}
 
 	closeAll := func() {
 		pcMu.Lock()
 		for _, e := range pcs {
-			_ = e.pc.Close()
+			closeEntry(e)
 		}
 		pcs = nil
 		pcMu.Unlock()
 	}
 	defer closeAll()
+
+	// Sweep entries idle longer than fwdUDPIdleNanos. Caller holds pcMu.
+	sweepIdleLocked := func(nowNano int64) {
+		for k, e := range pcs {
+			if nowNano-e.lastActive.Load() > fwdUDPIdleNanos {
+				delete(pcs, k)
+				closeEntry(e)
+				evictions.Add(1)
+			}
+		}
+	}
+
+	// Evict the single oldest entry to make room for a new one.
+	// Caller holds pcMu.
+	evictOldestLocked := func() {
+		var oldestKey pcKey
+		var oldestNano int64 = -1
+		for k, e := range pcs {
+			la := e.lastActive.Load()
+			if oldestNano < 0 || la < oldestNano {
+				oldestNano = la
+				oldestKey = k
+			}
+		}
+		if oldestNano >= 0 {
+			e := pcs[oldestKey]
+			delete(pcs, oldestKey)
+			closeEntry(e)
+			evictions.Add(1)
+		}
+	}
 
 	startReverse := func(key pcKey, e *pcEntry) {
 		go func() {
@@ -957,18 +1015,28 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 				if err != nil {
 					return
 				}
+				e.lastActive.Store(time.Now().UnixNano())
 				// Frame: datlen | hdrlen | atype | addr | port | data
+				// IPA-A5: write framing header and payload via separate
+				// Write calls under writeMu, instead of allocating a
+				// fresh frame []byte per datagram. At YouTube/voice
+				// rates (1k-3k pps) the old per-pkt allocation produced
+				// 1-3 MB/s of GC garbage.
 				addrLen := len(e.addrEncoded) // includes port (no atyp)
 				hdrLen := 3 + 1 + addrLen     // 3 = datlen+hdrlen; +1 for atyp
-				frame := make([]byte, hdrLen+n)
-				binary.BigEndian.PutUint16(frame[0:2], uint16(n))
-				frame[2] = byte(hdrLen)
-				frame[3] = e.atyp
-				copy(frame[4:], e.addrEncoded)
-				copy(frame[hdrLen:], buf[:n])
+				var hdrBuf [4]byte
+				binary.BigEndian.PutUint16(hdrBuf[0:2], uint16(n))
+				hdrBuf[2] = byte(hdrLen)
+				hdrBuf[3] = e.atyp
 
 				writeMu.Lock()
-				_, werr := client.Write(frame)
+				_, werr := client.Write(hdrBuf[:])
+				if werr == nil {
+					_, werr = client.Write(e.addrEncoded)
+				}
+				if werr == nil {
+					_, werr = client.Write(buf[:n])
+				}
 				writeMu.Unlock()
 				if werr != nil {
 					return
@@ -977,12 +1045,29 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		}()
 	}
 
+	// Periodic idle sweep so entries that go silent (closed peer with
+	// no further activity) get reaped even when the map isn't full.
+	sweepTicker := time.NewTicker(15 * time.Second)
+	defer sweepTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-subCtx.Done():
+				return
+			case t := <-sweepTicker.C:
+				pcMu.Lock()
+				sweepIdleLocked(t.UnixNano())
+				pcMu.Unlock()
+			}
+		}
+	}()
+
 	// Forward path: read framed datagrams from hev, look up / open
 	// PacketConn for the target, write the payload.
 	for {
 		var hdr [3]byte
 		if _, err := io.ReadFull(client, hdr[:]); err != nil {
-			flowLogf("info: udp#%d session end (%d datagrams)", idx, datagrams.Load())
+			flowLogf("info: udp#%d session end (%d datagrams, %d evictions)", idx, datagrams.Load(), evictions.Load())
 			return
 		}
 		datLen := binary.BigEndian.Uint16(hdr[0:2])
@@ -1013,9 +1098,21 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		}
 
 		key := pcKey{host: host, port: port}
+		nowNano := time.Now().UnixNano()
 		pcMu.Lock()
 		e, ok := pcs[key]
-		if !ok {
+		if ok {
+			e.lastActive.Store(nowNano)
+		} else {
+			// Entry not present — open new tunnel. First make room.
+			if len(pcs) >= fwdUDPMaxEntries {
+				sweepIdleLocked(nowNano)
+				if len(pcs) >= fwdUDPMaxEntries {
+					evictOldestLocked()
+				}
+			}
+			pcMu.Unlock()
+			// Dial outside the lock — TCP+uTLS+H2 setup is slow.
 			// IPA-K: 5s was too tight for slow cellular. 20s gives the
 			// underlying samizdat.DialUDP enough headroom for cold-cache
 			// transport setup (TCP dial + uTLS handshake + H2 settings).
@@ -1023,18 +1120,28 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 			dialCancel()
 			if derr != nil {
-				pcMu.Unlock()
 				rt.appendLog(fmt.Sprintf("warn: udp#%d dial %s:%d: %v", idx, host, port, derr))
 				continue
 			}
-			e = &pcEntry{
-				pc:          pc,
-				atyp:        atyp,
-				addrEncoded: addrSection[1:], // addr (incl. domain-len if applicable) + port
+			pcMu.Lock()
+			// Re-check after re-acquiring lock — another goroutine may
+			// have raced us to dial the same key (unlikely with single
+			// forward loop, but cheap to check).
+			if existing, raced := pcs[key]; raced {
+				_ = pc.Close()
+				e = existing
+				e.lastActive.Store(nowNano)
+			} else {
+				e = &pcEntry{
+					pc:          pc,
+					atyp:        atyp,
+					addrEncoded: addrSection[1:],
+				}
+				e.lastActive.Store(nowNano)
+				pcs[key] = e
+				startReverse(key, e)
+				flowLogf("info: udp#%d new target %s:%d (active=%d)", idx, host, port, len(pcs))
 			}
-			pcs[key] = e
-			startReverse(key, e)
-			flowLogf("info: udp#%d new target %s:%d (active=%d)", idx, host, port, len(pcs))
 		}
 		pcMu.Unlock()
 
