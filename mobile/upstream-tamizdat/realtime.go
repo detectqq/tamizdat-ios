@@ -556,18 +556,16 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 		EndpointCacheHitScoreQ4:      2,
 		UdpPriorScoreQ4:              1,
 		TcpBulkPortScoreQ4:           -2,
-		// IPA-Z2 (iOS-only patch): upstream defaults this to 100_000.
+		// IPA-Z3 (iOS-only patch): upstream defaults this to 100_000.
 		// On iOS NEPacketTunnelProvider has a 50 MB jetsam cap; each
 		// flow record (flowState + flowEndpoints + flowOrder slot +
-		// endpointBy* indices) costs ~12-14 KB, so 100_000 means ~1.4 GB
-		// committable memory before eviction even kicks in. Real iOS
-		// crash log 2026-05-05 03:18 shows ~700 KB/s growth for ~50 s
-		// then jetsam — matches "1024 flows × 14 KB ~ 14 MB" + the rest
-		// of hev/Go runtime overhead pushing past 35 MB.
-		// 1024 caps the worst-case detector overhead at ~14 MB; eviction
-		// runs FIFO so older flows get cleaned up promptly instead of
-		// idling forever waiting for IdleReleaseAge.
-		MaxConcurrentFlows:           1024,
+		// endpointBy* indices) costs ~12-14 KB. With cap=1024 (IPA-Z2)
+		// the steady-state worst case is still ~14 MB just for detector
+		// state — too tight when combined with socketpair buffers, Go
+		// runtime, hev lwIP, uTLS handshake. Drop to 256 → ~3.5 MB worst
+		// case, which together with the IPA-Z3 socketpair-buffer cut
+		// (16 MB → 1 MB) gives ~25 MB of breathing room under speedtest.
+		MaxConcurrentFlows:           256,
 		LegacyPortPromote:            true,
 		PlanBDefaultPromoteUDP:       true,
 		PlanBRateCapWindow:           500 * time.Millisecond,
