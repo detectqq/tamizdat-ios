@@ -331,15 +331,31 @@ func SetSamizdatConfig(blob string) error {
 		PublicKey:   pubKey,
 		ShortID:     primaryShortID,
 		Fingerprint: cfg.Fingerprint,
-		// IPA-Z4: lift the client-side cap entirely (was 50 since IPA-F
-		// audit). Real cause of the "multi-open blocks all connections"
-		// symptom turned out to be H2 max-concurrent-streams, not socket
-		// pressure — server now pushes 1000 via H2 SETTINGS_MAX_CONCURRENT_
-		// STREAMS frame, and 0 here means "obey whatever server sent".
-		// Without this, our 50 capped throughput and Roblox + Safari +
-		// YouTube together would deadlock the trube as soon as ~50
-		// streams piled up.
-		MaxStreamsPerConn: 0,
+		// IPA-Z7: re-introduce a client-side cap, this time at 200.
+		//
+		// History:
+		//   IPA-F (50): too tight — 50 streams jammed by Roblox alone
+		//               + Safari + YouTube → "multi-open blocks all".
+		//   IPA-Z4 (0):  removed cap to honour server's 1000. Worked
+		//               on Windows. ON iOS 50 MB jetsam this allowed
+		//               Go's net/http2 to open hundreds of concurrent
+		//               streams under speedtest fanout, each ~50-100 KB
+		//               of read/write buffers + flow-control state →
+		//               heap saturated GOMEMLIMIT (37 MB), GC thrashed
+		//               (1655 cycles in 16 s, observed in IPA-Z6 log
+		//               2026-05-05 13:07), iOS jetsam'd.
+		//   IPA-Z7 (200): compromise — 4× the failing IPA-F value,
+		//               plenty for realistic iOS workload (speedtest
+		//               fanout 32 + Safari ~50 + Roblox 4-8 + YouTube
+		//               16 ≈ ~100 active worst case), well below the
+		//               desktop 1000 that explodes our heap. Memory
+		//               cost ~16 MB worst case (200 × 80 KB), fits
+		//               under our budget with headroom for Go runtime
+		//               itself, hev, and Swift state.
+		//
+		// If 200 turns out to still throttle multi-open scenarios,
+		// next step is 300; if 200 turns out to still OOM, 128.
+		MaxStreamsPerConn: 200,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
