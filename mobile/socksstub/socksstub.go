@@ -353,17 +353,24 @@ func SetSamizdatConfig(blob string) error {
 		//               under our budget with headroom for Go runtime
 		//               itself, hev, and Swift state.
 		//
-		//   IPA-A2 (1000): bumps to match Windows tamizdat client,
-		//               which gets 140 Mbps on this protocol with cap=1000.
-		//               iOS now matches because we shrank the per-stream
-		//               recv-window in vendor-x-net 256 → 64 KiB. Worst-
-		//               case reserved buffer: 1000 × 64 KiB = 62 MiB but
-		//               only ~20 MiB live since stream activity rarely
-		//               peaks above 30%. Roblox crashed IPA-A1 with
-		//               go.inuse=52 MB at cap=200/256 KiB stream window
-		//               (50 MiB just buffer reservations). Fix at the
-		//               window level, not the cap level.
-		MaxStreamsPerConn: 1000,
+		//   IPA-A2 (1000): backfired. 1000 cap caused go.inuse=57 MB
+		//               under speedtest. Per-stream cost on Go h2 +
+		//               tamizdat is ~200-250 KB (recv buf 64 + send buf
+		//               + header arena + goroutine stack + tamizdat
+		//               per-flow state), not just the 64 KB recv buffer.
+		//               At ~200 active streams that's 50 MB regardless
+		//               of how small we make the window. iOS architectural
+		//               ceiling is ~200-300 active streams in 50 MB
+		//               jetsam, period.
+		//   IPA-A3 (200): back to cap=200 (A1's speedtest survived this)
+		//               but pair with vendor-x-net stream window 64 KiB
+		//               (A2's window keeps), so 200 × 64 KiB = 12.8 MiB
+		//               worst-case reserved + ~25 MB Go runtime + h2
+		//               + tamizdat = ~38 MiB total, fits under 37 MB
+		//               GOMEMLIMIT with GC pressure intact. Roblox-safe
+		//               (no buffer overcommit) AND speedtest-safe
+		//               (cap that already proved survivable in A1).
+		MaxStreamsPerConn: 200,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
