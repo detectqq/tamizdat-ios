@@ -208,6 +208,37 @@ func buildTamizdatClient(cfg *configparse.Config) (*tamizdat.Client, error) {
 	//     turns on TCPFragmentation + RecordFragmentation for DPI
 	//     camouflage. Setting DisableDefaultSecurity defeats those —
 	//     production socksstub deliberately leaves it false.
+	// IPA-B4: switched V1+StrictSingleH2 → V2 (MaxTransports=2,
+	// no StrictSingleH2). Empirical reason: B3 device smoke-test
+	// crashed in 71s under iOS multi-app cold-start burst. Log
+	// (samizdat-2026-05-05T23-46-10Z) showed 588× "tamizdat: pool
+	// at MaxTransports cap: cap=1" errors in <1 sec at the moment
+	// of Safari+Roblox+YouTube concurrent open, followed by
+	// go.inuse=32MB → 91MB in 1 second (jetsam-reaped).
+	//
+	// Root cause: V1 caps total H2 stream count at MaxTransports
+	// (1) × MaxStreamsPerConn (150) = 150. iOS NE multi-app burst
+	// generates 200+ unique flows in the first few seconds (each
+	// app fires DNS+QUIC concurrently). When stream slots saturate,
+	// every new dial returns ErrPoolBackpressure; our udpDemux
+	// can't gracefully shed load fast enough, goroutines + 64KB
+	// read buffers accumulate → +60 MB allocation spike → over
+	// 50 MB jetsam cap.
+	//
+	// V2 (MaxTransports=2) doubles the cap to 300 streams. Memory
+	// cost: ~5 MB per extra TLS+H2 transport. TSPU exposure: 2
+	// long-running connections per device vs 1; still well below
+	// the #546 fingerprint counter threshold (~12 conn/user
+	// trigger per Habr 1010336 research). V1 was operator's
+	// stated preference (per memory feedback_overnight_2026_05_02_
+	// priorities) for TSPU posture, BUT V1 is not viable on iOS
+	// NE under the multi-app burst load profile that real users
+	// generate. V2 is the smallest deviation that ships.
+	//
+	// Earlier IPA-A1..A9 didn't hit this because hev's lwIP
+	// terminated UDP locally and coalesced flows; only TCP went
+	// to socksstub→tamizdat at modest concurrency. Path 4 routes
+	// every flow directly through tamizdat, exposing the V1 cap.
 	clientCfg := tamizdat.ClientConfig{
 		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
 		ServerName:        cfg.SNI,
@@ -216,8 +247,8 @@ func buildTamizdatClient(cfg *configparse.Config) (*tamizdat.Client, error) {
 		Fingerprint:       cfg.Fingerprint,
 		MaxStreamsPerConn: 150,
 		IdleTimeout:       30 * time.Second,
-		PoolVariant:       "v1",
-		StrictSingleH2:    true,
+		PoolVariant:       "v2",
+		StrictSingleH2:    false,
 	}
 	if len(cfg.SNIPool) > 1 {
 		clientCfg.ServerNames = cfg.SNIPool

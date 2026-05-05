@@ -311,10 +311,28 @@ func (d *udpDemux) lookupOrDial(key netip.AddrPort, dest M.Socksaddr) (*udpEntry
 	return e, true
 }
 
+// pumpReadBufPool reuses the 64 KiB read buffer across all
+// pumpRemoteToLocal goroutines. Without this pool each per-destination
+// pump goroutine allocated `make([]byte, 65536)` and held it for the
+// goroutine's lifetime — at 588-flow burst that's ~38 MB of pinned
+// per-pump heap on top of the goroutine stacks. This was a load-bearing
+// contributor to IPA-B3's +60 MB allocation spike during multi-app
+// cold-start.
+var pumpReadBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
 func (d *udpDemux) pumpRemoteToLocal(e *udpEntry) {
-	// 64 KiB buffer matches the local-read side; QUIC payloads are
-	// bounded well under this.
-	buf2 := make([]byte, 65536)
+	// IPA-B4: pull the read buffer from a sync.Pool instead of
+	// allocating per-goroutine. Returned on goroutine exit so the
+	// next pump reuses it.
+	bufPtr := pumpReadBufPool.Get().(*[]byte)
+	defer pumpReadBufPool.Put(bufPtr)
+	buf2 := *bufPtr
+
 	for {
 		if d.ctx.Err() != nil {
 			return
