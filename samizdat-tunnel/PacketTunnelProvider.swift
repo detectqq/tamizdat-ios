@@ -749,9 +749,24 @@ misc:
     private func makeNetworkSettings(serverIP: String?) -> NEPacketTunnelNetworkSettings {
         let remoteAddress = serverIP ?? "127.0.0.1"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
-        settings.mtu = 1280
+        // IPA-B3: bumped MTU 1280 → 4064 to match sing-box-for-apple's
+        // iOS NEPacketTunnelProvider default. sing-box source comment at
+        // protocol/tun/inbound.go:107 says "above 4064 the tun loop
+        // performance drops significantly" (4096 - UTUN_IF_HEADROOM_SIZE);
+        // below it means more iovec scratch + 3-4× syscalls per byte.
+        // Go-side bridge.go:iosTunMTU must match this exactly or sing-tun
+        // truncates incoming frames at the kernel boundary.
+        settings.mtu = 4064
 
-        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
+        // IPA-B3: switched 198.18.0.1/24 → 172.19.0.1/30 to match
+        // sing-box-for-apple's documented default
+        // (docs/configuration/inbound/tun.md:162). /30 = 4-host subnet
+        // (.0,.1,.2,.3); System/Mixed stack uses .1 as listener bind, .2
+        // as spoofed source. Both /24 and /30 satisfy
+        // HasNextAddress(prefix,1)==true so the System stack accepts it,
+        // but /30 is the well-trodden path with ~hundreds of millions of
+        // installed apps in the field.
+        let ipv4 = NEIPv4Settings(addresses: ["172.19.0.1"], subnetMasks: ["255.255.255.252"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
         if let serverIP {
             ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255")]

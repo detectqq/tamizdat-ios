@@ -45,18 +45,36 @@ jobs:
         working-directory: mobile
         run: |
           mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
-          # IPA-B1 (Phase C / Path 4): added ./netstack to the bind set.
-          # Build tags:
-          #   with_gvisor   — required by sing-tun's gvisor stack; without
-          #                   it, NewGVisor returns ErrGVisorNotIncluded.
-          #   netstack_real — gates our handler.go + bridge.go + dial_cap.go.
-          #                   The build-time probe in
-          #                   mobile/netstack/with_gvisor_required.go fails
-          #                   compile if netstack_real is set without
-          #                   with_gvisor (defence in depth).
-          # Phase 3 cleanup will drop ./socksstub from this list.
+          # IPA-B3 build tags:
+          #   with_gvisor    — required by sing-tun's gvisor stack
+          #                    (NewGVisor returns ErrGVisorNotIncluded
+          #                    without it).
+          #   netstack_real  — gates our handler.go + bridge.go +
+          #                    dial_cap.go. The build-time probe at
+          #                    mobile/netstack/with_gvisor_required.go
+          #                    fails compile if netstack_real is set
+          #                    without with_gvisor (defence in depth).
+          #   with_low_memory — sing-box-for-apple ships this on iOS via
+          #                    `-tags-not-macos=with_low_memory` (their
+          #                    cmd/internal/build_libbox/main.go:206).
+          #                    Halves every sing buf.NewSize allocation
+          #                    (BufferSize 32→16 KiB, UDPBufferSize
+          #                    16→8 KiB; sing@v0.8.9/common/buf/
+          #                    buffer_low_memory.go). At our MTU=4064
+          #                    batchSize=129 + 2 iovec arrays this
+          #                    halves ~8 MB → ~4 MB of tun-loop scratch.
+          #                    IPA-B2 missing this tag was the dominant
+          #                    cause of the +20 MB go.inuse spike at
+          #                    boot.
+          #   badlinkname    — also from sing-box-for-apple. Enables
+          #                    sing-box oomkiller's reflective json
+          #                    field-cache eviction during memory
+          #                    pressure (we don't use the oomkiller
+          #                    directly but the tag is harmless and
+          #                    matches their ship config).
+          # Phase 3 cleanup will drop ./socksstub from this bind list.
           gomobile bind -v \
-            -tags=with_gvisor,netstack_real \
+            -tags=with_gvisor,netstack_real,with_low_memory,badlinkname \
             -target=ios,iossimulator \
             -iosversion=17.0 \
             -o "${{ env.FRAMEWORK_OUT }}" \

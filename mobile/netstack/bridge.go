@@ -13,7 +13,7 @@ import (
 
 	tamizdat "github.com/detectqq/tamizdat"
 	"github.com/sagernet/sing-tun"
-	"github.com/sagernet/sing/common/logger"
+	"github.com/sagernet/sing/common/control"
 
 	"github.com/anarki/samizdat-ios/mobile/internal/configparse"
 )
@@ -34,24 +34,29 @@ var (
 	rtRes   *resources
 )
 
-// iOS NEPacketTunnelProvider supplies a 1280-byte MTU via
-// `settings.mtu = 1280` in PacketTunnelProvider.swift. The gvisor
-// link MTU must match exactly or fdbased reads truncate frames at
-// the kernel level.
-const iosTunMTU uint32 = 1280
+// IPA-B3: switched MTU 1280 → 4064 to match sing-box-for-apple's
+// iOS NEPacketTunnelProvider default (`protocol/tun/inbound.go:107`
+// in sing-box source — "above 4064 the tun loop performance drops
+// significantly, may be a system bug; below 4064 means more iovec
+// scratch and 3-4× syscalls per byte"). At MTU=1280 sing-tun's
+// `batchSize := ((512*1024)/MTU)+1 = 410` slots × `buf.NewSize` of
+// 32 KiB each = ~26 MiB of tun-loop scratch alone. With MTU=4064
+// + the with_low_memory build tag, that drops to ~4 MiB.
+const iosTunMTU uint32 = 4064
 
-// iOS extension assigns 198.18.0.1/24 to the utun via
-// NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks:
-// ["255.255.255.0"]). The gvisor stack MUST be told about this
-// address so its NIC accepts inbound packets from the iOS-side
-// app.
-var iosTunInet4 = netip.MustParsePrefix("198.18.0.1/24")
+// IPA-B3: switched 198.18.0.1/24 → 172.19.0.1/30 to match
+// sing-box-for-apple's documented default at
+// `docs/configuration/inbound/tun.md:162`. /30 = 4-host subnet
+// (.0,.1,.2,.3); System/Mixed stack uses .1 as listener bind, .2
+// as spoofed source. Both /24 and /30 satisfy
+// `HasNextAddress(prefix,1) == true` (stack_system.go:82-87 check
+// that fails the start). Switch to /30 for parity with the proven
+// reference implementation.
+var iosTunInet4 = netip.MustParsePrefix("172.19.0.1/30")
 
 // bridgeStart is called by netstack.Start under the runtime mutex.
 // It builds the tamizdat client, opens sing-tun on the iOS-supplied
-// utun fd (without trying to set system routes — iOS's
-// NEPacketTunnelNetworkSettings owns those), and starts the gvisor
-// stack with our Handler.
+// utun fd, and starts the Mixed stack with our Handler.
 //
 // On failure all partially-constructed resources are torn down here;
 // caller's `cancel()` then frees the ctx. On success the resources
@@ -73,13 +78,25 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 	// independently decides realtime per its own packet timing.
 	client.DisableRealtimeDetector()
 
-	// sing-tun darwin: when Options.FileDescriptor != 0 the
-	// constructor SKIPS the open-utun-socket path and just dups our
-	// fd into a *os.File. EXP_ExternalConfiguration: true skips
-	// setRoutes() in Start() (which on iOS extension lacks
-	// privileges) and skips InterfaceMonitor wiring (which on iOS
-	// is nil and would nil-panic). See tun_darwin.go:148-154 for
-	// the Start() short-circuit and 156-165 for Close().
+	// IPA-B3: tun.Options aligned with sing-box-for-apple iOS defaults
+	// (sing-box `protocol/tun/inbound.go:186-222` + `:181`).
+	//
+	// Key decisions:
+	//   - FileDescriptor != 0: tun.New skips the "create utun" path
+	//     and just dups our fd via os.NewFile (tun_darwin.go:94-122).
+	//   - EXP_ExternalConfiguration: true: keeps Start() from calling
+	//     `setRoutes()` (no privileges in NE sandbox; would fail
+	//     silently anyway) AND skips the
+	//     `t.options.InterfaceMonitor.RegisterMyInterface(name)` call
+	//     at tun_darwin.go:152 — we don't pass an InterfaceMonitor,
+	//     so without this short-circuit the call would nil-panic.
+	//     sing-box-for-apple does NOT set EXP_ExternalConfiguration
+	//     because they DO pass a non-nil InterfaceMonitor (libbox-
+	//     managed); we keep it true while we use a minimal stack.
+	//   - EXP_MultiPendingPackets: true (Darwin batchLoopDarwin
+	//     enables vectored iovec syscalls, ~3-4× fewer syscalls
+	//     per packet). sing-box-for-apple sets this on iOS+Mixed
+	//     when MTU<=9000 (`inbound.go:181`).
 	tunOpts := tun.Options{
 		Name:                      "utun",
 		FileDescriptor:            int(fd),
@@ -87,7 +104,8 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 		Inet4Address:              []netip.Prefix{iosTunInet4},
 		AutoRoute:                 false,
 		EXP_ExternalConfiguration: true,
-		Logger:                    logger.NOP(),
+		EXP_MultiPendingPackets:   true,
+		Logger:                    newStackLogger(),
 	}
 	tunIf, err := tun.New(tunOpts)
 	if err != nil {
@@ -95,27 +113,33 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 		return fmt.Errorf("tun.New: %w", err)
 	}
 
+	// IPA-B3: ForwarderBindInterface + InterfaceFinder are the
+	// load-bearing knobs sing-box-for-apple sets at
+	// `protocol/tun/inbound.go:319,326-327`. Without them the System
+	// TCP NAT's listener.Listen at stack_system.go:117-128 fires
+	// through the kernel default route instead of being bound to the
+	// tun interface — packets loop back into our own stack →
+	// connections never establish. This is the #1 root cause of the
+	// IPA-B2 "Roblox / speedtest don't open" symptom.
+	//
+	// We use sing's `control.NewDefaultInterfaceFinder()` which
+	// resolves interfaces via `net.Interfaces()`. sing-box-for-apple
+	// uses a richer libbox-managed monitor that pulls from Swift's
+	// NWPathMonitor; for our minimal build the default finder is
+	// sufficient because the only resolution we need is "given the
+	// tun's name, find its index" — and `net.Interfaces()` returns
+	// the tun once it's up.
+	ifFinder := control.NewDefaultInterfaceFinder()
+	if err := ifFinder.Update(); err != nil {
+		// Don't fail bridgeStart on this — Update() reads
+		// net.Interfaces() which may transiently fail during iOS
+		// extension cold start. The finder will be re-queried per
+		// dial inside BindToInterface0; tunIf isn't even up yet at
+		// this point in some cases.
+		rtLog(fmt.Sprintf("warn: InterfaceFinder.Update() at startup: %v (will retry per-dial)", err))
+	}
+
 	handler := &Handler{client: client}
-	// IPA-B2: switch from forced "gvisor" to "" (auto). With the
-	// with_gvisor build tag and IncludeAllNetworks=false, sing-tun's
-	// auto-selector picks Mixed (system TCP + gvisor UDP) — the
-	// same mode sing-box-for-apple ships on iOS, and what
-	// Shadowrocket/Hiddify/V2Box use to hit 150+ Mbps.
-	//
-	// The "gvisor" mode has an iOS-specific TCP buffer cap at
-	// stack_gvisor.go:182-202 (32 KiB default / 128 KiB max via a
-	// runtime.GOOS=="ios" check). At 200 Mbps × ~30 ms RTT, BDP =
-	// 750 KB; the 128 KiB cap pins throughput at ~32 Mbps —
-	// matching the 30 Mbps we measured in IPA-B1. Mixed mode
-	// routes TCP through a localhost net.Listener (kernel TCP, no
-	// gvisor buffer cap) that our Handler.NewConnectionEx already
-	// serves; UDP stays on gvisor + udpnat + our udpDemux. The
-	// Handler interface is unchanged.
-	//
-	// Bonus: this also drops gvisor's per-flow TCP recv/send
-	// arenas from our process memory, recovering ~3 MB at the
-	// 32-stream-speedtest fanout point that pushed IPA-B1 over
-	// the 50 MB jetsam cap when Roblox launched.
 	stack, err := tun.NewStack("", tun.StackOptions{
 		Context:    ctx,
 		Tun:        tunIf,
@@ -126,12 +150,19 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 		// sweep) sits inside one udpnat slot.
 		UDPTimeout: udpEntryIdle,
 		Handler:    handler,
-		Logger:     logger.NOP(),
+		// Real logger so sing-tun's "bind forwarder to interface:
+		// <err>" warning at stack_system.go:117-128 reaches our App
+		// Group log file. NOP() in IPA-B2 hid this exact warning
+		// which would have surfaced the missing
+		// ForwarderBindInterface field.
+		Logger:                 newStackLogger(),
+		ForwarderBindInterface: true,
+		InterfaceFinder:        ifFinder,
 	})
 	if err != nil {
 		_ = tunIf.Close()
 		client.Close()
-		return fmt.Errorf("tun.NewStack(gvisor): %w", err)
+		return fmt.Errorf("tun.NewStack: %w", err)
 	}
 	if err := stack.Start(); err != nil {
 		_ = stack.Close()
@@ -144,8 +175,18 @@ func bridgeStart(ctx context.Context, fd int32, configBlob string) error {
 	rtRes = &resources{tunIf: tunIf, stack: stack, client: client}
 	rtResMu.Unlock()
 
-	rtLog(fmt.Sprintf("info: netstack started fd=%d server=%s:%d sni=%s mtu=%d",
-		fd, cfg.ServerHost, cfg.ServerPort, cfg.SNI, iosTunMTU))
+	// IPA-B3: start the FreeOSMemory watchdog. Without it Go's GC
+	// holds onto unused arenas for minutes after deallocation, which
+	// pushed IPA-B1/B2 over the 50 MB iOS jetsam cap during heavy
+	// alloc spikes (Speedtest + Roblox launch). The watchdog
+	// tick-checks runtime.MemStats.Sys every 5 s and calls
+	// debug.FreeOSMemory() when sys > 45 MiB. Mirrors
+	// sing-box-for-apple's oomkiller cadence
+	// (service/oomkiller/timer.go:39,160,215).
+	startMemWatch(ctx)
+
+	rtLog(fmt.Sprintf("info: netstack started fd=%d server=%s:%d sni=%s mtu=%d nic=%s",
+		fd, cfg.ServerHost, cfg.ServerPort, cfg.SNI, iosTunMTU, iosTunInet4))
 	return nil
 }
 
