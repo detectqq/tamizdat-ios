@@ -246,7 +246,7 @@ struct ContentView: View {
     /// Bump this when promoting a new milestone IPA so testers can tell
     /// at a glance which build is on the device. Source of truth:
     /// `ipa/milestones/<TAG>-...` directory name.
-    private static let milestoneTag = "A3"
+    private static let milestoneTag = "A4"
 
     /// "IPA-Z6 · v0.2.42-fab1f9e (build 42)" — milestone tag is
     /// hardcoded above; rest is pulled from Info.plist, which the CI

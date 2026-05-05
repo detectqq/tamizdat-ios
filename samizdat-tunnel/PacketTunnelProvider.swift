@@ -425,6 +425,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //     code paths, otherwise it silently drops packets.
         //   - connect-timeout 2 s (down from 5) — first DNS query
         //     should not stall 5 s on a brief startup race.
+        // IPA-A4: tighten hev's per-flow buffers + cap concurrent
+        // sessions. A3 log shows under YouTube playback (long-lived
+        // TCP flows to CDN) iOS RSS slowly grows 9 minutes → jetsam,
+        // while go.inuse stays steady at 22-30 MB. Leak is in hev's
+        // lwIP per-flow PCBs + tcp/udp buffers.
+        //
+        // Caps at the hev level (defaults from upstream main.yml):
+        //   tcp-buffer-size:        64 KiB  → 16 KiB  (per-flow TCP queue)
+        //   udp-recv-buffer-size:   512 KiB → 64 KiB  (per UDP session)
+        //   udp-copy-buffer-nums:   10      → 4       (UDP intermediate buffers)
+        //   max-session-count:      0 (∞)  → 256     (hard ceiling on flows)
+        //   tcp-read-write-timeout: default 5 min → 30 s (drop dead earlier)
+        //
+        // Worst-case hev memory: 256 sessions × 16 KiB tcp-buffer
+        // = 4 MiB hev TCP state, manageable. UDP recv side: rare to
+        // exceed 32 simultaneous UDP flows × 64 KiB = 2 MiB.
+        // task-stack-size already tight at 24 KiB (default 84 KiB).
         let yaml = """
 tunnel:
   mtu: 1280
@@ -437,9 +454,13 @@ socks5:
 
 misc:
   task-stack-size: 24576
+  tcp-buffer-size: 16384
+  udp-recv-buffer-size: 65536
+  udp-copy-buffer-nums: 4
+  max-session-count: 256
   log-level: 'info'
   connect-timeout: 2000
-  read-write-timeout: 60000
+  tcp-read-write-timeout: 30000
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
