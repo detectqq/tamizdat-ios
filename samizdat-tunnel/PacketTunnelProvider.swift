@@ -661,28 +661,36 @@ misc:
     private func startSwiftHeartbeat() {
         let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        // IPA-Z6: bump cadence 2 s → 1 s for finer crash-correlation
+        // resolution. Per-flow log spam is gated behind
+        // SocksstubSetVerboseFlowLogs (default OFF), so this doesn't add
+        // log noise — heartbeat is the dominant line.
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
-            let avail = os_proc_available_memory()
-            var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
-            hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            // iOS's apple-supplied "available before jetsam" gauge.
+            let availKB = os_proc_available_memory() / 1024
+
+            // Go heap detail — disambiguates "Go is bloating" from
+            // "non-Go is bloating" on a crash.
+            //   inUse: working set of allocated objects RIGHT NOW.
+            //   sys: heap committed from OS (>= inUse).
+            //   released: returned to OS via madvise.
+            //   numGC: cycles completed since process start (rate)
+            let goInUseKB = SocksstubMemHeapInUseKB()
+            let goSysKB   = SocksstubMemHeapSysKB()
+            let goRelKB   = SocksstubMemHeapReleasedKB()
+            let numGC     = SocksstubMemNumGC()
+
             // Ask the Go runtime to return freed pages to iOS so they
-            // don't sit on our jetsam ledger between heartbeats. Cheap
-            // (a single madvise loop in Go's scavenger).
+            // don't sit on our jetsam ledger between heartbeats.
             SocksstubFreeOSMemory()
-            // IPA-V: include PacketBridge counters + active app-hint
-            // table size so we can confirm Swift is actually feeding
-            // hev and that metadata is flowing through.
-            let bridgeCounters = self.packetBridge?.counters() ?? (toHev: 0, fromHev: 0, hints: 0)
-            let hintCount = SocksstubAppHintCount()
+
             self.appendExtLog(String(
-                format: "info: hb avail=%dKB hev tx=%d/%dKB rx=%d/%dKB bridge to=%llu from=%llu hints=%llu live=%d",
-                avail / 1024,
-                tx_pkts, tx_bytes / 1024,
-                rx_pkts, rx_bytes / 1024,
-                bridgeCounters.toHev, bridgeCounters.fromHev, bridgeCounters.hints,
-                hintCount
+                format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld",
+                availKB,
+                goInUseKB, goSysKB, goRelKB,
+                numGC
             ))
         }
         timer.resume()

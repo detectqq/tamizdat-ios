@@ -242,14 +242,21 @@ struct ContentView: View {
         bridge.state == .connected ? .red : .blue
     }
 
-    /// "v0.2.42-fab1f9e (build 42)" — pulled from Info.plist, which the
-    /// CI workflow stamps with MARKETING_VERSION = 0.2.<run>-<git-sha>
-    /// and CURRENT_PROJECT_VERSION = <run>. Updates on every build.
+    /// IPA milestone tag rendered next to the version in the footer.
+    /// Bump this when promoting a new milestone IPA so testers can tell
+    /// at a glance which build is on the device. Source of truth:
+    /// `ipa/milestones/<TAG>-...` directory name.
+    private static let milestoneTag = "Z6"
+
+    /// "IPA-Z6 · v0.2.42-fab1f9e (build 42)" — milestone tag is
+    /// hardcoded above; rest is pulled from Info.plist, which the CI
+    /// workflow stamps with MARKETING_VERSION = 0.2.<run>-<git-sha> and
+    /// CURRENT_PROJECT_VERSION = <run>. Updates on every build.
     private var buildLabel: String {
         let info = Bundle.main.infoDictionary
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "v\(marketing) (build \(build))"
+        return "IPA-\(Self.milestoneTag) · v\(marketing) (build \(build))"
     }
 
     // IPA-Q: status badge colour + text driven by WhitelistDetector.

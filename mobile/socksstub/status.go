@@ -28,6 +28,8 @@
 
 package socksstub
 
+import "runtime"
+
 // CurrentShapeMode returns the controller-intent shape: "ShapeFull",
 // "ShapeLite", or "" if no client is built. Operator's intent —
 // not necessarily what's already on the wire.
@@ -125,4 +127,41 @@ func RTTLastMs() int64 {
 		return -1
 	}
 	return c.RTTProbeSnapshot().LastMs
+}
+
+// MemHeapInUseKB returns runtime.MemStats.HeapInuse in KB. This is the
+// Go heap that's CURRENTLY holding allocated objects — the working
+// set, not the high-water mark. IPA-Z6: surfaced in the Swift
+// heartbeat alongside `os_proc_available_memory()` to disambiguate
+// "Go is bloating" vs "non-Go state is bloating" before crashes.
+func MemHeapInUseKB() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapInuse / 1024)
+}
+
+// MemHeapSysKB returns runtime.MemStats.HeapSys in KB — total heap
+// memory obtained from OS (committed). HeapInuse <= HeapSys; the gap
+// is what GC has freed but not yet returned to OS.
+func MemHeapSysKB() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapSys / 1024)
+}
+
+// MemHeapReleasedKB returns runtime.MemStats.HeapReleased in KB —
+// memory the scavenger has actually returned to the OS. If this lags
+// HeapSys-HeapInuse, GOMEMLIMIT pacer is starving the scavenger.
+func MemHeapReleasedKB() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapReleased / 1024)
+}
+
+// MemNumGC returns the count of completed GC cycles since process
+// start. Tells you whether GC is even firing.
+func MemNumGC() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.NumGC)
 }

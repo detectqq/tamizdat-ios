@@ -105,6 +105,34 @@ var (
 	logSink   *os.File
 )
 
+// IPA-Z6: per-flow noise gate. When false, the high-volume "accept #N",
+// "conn#N dial", "conn#N closed", "udp#N session open/end/new target"
+// lines are suppressed. Errors, warnings, config events, and the
+// heartbeat from Swift still appear. Default false — operator's
+// crash-diagnosis log was getting drowned in per-packet trivia.
+var verboseFlowLogs atomic.Bool
+
+// SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
+// SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
+func SetVerboseFlowLogs(enabled bool) {
+	verboseFlowLogs.Store(enabled)
+	if enabled {
+		rt.appendLog("info: verbose per-flow logs = ON")
+	} else {
+		rt.appendLog("info: verbose per-flow logs = OFF (errors+heartbeat only)")
+	}
+}
+
+// flowLogf is a gated wrapper for per-flow info logs. Errors and
+// warnings should still use rt.appendLog directly so they're never
+// suppressed.
+func flowLogf(format string, args ...interface{}) {
+	if !verboseFlowLogs.Load() {
+		return
+	}
+	rt.appendLog(fmt.Sprintf(format, args...))
+}
+
 // SetLogSink opens the given path in append mode (creating if necessary).
 // Pass an empty string to detach.
 func SetLogSink(path string) {
@@ -632,7 +660,7 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 		// while hev says it's forwarding traffic, loopback in
 		// NEPacketTunnelProvider is sandbox-blocked — the headline
 		// data-plane diagnosis we need.
-		rt.appendLog(fmt.Sprintf("info: accept #%d from %s", n, c.RemoteAddr()))
+		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
 		go func(client net.Conn, idx uint64) {
 			defer client.Close()
 			defer rt.connsActive.Add(-1)
@@ -739,7 +767,7 @@ func readSocksAddr(r io.Reader, atyp byte) (string, uint16, error) {
 // handleConnect handles SOCKS5 cmd=0x01 (CONNECT) — TCP tunnel. Caller
 // has already consumed the request header AND the addr/port.
 func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string) {
-	rt.appendLog(fmt.Sprintf("info: conn#%d dial → %s", idx, dest))
+	flowLogf("info: conn#%d dial → %s", idx, dest)
 	dialStart := time.Now()
 	// IPA-K: 10s was too tight for first-flow on Russian cellular where
 	// TLS handshake gets delayed by DPI. 20s lets cold-cache transport
@@ -759,7 +787,7 @@ func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string
 		_ = sendReply(client, code)
 		return
 	}
-	rt.appendLog(fmt.Sprintf("info: conn#%d dial %s ok in %dms", idx, dest, time.Since(dialStart).Milliseconds()))
+	flowLogf("info: conn#%d dial %s ok in %dms", idx, dest, time.Since(dialStart).Milliseconds())
 	defer upstream.Close()
 
 	if err := sendReply(client, socksReplySuccess); err != nil {
@@ -767,7 +795,7 @@ func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string
 		return
 	}
 	relay(client, upstream)
-	rt.appendLog(fmt.Sprintf("info: conn#%d closed (lifetime %dms)", idx, time.Since(dialStart).Milliseconds()))
+	flowLogf("info: conn#%d closed (lifetime %dms)", idx, time.Since(dialStart).Milliseconds())
 }
 
 func sendReply(client net.Conn, code byte) error {
@@ -871,7 +899,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
 		return
 	}
-	rt.appendLog(fmt.Sprintf("info: udp#%d FWD_UDP session open", idx))
+	flowLogf("info: udp#%d FWD_UDP session open", idx)
 
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -935,7 +963,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	for {
 		var hdr [3]byte
 		if _, err := io.ReadFull(client, hdr[:]); err != nil {
-			rt.appendLog(fmt.Sprintf("info: udp#%d session end (%d datagrams)", idx, datagrams.Load()))
+			flowLogf("info: udp#%d session end (%d datagrams)", idx, datagrams.Load())
 			return
 		}
 		datLen := binary.BigEndian.Uint16(hdr[0:2])
@@ -987,7 +1015,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			}
 			pcs[key] = e
 			startReverse(key, e)
-			rt.appendLog(fmt.Sprintf("info: udp#%d new target %s:%d (active=%d)", idx, host, port, len(pcs)))
+			flowLogf("info: udp#%d new target %s:%d (active=%d)", idx, host, port, len(pcs))
 		}
 		pcMu.Unlock()
 
