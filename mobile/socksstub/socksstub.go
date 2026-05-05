@@ -822,21 +822,13 @@ func sendReply(client net.Conn, code byte) error {
 }
 
 // dialUpstream is the swap-point: stage 1 = direct, stage 2 = samizdat.
-//
-// IPA-V: if the Swift extension recorded an app-attribution hint for
-// this destination via SubmitAppHint(), wrap ctx with tamizdat.
-// ContextWithAppHint so the H2 CONNECT request carries a
-// Tamizdat-App-Hint header. The server-side classifier (v2, deployed
-// 2026-05-02) reads that header as a Tier 3 side signal and scores
-// realtime apps (anydesk/roblox/discord/etc.) toward TrafficRealtime.
+// IPA-A1: app-hint Tier 3 removed (PacketBridge gone). Server's
+// Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
+// classifier without us.
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
-	if hint := lookupAppHint("tcp", dest); hint != "" {
-		ctx = samizdat.ContextWithAppHint(ctx, hint)
-		rt.appendLog(fmt.Sprintf("info: app_hint=%q for tcp %s", hint, dest))
-	}
 	if client == nil {
 		// Direct dial — POC stage 1 / fallback when no config set.
 		var d net.Dialer
@@ -852,10 +844,6 @@ func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
-	if hint := lookupAppHint("udp", dest); hint != "" {
-		ctx = samizdat.ContextWithAppHint(ctx, hint)
-		rt.appendLog(fmt.Sprintf("info: app_hint=%q for udp %s", hint, dest))
-	}
 	if client == nil {
 		var d net.Dialer
 		c, err := d.DialContext(ctx, "udp", dest)

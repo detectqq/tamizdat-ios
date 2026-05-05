@@ -76,13 +76,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var whitelistDetector: WhitelistDetector?
     private var lastPathSatisfied: Bool = true
 
-    // IPA-V: per-flow process attribution. PacketBridge sits between
-    // packetFlow.readPacketsAndMetadata (where NEFlowMetaData lives)
-    // and hev's tun fd. For every outbound packet with a non-nil
-    // metadata.sourceAppSigningIdentifier it submits an app-hint to
-    // socksstub, which then attaches a Tamizdat-App-Hint header to
-    // the matching upstream H2 CONNECT.
-    private var packetBridge: PacketBridge?
+    // IPA-A1: PacketBridge removed. We're back on the original
+    // "Path 3" architecture (Pattern 1 in the iOS proxy taxonomy):
+    // hev gets the raw utun file descriptor via KVO and reads/writes
+    // packets directly in C. No Swift in the data path. Same setup
+    // Shadowrocket / Surge / Tun2SocksKit use. Loss: per-flow
+    // NEFlowMetaData (app bundle-id) — the Tamizdat-App-Hint header
+    // (Tier 3 server classifier signal) is no longer sent. Server's
+    // Tier 1 (port whitelist for Roblox/AnyDesk/Discord/IANA-dynamic)
+    // and Tier 2 (cadence/jitter for RTP/opus) handle real workload
+    // without it.
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -184,10 +187,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         WhitelistStatusStore.reset()
         pathMonitor.cancel()
         hev_socks5_tunnel_quit()
-        // IPA-V: tear down the bridge AFTER hev has been told to quit
-        // so hev sees EBADF / EOF on its side and exits cleanly.
-        packetBridge?.stop()
-        packetBridge = nil
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
         try? swiftLogHandle?.close()
@@ -444,29 +443,29 @@ misc:
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
-        // IPA-V: instead of handing hev the raw utun fd (which bypasses
-        // the Swift packetFlow API and hides NEFlowMetaData), we put a
-        // socketpair-based PacketBridge between Apple's packetFlow and
-        // hev. Swift reads packetFlow.readPacketsAndMetadata to get
-        // sourceAppSigningIdentifier, submits app hints to socksstub
-        // for each (proto, dst:port) tuple, and forwards the packet
-        // to hev via the bridge socketpair. Reverse direction works
-        // the same way.
-        //
-        // The KVO utun fd discovery used in IPA-H is no longer needed
-        // for the data path — we never give hev the kctl fd. The
-        // bridge owns the only fd hev sees.
-        let bridge = PacketBridge(provider: self) { [weak self] line in
-            self?.appendExtLog(line)
-        }
-        let fd = bridge.start()
-        if fd < 0 {
-            appendExtLog("error: PacketBridge failed to allocate socketpair")
-            completionHandler(makeError("PacketBridge socketpair failed"))
+        // IPA-A1: direct utun fd handoff to hev. Same pattern as
+        // Tun2SocksKit, Shadowrocket, sing-box-with-hev configs etc.
+        // KVO `socket.fileDescriptor` is the well-known private API
+        // every shipping iOS proxy app uses — wireguard-apple,
+        // sing-box-for-apple, Tun2SocksKit. Apple has not deprecated it.
+        // Fallback fd-scanner kept as diagnostic for the rare case KVO
+        // returns nil (typically when iCloud Private Relay's utun
+        // shadows ours).
+        let kvoFD = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
+        let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) ?? -1
+        appendExtLog("info: utun fd kvo=\(kvoFD) scan=\(scanFD)")
+        let fd: Int32
+        if kvoFD >= 0 {
+            fd = kvoFD
+        } else if scanFD >= 0 {
+            appendExtLog("warn: KVO fd unavailable, falling back to scan")
+            fd = scanFD
+        } else {
+            appendExtLog("error: could not locate utun fd (KVO + scan both failed)")
+            completionHandler(makeError("utun fd not found"))
             return
         }
-        self.packetBridge = bridge
-        appendExtLog("info: PacketBridge started; hev fd = \(fd)")
+        appendExtLog("info: utun fd selected = \(fd)")
 
         // Verify main app's SOCKS5 listener is reachable before handing
         // packets to hev. If the app hasn't started SocksStubStart yet,
@@ -686,14 +685,15 @@ misc:
             // don't sit on our jetsam ledger between heartbeats.
             SocksstubFreeOSMemory()
 
-            // IPA-Z8: bridge counters are useful for correlating
-            // memory pressure with packet rate. Compute deltas
-            // since last heartbeat so the log shows pps.
-            let counters = self.packetBridge?.counters() ?? (toHev: 0, fromHev: 0, hints: 0)
-            let inboundPPS  = Int64(counters.toHev) - self.lastBridgeToHev
-            let outboundPPS = Int64(counters.fromHev) - self.lastBridgeFromHev
-            self.lastBridgeToHev = Int64(counters.toHev)
-            self.lastBridgeFromHev = Int64(counters.fromHev)
+            // IPA-A1: pps comes from hev's own tunnel-stats counters
+            // (it now owns the data path again — no bridge counters
+            // to consult). Compute delta since last heartbeat.
+            var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
+            hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            let inboundPPS  = Int64(tx_pkts) - self.lastHevTxPkts
+            let outboundPPS = Int64(rx_pkts) - self.lastHevRxPkts
+            self.lastHevTxPkts = Int64(tx_pkts)
+            self.lastHevRxPkts = Int64(rx_pkts)
 
             self.appendExtLog(String(
                 format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
@@ -707,9 +707,9 @@ misc:
         swiftHeartbeatTimer = timer
     }
 
-    // IPA-Z8 bookkeeping for pps delta in heartbeat.
-    private var lastBridgeToHev: Int64 = 0
-    private var lastBridgeFromHev: Int64 = 0
+    // IPA-A1 bookkeeping for pps delta in heartbeat (from hev's own counters).
+    private var lastHevTxPkts: Int64 = 0
+    private var lastHevRxPkts: Int64 = 0
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
