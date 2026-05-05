@@ -371,14 +371,15 @@ func SetSamizdatConfig(blob string) error {
 		//               ceiling is ~200-300 active streams in 50 MB
 		//               jetsam, period.
 		//   IPA-A3 (200): back to cap=200 (A1's speedtest survived this)
-		//               but pair with vendor-x-net stream window 64 KiB
-		//               (A2's window keeps), so 200 × 64 KiB = 12.8 MiB
-		//               worst-case reserved + ~25 MB Go runtime + h2
-		//               + tamizdat = ~38 MiB total, fits under 37 MB
-		//               GOMEMLIMIT with GC pressure intact. Roblox-safe
-		//               (no buffer overcommit) AND speedtest-safe
-		//               (cap that already proved survivable in A1).
-		MaxStreamsPerConn: 200,
+		//               but pair with vendor-x-net stream window 64 KiB.
+		//   IPA-A9 (150): operator request after A7 still crashed under
+		//               Roblox+YouTube combo. 150 × ~130 KB live per
+		//               active stream = ~19 MiB peak instead of ~26 MiB
+		//               at 200 — frees ~6-7 MiB headroom under jetsam.
+		//               Realistic concurrent load: Safari ~50 + Roblox
+		//               ~8 + YouTube ~20 + speedtest fanout ~32 ≈ 110.
+		//               Cap=150 still has 36% buffer over that.
+		MaxStreamsPerConn: 150,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
