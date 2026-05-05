@@ -353,9 +353,17 @@ func SetSamizdatConfig(blob string) error {
 		//               under our budget with headroom for Go runtime
 		//               itself, hev, and Swift state.
 		//
-		// If 200 turns out to still throttle multi-open scenarios,
-		// next step is 300; if 200 turns out to still OOM, 128.
-		MaxStreamsPerConn: 200,
+		//   IPA-A2 (1000): bumps to match Windows tamizdat client,
+		//               which gets 140 Mbps on this protocol with cap=1000.
+		//               iOS now matches because we shrank the per-stream
+		//               recv-window in vendor-x-net 256 → 64 KiB. Worst-
+		//               case reserved buffer: 1000 × 64 KiB = 62 MiB but
+		//               only ~20 MiB live since stream activity rarely
+		//               peaks above 30%. Roblox crashed IPA-A1 with
+		//               go.inuse=52 MB at cap=200/256 KiB stream window
+		//               (50 MiB just buffer reservations). Fix at the
+		//               window level, not the cap level.
+		MaxStreamsPerConn: 1000,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
