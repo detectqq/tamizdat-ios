@@ -148,16 +148,18 @@ func Start(addrSpec string) error {
 	rt.mu.Unlock()
 
 	// Pin the Go runtime under iOS's NEPacketTunnelProvider memory cap.
-	// Path 3 runs the Go runtime + samizdat client + lwIP-via-hev all
-	// inside the extension; iOS jetsam will reap us if the process RSS
-	// approaches 50 MB. 25 MB soft limit + GOGC=20 tells the pacer to
-	// run GC progressively earlier rather than waiting for heap to
-	// double. FreeOSMemory is fired periodically below — we don't have
-	// a clean place for that here without spawning a goroutine, so we
-	// rely on the runtime's natural scavenger plus the heartbeat-driven
-	// FreeOSMemory call from the extension Swift side (which, if added,
-	// can call back into Go via gomobile).
-	debug.SetMemoryLimit(25 * 1024 * 1024)
+	// iOS jetsam-reaps the extension if RSS approaches ~50 MB.
+	//
+	// IPA-Z5: bump soft limit 25 MB → 37 MB (sing-box-for-apple's
+	// formula: 75% of the 50 MB jetsam cap). At 25 MB the GC pacer was
+	// running so aggressively that small bursts couldn't be absorbed
+	// without paging — and the headroom we kept (25 MB unused) was
+	// just sitting useless because Go won't touch it. 37 MB lets the
+	// heap actually breathe under speedtest fanout while still leaving
+	// 13 MB headroom for non-Go state (Swift, hev, NEPacketTunnel
+	// internals). GOGC=20 (steeper-than-default GC ramp) is kept —
+	// Go's pacer will start aggressive collection well before 37 MB.
+	debug.SetMemoryLimit(37 * 1024 * 1024)
 	debug.SetGCPercent(20)
 
 	network := "tcp"
