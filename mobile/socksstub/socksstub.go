@@ -301,8 +301,15 @@ func SetSamizdatConfig(blob string) error {
 		PublicKey:   pubKey,
 		ShortID:     primaryShortID,
 		Fingerprint: cfg.Fingerprint,
-		// Audit fix (final IPA-F): cap concurrent H2 streams at 50.
-		MaxStreamsPerConn: 50,
+		// IPA-Z4: lift the client-side cap entirely (was 50 since IPA-F
+		// audit). Real cause of the "multi-open blocks all connections"
+		// symptom turned out to be H2 max-concurrent-streams, not socket
+		// pressure — server now pushes 1000 via H2 SETTINGS_MAX_CONCURRENT_
+		// STREAMS frame, and 0 here means "obey whatever server sent".
+		// Without this, our 50 capped throughput and Roblox + Safari +
+		// YouTube together would deadlock the trube as soon as ~50
+		// streams piled up.
+		MaxStreamsPerConn: 0,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:

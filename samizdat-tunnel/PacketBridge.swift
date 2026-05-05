@@ -96,12 +96,14 @@ final class PacketBridge {
         swiftSideFD = fds[0]
         hevSideFD = fds[1]
 
-        // IPA-Z3: per-socket buffers were 4 MiB × 4 = up to 16 MiB
-        // committed on speedtest, which alone consumes a third of our
-        // 50 MB jetsam cap before any client logic. 256 KiB × 4 = 1 MiB
-        // total, holds ~200 packets at 1280 MTU per buffer — enough for
-        // burst smoothing without bloating RSS.
-        var sndbuf: Int32 = 256 * 1024
+        // IPA-Z4: 256 KiB (Z3) throttled upstream throughput because
+        // hev's drain rate occasionally lagged behind packetFlow's
+        // produce rate during bursts → SO_SNDBUF fill → kernel drops →
+        // TCP retransmits → speed cliff. 1 MiB × 4 sides = 4 MiB total
+        // committed worst case, holds ~800 packets per buffer at 1280
+        // MTU. Compromise: ~12 MiB lower than the original 16 MiB Z2
+        // value, but leaves headroom for actual speedtest fanout.
+        var sndbuf: Int32 = 1024 * 1024
         setsockopt(swiftSideFD, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(swiftSideFD, SOL_SOCKET, SO_RCVBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(hevSideFD,   SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))

@@ -556,16 +556,17 @@ func defaultRealtimeDetectorConfig() RealtimeDetectorConfig {
 		EndpointCacheHitScoreQ4:      2,
 		UdpPriorScoreQ4:              1,
 		TcpBulkPortScoreQ4:           -2,
-		// IPA-Z3 (iOS-only patch): upstream defaults this to 100_000.
-		// On iOS NEPacketTunnelProvider has a 50 MB jetsam cap; each
-		// flow record (flowState + flowEndpoints + flowOrder slot +
-		// endpointBy* indices) costs ~12-14 KB. With cap=1024 (IPA-Z2)
-		// the steady-state worst case is still ~14 MB just for detector
-		// state — too tight when combined with socketpair buffers, Go
-		// runtime, hev lwIP, uTLS handshake. Drop to 256 → ~3.5 MB worst
-		// case, which together with the IPA-Z3 socketpair-buffer cut
-		// (16 MB → 1 MB) gives ~25 MB of breathing room under speedtest.
-		MaxConcurrentFlows:           256,
+		// IPA-Z4 (iOS-only patch): upstream desktop default is 100_000.
+		// Operator's Windows-vs-mobile tests show bulk-vs-lite RTT
+		// difference is within noise (117 ms vs 116 ms over mobile
+		// internet). The real perf lever was H2 max-streams (50→1000
+		// via server SETTINGS frame), not the realtime detector's
+		// shape-flip machinery. So the detector contributes near-zero
+		// throughput benefit on a phone — just memory cost. Drop to
+		// 64 → ~900 KB worst case detector state. Detector still runs
+		// (Geneva fragmentation hooks etc. depend on it being non-nil),
+		// it just tracks 64 flows max instead of 1024.
+		MaxConcurrentFlows:           64,
 		LegacyPortPromote:            true,
 		PlanBDefaultPromoteUDP:       true,
 		PlanBRateCapWindow:           500 * time.Millisecond,
