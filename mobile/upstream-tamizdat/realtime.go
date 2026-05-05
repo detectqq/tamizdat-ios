@@ -455,6 +455,18 @@ type migrationRequest struct {
 }
 
 type RealtimeDetector struct {
+	// IPA-A7 (iOS-local patch): when set, the detector early-returns
+	// from ClassifyOpen / Observe with TrafficBulk and never starts
+	// its cleanup goroutine. Per-packet hot path drops the d.mu
+	// acquisition under speedtest (10000 mutex ops/sec → 0). Operator's
+	// own tests showed bulk-vs-lite RTT on this network is 117 vs 116
+	// ms — the realtime-aware shape flip provides no measurable user
+	// benefit, so we trade the CPU + complexity for a simpler V1+
+	// StrictSingleH2 invariant. Set via Disable() right after Client
+	// construction. Wire-protocol unaffected (server-side classifier
+	// runs independently from packet timings on its end).
+	disabled atomic.Bool
+
 	ports    map[int]struct{}
 	appHints []string
 	cfg      RealtimeDetectorConfig
@@ -814,12 +826,23 @@ func (d *RealtimeDetector) ClassifyOpen(meta FlowMeta) TrafficClass {
 	return class
 }
 
+// Disable puts the detector in no-op mode (IPA-A7 iOS-local patch).
+// All subsequent Observe / ClassifyOpen calls early-return with
+// TrafficBulk and skip the d.mu critical section. cleanupLoop also
+// noticed the flag and exits its goroutine. Idempotent.
+func (d *RealtimeDetector) Disable() {
+	if d == nil {
+		return
+	}
+	d.disabled.Store(true)
+}
+
 // ClassifyOpenWithToken classifies a candidate flow and returns both the
 // traffic class and an opaque token that callers must pass to
 // RealtimeController.OpenWithToken so bindOpen receives the correct pending
 // entry. Token is nil when no pending was recorded (e.g. forceBulk hit).
 func (d *RealtimeDetector) ClassifyOpenWithToken(meta FlowMeta) (TrafficClass, *flowToken) {
-	if d == nil {
+	if d == nil || d.disabled.Load() {
 		return TrafficBulk, nil
 	}
 	meta = normalizeFlowMeta(meta)
@@ -952,6 +975,12 @@ func (d *RealtimeDetector) ObservePacket(flowID uint64, at time.Time, payload []
 
 func (d *RealtimeDetector) Observe(p ObservedPacket) TrafficClass {
 	if d == nil || p.FlowID == 0 {
+		return TrafficBulk
+	}
+	// IPA-A7: short-circuit BEFORE d.mu acquire. Per-packet hot path
+	// under speedtest 10000 pps was hitting this mutex 10000×/sec; the
+	// disable flag drops that to zero.
+	if d.disabled.Load() {
 		return TrafficBulk
 	}
 	if p.At.IsZero() {
@@ -2489,6 +2518,13 @@ func (d *RealtimeDetector) setController(c *RealtimeController) {
 	d.mu.Lock()
 	d.controller = c
 	d.mu.Unlock()
+	// IPA-A7: don't start cleanupLoop if detector was disabled before
+	// the controller wires up. (If Disable() is called AFTER the loop
+	// already started, the loop sees d.disabled.Load() inside cleanupLoop
+	// and exits on next tick.)
+	if d.disabled.Load() {
+		return
+	}
 	d.cleanupStarted.Do(func() {
 		go d.cleanupLoop()
 	})
@@ -2497,9 +2533,18 @@ func (d *RealtimeDetector) setController(c *RealtimeController) {
 func (d *RealtimeDetector) cleanupLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
+	// IPA-A7: graceful exit if disabled flag was set after loop started.
+	if d.disabled.Load() {
+		return
+	}
 	for {
 		select {
 		case now := <-t.C:
+			// IPA-A7: re-check on each tick — Disable() may be called
+			// after the loop starts.
+			if d.disabled.Load() {
+				return
+			}
 			d.sweepIdle(now)
 		case <-d.stop:
 			return

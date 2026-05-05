@@ -427,6 +427,15 @@ func SetSamizdatConfig(blob string) error {
 		return err
 	}
 
+	// IPA-A7: disable client-side realtime detector on iOS. Operator's
+	// measurement: bulk vs lite shape-flip RTT difference is 1 ms (117
+	// vs 116 ms) on this network — no user-perceptible benefit. The
+	// detector's per-packet Observe under d.mu was the hottest mutex
+	// at speedtest pps. Server-side classifier independently decides
+	// realtime per its own packet timing — wire protocol unaffected.
+	client.DisableRealtimeDetector()
+	rt.appendLog("info: client realtime detector = DISABLED (iOS-local)")
+
 	rt.mu.Lock()
 	old := rt.samizdatClient
 	rt.samizdatBlob = blob

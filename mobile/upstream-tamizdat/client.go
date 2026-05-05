@@ -292,6 +292,23 @@ func (c *Client) ShapeMode() string {
 	return c.realtime.Mode().String()
 }
 
+// DisableRealtimeDetector puts the client's realtime classifier into
+// no-op mode. ClassifyOpen / Observe early-return TrafficBulk; per-
+// packet d.mu acquisition is skipped; cleanupLoop exits gracefully.
+// Wire-protocol unaffected — server-side classifier runs independently.
+//
+// IPA-A7 iOS-local: speedtest-time mutex contention on the global
+// detector lock (10000 acq/sec) was the dominant CPU cost on iOS.
+// Operator's measurement showed bulk-vs-lite RTT difference of 1 ms
+// — no measurable user benefit on this network. Trade the realtime-
+// aware shape-flip for a simpler V1+StrictSingleH2 invariant.
+func (c *Client) DisableRealtimeDetector() {
+	if c == nil || c.realtime == nil || c.realtime.Detector == nil {
+		return
+	}
+	c.realtime.Detector.Disable()
+}
+
 // ActiveRealtimeCount returns the live count of realtime-class flows tracked
 // by the client's realtime controller. Useful for debug observability.
 func (c *Client) ActiveRealtimeCount() int {
