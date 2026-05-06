@@ -613,16 +613,14 @@ func SetSamizdatConfig(blob string) error {
 		//               Roblox+YouTube combo. 150 × ~130 KB live per
 		//               active stream = ~19 MiB peak instead of ~26 MiB
 		//               at 200 — frees ~6-7 MiB headroom under jetsam.
-		//               IPA-D6: 150→8. Per-flow Go heap is ~1.5 MiB under
-		//               sustained download (empirically). Cannot match
-		//               Shadowrocket's per-flow cost (50 bytes - 20 KB) —
-		//               it's architectural Go-runtime overhead. Compensate
-		//               by hard-bounding parallelism: 16-stream Speedtest
-		//               forced into 2 batches of 8. Heap = 8 × 1.5 MiB =
-		//               12 MiB. Tradeoff: Speedtest throughput halved;
-		//               YouTube (~6 streams) unaffected; Roblox/Telegram
-		//               unaffected; heavy Safari fanout serializes.
-		MaxStreamsPerConn: 8,
+		//               IPA-D8: REVERTED 8→150. D6 set this to 8 hoping
+		//               to bound heap. With V2 mode (MaxTransports=2),
+		//               total slots = 8 × 2 = 16 — insufficient for
+		//               normal iOS multi-app combo. Result: every dial
+		//               immediately failed with "pool at MaxTransports cap"
+		//               error. Pool size doesn't fix memory; we need
+		//               D7's bufio.Copy + nuclear close approach instead.
+		MaxStreamsPerConn: 150,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
