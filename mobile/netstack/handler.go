@@ -209,10 +209,13 @@ func (d *udpDemux) run() {
 		if d.ctx.Err() != nil {
 			return
 		}
-		// 64 KiB matches the deleted forwardUDP code's buffer size,
-		// which served Speedtest's 1500-byte UDP datagrams plus QUIC
-		// jumbo-equivalents fine.
-		b := buf.NewSize(65536)
+		// IPA-B5: shrunk 64 KiB → 16 KiB. UDP datagrams (DNS, QUIC,
+		// game traffic) are bounded ~1.5 KB; 16 KiB still has 10×
+		// headroom. sing's buf.NewSize allocates from a pool sized
+		// by the with_low_memory tag's BufferSize const (16 KiB),
+		// so 16-KiB requests are pool-friendly while 64-KiB requests
+		// allocated fresh on every iteration.
+		b := buf.NewSize(16 * 1024)
 		dest, err := d.conn.ReadPacket(b)
 		if err != nil {
 			b.Release()
@@ -311,16 +314,25 @@ func (d *udpDemux) lookupOrDial(key netip.AddrPort, dest M.Socksaddr) (*udpEntry
 	return e, true
 }
 
-// pumpReadBufPool reuses the 64 KiB read buffer across all
+// pumpReadBufPool reuses the read buffer across all
 // pumpRemoteToLocal goroutines. Without this pool each per-destination
-// pump goroutine allocated `make([]byte, 65536)` and held it for the
-// goroutine's lifetime — at 588-flow burst that's ~38 MB of pinned
+// pump goroutine allocated `make([]byte, ...)` and held it for the
+// goroutine's lifetime — at 588-flow burst that's ~38 MiB of pinned
 // per-pump heap on top of the goroutine stacks. This was a load-bearing
 // contributor to IPA-B3's +60 MB allocation spike during multi-app
 // cold-start.
+//
+// IPA-B5: buffer size shrunk 64 KiB → 16 KiB. UDP datagrams over QUIC
+// or DNS are bounded ~1.5 KB; 16 KiB still has 10× headroom for
+// jumbograms but cuts max per-pump pinned cost in half (when pool
+// is busy and Get returns fresh allocation). Even with the pool,
+// burst peak shrinks: 300 flows × 16 KiB pool fill = 4.7 MiB max
+// vs 19 MiB at 64 KiB.
+const pumpReadBufSize = 16 * 1024
+
 var pumpReadBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 65536)
+		b := make([]byte, pumpReadBufSize)
 		return &b
 	},
 }
@@ -395,12 +407,24 @@ func (d *udpDemux) closeAll() {
 func relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 32*1024)
+		// IPA-B5: shrunk from 32 KiB → 16 KiB. iOS NE workload is
+		// multi-flow parallel (many apps × many streams), not single-
+		// stream bulk; smaller buffer means more io.CopyBuffer
+		// iterations per byte but cuts per-flow heap commitment by
+		// half. At 300 flows worst case: 300 × 2 dirs × 16 KiB =
+		// 9 MiB instead of 18 MiB.
+		buf := make([]byte, 16*1024)
 		_, _ = io.CopyBuffer(b, a, buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 32*1024)
+		// IPA-B5: shrunk from 32 KiB → 16 KiB. iOS NE workload is
+		// multi-flow parallel (many apps × many streams), not single-
+		// stream bulk; smaller buffer means more io.CopyBuffer
+		// iterations per byte but cuts per-flow heap commitment by
+		// half. At 300 flows worst case: 300 × 2 dirs × 16 KiB =
+		// 9 MiB instead of 18 MiB.
+		buf := make([]byte, 16*1024)
 		_, _ = io.CopyBuffer(a, b, buf)
 		done <- struct{}{}
 	}()

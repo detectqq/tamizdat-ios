@@ -46,21 +46,36 @@ const (
 	// (multi-stream multiplexing aggregates higher).
 	transportDefaultConnFlow = 1 << 20
 
-	// transportDefaultStreamFlow: shrunk from 4 MiB upstream → 64 KiB iOS.
-	// IPA-A2: was 256 KiB. SETTINGS_INITIAL_WINDOW_SIZE advertised to
-	// the server == size of each stream's bufPipe receive buffer ==
-	// bytes the server is allowed to push at us before WINDOW_UPDATE.
+	// transportDefaultStreamFlow: shrunk from 4 MiB upstream → 64 KiB iOS
+	// (history) → 16 KiB iOS-NE-burst-tuned (IPA-B5).
 	//
-	// Roblox crashed IPA-A1 with 256 KiB × 200 stream cap = 50 MiB
-	// reserved buffer commitments. Operator's Windows tamizdat client
-	// uses 1000 stream cap (no memory cap on desktop). To match that
-	// on iOS we drop the per-stream window to 64 KiB:
-	//   1000 streams × 64 KiB = 62 MiB max reserved
-	// In practice <30% of streams active simultaneously → ~20 MiB live.
-	// Per-stream throughput cap @ 100 ms RTT: 64 KiB × 10 / sec = 5 Mbps,
-	// but H2 multiplexes hundreds of streams so aggregate stays high
-	// (Speedtest fan-out ~32 streams × 5 Mbps = 160 Mbps theoretical).
-	transportDefaultStreamFlow = 64 << 10
+	// Per-stream window = SETTINGS_INITIAL_WINDOW_SIZE ad to server =
+	// size of each stream's bufPipe recv buffer = bytes server can push
+	// at us before WINDOW_UPDATE.
+	//
+	// History:
+	//   - 4 MiB upstream default.
+	//   - IPA-A2: 256 KiB. Crashed under Roblox at 200 streams (50 MiB).
+	//   - IPA-A2..A9: 64 KiB. Worked with hev coalescing UDP locally.
+	//   - IPA-B4 V2 (300 streams cap): 64 KiB × 300 = 19 MiB max stream
+	//     buffer commitments. Tight but fit within 50 MiB jetsam under
+	//     normal load.
+	//   - IPA-B5: drop to 16 KiB. Math:
+	//       300 streams × 16 KiB = 4.7 MiB max buffer commitments
+	//     vs B4's 19 MiB — saves 14 MiB pinned heap at peak burst.
+	//
+	// Trade-off: per-stream peak throughput @ 30 ms RTT (Russian server) =
+	// 16 KiB × (1000ms/30ms) = ~533 KiB/sec = ~4.3 Mbps.
+	// At 300 parallel streams aggregate = 1.3 Gbps theoretical.
+	// User's base = 700 Mbps. So aggregate cap is fine; per-stream cap
+	// is irrelevant for typical iOS workload (parallel multi-app, not
+	// single-stream bulk).
+	//
+	// For sustained single-stream high-throughput (e.g. 100 MB file
+	// download), this caps at ~4 Mbps which is too low. If operator
+	// reports single-stream regression, revert this constant — but
+	// realistic iOS workload is multi-flow heavy, NOT single-flow.
+	transportDefaultStreamFlow = 16 << 10
 
 	defaultUserAgent = "Go-http-client/2.0"
 
