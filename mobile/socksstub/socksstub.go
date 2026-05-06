@@ -36,7 +36,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -1509,10 +1511,15 @@ func relay(a, b net.Conn, idx uint64) {
 	_ = b.Close()
 }
 
-// CloseAllFlows force-closes every registered flow. Called from
-// Swift's kernel memorypressure CRITICAL handler (the nuclear teardown
-// pattern from sing-box). Apps see RST and reconnect; iOS gets the
-// memory back; we survive.
+// CloseAllFlows force-closes every registered flow's local SOCKS5 conn.
+//
+// IPA-D9 fix: removed fs.cancel() from the original D7 implementation.
+// Cancel propagated into tamizdat client's in-flight DialContext via
+// context tree, killing the upstream H/2 transport and triggering a
+// "http2: client connection lost" cascade lasting ~40 seconds visible
+// to user (Roblox 277, YouTube stall, etc). Just closing the local
+// conn is enough — the goroutine sees EOF on the next CopyBuffer
+// iteration and exits naturally; tamizdat's transport pool stays alive.
 //
 // gomobile binding exposes this as SocksstubCloseAllFlows().
 func CloseAllFlows() int32 {
@@ -1520,9 +1527,6 @@ func CloseAllFlows() int32 {
 	flowRegistry.Range(func(k, v any) bool {
 		fs := v.(*flowState)
 		_ = fs.conn.Close()
-		if fs.cancel != nil {
-			fs.cancel()
-		}
 		closed++
 		return true
 	})
@@ -1531,4 +1535,51 @@ func CloseAllFlows() int32 {
 	}
 	debug.FreeOSMemory()
 	return closed
+}
+
+// IPA-D9: heap profiling endpoint. Swift passes a file path (App Group
+// container so it survives across extension/main-app and is reachable
+// via Files app). Go writes the gzipped pprof profile there.
+//
+// Trigger: Swift heartbeat calls SocksstubWriteHeapProfile(path) right
+// before invoking SocksstubCloseAllFlows on memory pressure — captures
+// the heap state at the exact moment iOS thinks we're critical, which
+// is the most informative snapshot.
+//
+// Analysis: copy file off device (Files app or Telegram uploader),
+// run `go tool pprof heap-<ts>.pb.gz` to find what eats per-flow memory.
+//
+// Returns empty string on success, error message on failure.
+func WriteHeapProfile(path string) string {
+	// Force GC first so unreachable allocations don't pollute the heap profile.
+	runtime.GC()
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Sprintf("create %s: %v", path, err)
+	}
+	defer f.Close()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		return fmt.Sprintf("write profile: %v", err)
+	}
+	rt.appendLog(fmt.Sprintf("info: heap profile written to %s", path))
+	return ""
+}
+
+// WriteGoroutineProfile dumps current goroutine stacks. Useful for
+// diagnosing goroutine leaks.
+func WriteGoroutineProfile(path string) string {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Sprintf("create %s: %v", path, err)
+	}
+	defer f.Close()
+	p := pprof.Lookup("goroutine")
+	if p == nil {
+		return "no goroutine profile available"
+	}
+	if err := p.WriteTo(f, 2); err != nil { // 2 = full stacks
+		return fmt.Sprintf("write profile: %v", err)
+	}
+	rt.appendLog(fmt.Sprintf("info: goroutine profile written to %s", path))
+	return ""
 }

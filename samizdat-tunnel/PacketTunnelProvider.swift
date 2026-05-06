@@ -678,18 +678,42 @@ misc:
 
     private func startBurstProtection() {
         // IPA-D7: nuclear close pattern from sing-box-for-apple.
-        // On kernel CRITICAL → close ALL active flows + force GC. iOS apps
-        // see RST and reconnect; iOS reclaims memory; we survive.
-        // Surgical admission control (D1-D6) was the wrong abstraction —
-        // sing-box doesn't do it and survives. We follow their pattern.
+        // IPA-D9: dump heap profile right before nuclear close — captures
+        // the heap state at the exact moment iOS says we're critical,
+        // which is the most informative snapshot for diagnosing leaks.
         let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
         let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
         src.setEventHandler { [weak self] in
+            self?.dumpProfileBeforeNuclear(reason: "kernel-critical")
             let closed = SocksstubCloseAllFlows()
             self?.appendExtLog("warn: kernel memorypressure CRITICAL — nuclear close (\(closed) flows)")
         }
         src.activate()
         self.memPressureSrc = src
+    }
+
+    private func dumpProfileBeforeNuclear(reason: String) {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupID
+        ) else {
+            appendExtLog("warn: heap-dump: appGroup container not available")
+            return
+        }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let heapURL = containerURL.appendingPathComponent("heap-\(reason)-\(stamp).pb.gz")
+        let goroutineURL = containerURL.appendingPathComponent("goroutine-\(reason)-\(stamp).txt")
+        let heapErr = SocksstubWriteHeapProfile(heapURL.path)
+        let goroutineErr = SocksstubWriteGoroutineProfile(goroutineURL.path)
+        if heapErr.isEmpty {
+            appendExtLog("info: heap-dump → \(heapURL.lastPathComponent)")
+        } else {
+            appendExtLog("warn: heap-dump failed: \(heapErr)")
+        }
+        if goroutineErr.isEmpty {
+            appendExtLog("info: goroutine-dump → \(goroutineURL.lastPathComponent)")
+        } else {
+            appendExtLog("warn: goroutine-dump failed: \(goroutineErr)")
+        }
     }
 
     private func stopBurstProtection() {
@@ -710,12 +734,10 @@ misc:
             // iOS's apple-supplied "available before jetsam" gauge.
             let availKB = os_proc_available_memory() / 1024
 
-            // IPA-D7: per-process memory backstop. If avail drops below
-            // 8 MiB we trigger nuclear close (matches sing-box pattern —
-            // no surgical admission, just close everything and let apps
-            // reconnect). Above 8 MiB do nothing.
+            // IPA-D7/D9: per-process memory backstop with heap dump.
             let availBytes = os_proc_available_memory()
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
+                self.dumpProfileBeforeNuclear(reason: "avail8mib")
                 let closed = SocksstubCloseAllFlows()
                 self.appendExtLog("warn: avail<8MiB heartbeat — nuclear close (\(closed) flows)")
             }
