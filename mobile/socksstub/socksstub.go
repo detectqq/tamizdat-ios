@@ -615,14 +615,13 @@ func SetSamizdatConfig(blob string) error {
 		//               Roblox+YouTube combo. 150 × ~130 KB live per
 		//               active stream = ~19 MiB peak instead of ~26 MiB
 		//               at 200 — frees ~6-7 MiB headroom under jetsam.
-		//               IPA-D8: REVERTED 8→150. D6 set this to 8 hoping
-		//               to bound heap. With V2 mode (MaxTransports=2),
-		//               total slots = 8 × 2 = 16 — insufficient for
-		//               normal iOS multi-app combo. Result: every dial
-		//               immediately failed with "pool at MaxTransports cap"
-		//               error. Pool size doesn't fix memory; we need
-		//               D7's bufio.Copy + nuclear close approach instead.
-		MaxStreamsPerConn: 150,
+		//               IPA-D13: 150→200. After D12 fixed the real memory
+		//               leak (vendored x-net frameScratchBufferLen 512K→16K
+		//               saves ~24 MiB), we have headroom for more parallel
+		//               streams. 200 × 16K scratch = 3.2 MiB outgoing.
+		//               Reduces queueing under Safari/Roblox fanout where
+		//               apps want >150 concurrent dials.
+		MaxStreamsPerConn: 200,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:

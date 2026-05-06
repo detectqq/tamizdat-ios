@@ -54,13 +54,16 @@ const (
 	// Roblox crashed IPA-A1 with 256 KiB × 200 stream cap = 50 MiB
 	// reserved buffer commitments. Operator's Windows tamizdat client
 	// uses 1000 stream cap (no memory cap on desktop). To match that
-	// on iOS we drop the per-stream window to 64 KiB:
-	//   1000 streams × 64 KiB = 62 MiB max reserved
-	// In practice <30% of streams active simultaneously → ~20 MiB live.
-	// Per-stream throughput cap @ 100 ms RTT: 64 KiB × 10 / sec = 5 Mbps,
-	// but H2 multiplexes hundreds of streams so aggregate stays high
-	// (Speedtest fan-out ~32 streams × 5 Mbps = 160 Mbps theoretical).
-	transportDefaultStreamFlow = 64 << 10
+	// on iOS we drop the per-stream window.
+	//
+	// IPA-D13: 64 KiB → 128 KiB. After D12 fixed the real leak
+	// (frameScratchBufferLen 512K→16K saves ~24 MiB), we have budget
+	// to widen the receive window for better per-stream throughput.
+	// 200 streams × 128 KiB = 25 MiB max reserved (in practice <30% active
+	// → ~7 MiB live). Per-stream throughput cap @ 30 ms RTT:
+	// 128 KiB × 33/s = 35 Mbps, much closer to YouTube/Speedtest expected
+	// single-stream behaviour without ramping (was bottlenecked at ~17 Mbps).
+	transportDefaultStreamFlow = 128 << 10
 
 	defaultUserAgent = "Go-http-client/2.0"
 
