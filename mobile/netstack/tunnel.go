@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	tamizdat "github.com/detectqq/tamizdat"
@@ -32,8 +32,9 @@ import (
 // asynchronously (TCP onSegment is non-blocking, UDP udpOnPacket is
 // non-blocking modulo the rare lock).
 type tunnel struct {
-	fd     int
-	client *tamizdat.Client
+	fd      int      // raw fd retained for diagnostic logging
+	tunFile *os.File // wrapped fd for Read/Write through Go poller
+	client  *tamizdat.Client
 
 	tcp *tcpTable
 	udp *udpTable
@@ -48,11 +49,11 @@ type tunnel struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// writeMu serializes syscall.Write to the utun fd. Multiple
+	// writeMu serializes *os.File.Write to the utun fd. Multiple
 	// goroutines call sendTCP/sendUDP concurrently; the kernel utun
 	// driver doesn't block reads on writes, but writes from many goroutines
 	// without serialization can interleave (since each "packet" is one
-	// syscall.Write but multiple writes may queue). Single mutex keeps
+	// write but multiple writes may queue). Single mutex keeps
 	// the write path simple. Profile: ~1 μs per held lock — fine.
 	writeMu sync.Mutex
 }
@@ -89,6 +90,7 @@ func startTunnel(ctx context.Context, fd int32, configBlob string) error {
 	tctx, tcancel := context.WithCancel(ctx)
 	t := &tunnel{
 		fd:       int(fd),
+		tunFile:  os.NewFile(uintptr(fd), "utun"),
 		client:   client,
 		tcp:      newTCPTable(),
 		udp:      newUDPTable(),
@@ -119,20 +121,24 @@ func startTunnel(ctx context.Context, fd int32, configBlob string) error {
 
 // run is the main packet dispatch loop. Hot path: read → parse → route.
 //
-// Termination: ctx cancel triggers run() exit via syscall.Read returning
-// EBADF after fd is closed. We close fd on ctx cancel via tearDown.
+// Termination: ctx cancel triggers run() exit via *os.File.Read returning
+// an error after tunFile is closed. We close tunFile on ctx cancel via tearDown.
 var diagReadCount atomic.Int32
 
 func (t *tunnel) run() {
+	rtLog(fmt.Sprintf("info: tunnel.run() entering loop fd=%d tunFile=%v", t.fd, t.tunFile != nil))
 	for {
 		if t.ctx.Err() != nil {
 			return
 		}
 		buf := t.pkts.get()
-		_, ip, err := readUtun(t.fd, buf)
+		_, ip, err := readUtun(t.tunFile, buf)
 		if err != nil {
+			// IPA-C7: log the error so we can see WHY run() is exiting.
+			// C6 silently returned on first read error and we lost
+			// visibility into whether reads were even being attempted.
+			rtLog(fmt.Sprintf("error: utun read fd=%d err=%v", t.fd, err))
 			t.pkts.put(buf)
-			// fd closed (EBADF) on tearDown — exit cleanly.
 			return
 		}
 
@@ -252,7 +258,7 @@ func (t *tunnel) sendTCP(tup fivetuple, seq, ack uint32, flags byte, win uint16,
 	binary.BigEndian.PutUint32(bufp[0:4], afINET)
 
 	t.writeMu.Lock()
-	_, _ = syscall.Write(t.fd, bufp[:end])
+	_, _ = t.tunFile.Write(bufp[:end])
 	t.writeMu.Unlock()
 }
 
@@ -279,7 +285,7 @@ func (t *tunnel) sendUDP(tup fivetuple, payload []byte) {
 	binary.BigEndian.PutUint32(bufp[0:4], afINET)
 
 	t.writeMu.Lock()
-	_, _ = syscall.Write(t.fd, bufp[:end])
+	_, _ = t.tunFile.Write(bufp[:end])
 	t.writeMu.Unlock()
 }
 
@@ -325,9 +331,9 @@ func stopTunnel() {
 	if t.client != nil {
 		t.client.Close()
 	}
-	// Closing fd unblocks the run() loop's syscall.Read with EBADF.
-	if t.fd > 0 {
-		_ = syscall.Close(t.fd)
+	// Closing tunFile unblocks the run() loop's *os.File.Read poll wait.
+	if t.tunFile != nil {
+		_ = t.tunFile.Close()
 	}
 	rtLog("info: netstack stopped (Path 5)")
 }

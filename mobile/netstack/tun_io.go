@@ -5,8 +5,8 @@ package netstack
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sync"
-	"syscall"
 )
 
 // utun fd protocol on iOS NEPacketTunnelProvider darwin:
@@ -51,9 +51,9 @@ const (
 
 // pktBufSize matches utun MTU + 4-byte AF prefix.
 const (
-	tunMTU      = 4064
-	pktBufSize  = tunMTU + utunHdrLen
-	pktPoolCap  = 64 // max idle buffers in pool; surplus get GC'd
+	tunMTU     = 4064
+	pktBufSize = tunMTU + utunHdrLen
+	pktPoolCap = 64 // max idle buffers in pool; surplus get GC'd
 )
 
 // pktBufPool is the central scratch pool for utun read/write. Every
@@ -106,14 +106,21 @@ var sharedPktPool = sync.Pool{
 	},
 }
 
-// readUtun reads one packet from the utun fd. Strips the 4-byte AF
-// prefix and returns the IP-header-and-payload slice + the AF tag
-// (afINET=2 or afINET6=30). The slice is sliced into the supplied
-// backing buffer; do NOT modify until done with the read.
+// readUtun reads one packet from the utun *os.File. Strips the 4-byte
+// AF prefix (host=BigEndian per Apple eskimo's confirmation, matched
+// by WireGuard tun_darwin.go).
+//
+// Why *os.File and not raw syscall.Read: iOS NE creates the utun fd
+// in non-blocking mode. *os.File.Read goes through Go's runtime
+// poller (kqueue on darwin) which transparently parks the goroutine
+// on EAGAIN and resumes when poll signals readability. Raw
+// syscall.Read returns EAGAIN immediately and we'd have to either
+// busy-loop or implement our own poll. WireGuard ships this exact
+// pattern in tun_darwin.go.
 //
 // Caller MUST call pool.put(buf) when finished with the returned slice.
-func readUtun(fd int, buf *[pktBufSize]byte) (afTag uint32, ip []byte, err error) {
-	n, err := syscall.Read(fd, buf[:])
+func readUtun(f *os.File, buf *[pktBufSize]byte) (afTag uint32, ip []byte, err error) {
+	n, err := f.Read(buf[:])
 	if err != nil {
 		return 0, nil, err
 	}
@@ -132,8 +139,8 @@ func readUtun(fd int, buf *[pktBufSize]byte) (afTag uint32, ip []byte, err error
 //
 // Convention: caller has already filled buf[utunHdrLen:utunHdrLen+ipLen]
 // and tells us ipLen.
-func writeUtun(fd int, buf *[pktBufSize]byte, afTag uint32, ipLen int) error {
+func writeUtun(f *os.File, buf *[pktBufSize]byte, afTag uint32, ipLen int) error {
 	binary.BigEndian.PutUint32(buf[0:4], afTag)
-	_, err := syscall.Write(fd, buf[:utunHdrLen+ipLen])
+	_, err := f.Write(buf[:utunHdrLen+ipLen])
 	return err
 }
