@@ -40,14 +40,14 @@ import (
 type tcpState uint8
 
 const (
-	stListen     tcpState = iota
-	stSynRcvd             // got iOS SYN, sent SYN-ACK; awaiting iOS ACK or data
-	stEstablished         // both ACKs in; pumps active
-	stFinWait1            // we sent FIN, awaiting iOS ACK
-	stFinWait2            // iOS ACK'd our FIN, awaiting iOS FIN
-	stCloseWait           // iOS sent FIN, ring drained from our side; we owe FIN
-	stLastAck             // we sent FIN, awaiting iOS ACK; closes after
-	stClosed              // terminal — flow scheduled for table removal
+	stListen      tcpState = iota
+	stSynRcvd              // got iOS SYN, sent SYN-ACK; awaiting iOS ACK or data
+	stEstablished          // both ACKs in; pumps active
+	stFinWait1             // we sent FIN, awaiting iOS ACK
+	stFinWait2             // iOS ACK'd our FIN, awaiting iOS FIN
+	stCloseWait            // iOS sent FIN, ring drained from our side; we owe FIN
+	stLastAck              // we sent FIN, awaiting iOS ACK; closes after
+	stClosed               // terminal — flow scheduled for table removal
 )
 
 // announceMSS — the MSS we tell iOS in our SYN-ACK MSS option. Conservative
@@ -61,6 +61,21 @@ const announceMSS uint16 = 1460
 // at 128 flows × 4 KiB = 512 KiB of in-flight data, more than the
 // upstream tamizdat path can sustain anyway.
 const announceWindow uint16 = rxRingSize
+
+var (
+	pumpInBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 16*1024)
+			return &b
+		},
+	}
+	pumpOutBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, int(announceMSS))
+			return &b
+		},
+	}
+)
 
 // dialTimeout limits how long tamizdat.DialContext can take before we
 // RST the iOS-side connection. 10 s matches typical browser dial timeouts.
@@ -82,11 +97,11 @@ type tcpFlow struct {
 	tup fivetuple // immutable
 
 	// Sequencing — accessed under f.mu unless noted.
-	iss     uint32 // our initial seq we picked at SYN time
-	sndNxt  uint32 // next seq we will send to iOS
-	rcvNxt  uint32 // next seq we expect from iOS
-	mu      sync.Mutex
-	state   tcpState
+	iss      uint32 // our initial seq we picked at SYN time
+	sndNxt   uint32 // next seq we will send to iOS
+	rcvNxt   uint32 // next seq we expect from iOS
+	mu       sync.Mutex
+	state    tcpState
 	lastSeen atomic.Int64 // unix nanos; written by onSegment, read by reaper
 
 	// rxring buffers iOS-app→tamizdat data. Allocated lazily in onSYN.
@@ -296,7 +311,9 @@ func (f *tcpFlow) dialAndPump(t *tunnel) {
 // pumpInbound: rxring → tamizdat. Drains until ring closes (eof) or
 // remote write fails.
 func (f *tcpFlow) pumpInbound(t *tunnel) {
-	buf := make([]byte, 16*1024)
+	bufp := pumpInBufPool.Get().(*[]byte)
+	defer pumpInBufPool.Put(bufp)
+	buf := *bufp
 	for {
 		n := f.rxring.read(buf)
 		if n == 0 {
@@ -318,7 +335,9 @@ func (f *tcpFlow) pumpInbound(t *tunnel) {
 // pumpOutbound: tamizdat → synth packets to iOS. Reads up to ~1.4 KB
 // per iteration (one MSS), wraps in IP+TCP, writes to fd.
 func (f *tcpFlow) pumpOutbound(t *tunnel) {
-	buf := make([]byte, int(announceMSS))
+	bufp := pumpOutBufPool.Get().(*[]byte)
+	defer pumpOutBufPool.Put(bufp)
+	buf := *bufp
 	for {
 		n, err := f.remote.Read(buf)
 		if n > 0 {

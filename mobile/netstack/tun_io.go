@@ -9,20 +9,39 @@ import (
 	"syscall"
 )
 
-// utun fd protocol on darwin: every read/write is prefixed with a 4-byte
-// "address family" header in HOST byte order (little-endian on arm64
-// iOS). Bytes 0-3 = AF_INET (=2) or AF_INET6 (=30) when packed for the
-// utun_control socket. We strip it on read, prepend it on write.
+// utun fd protocol on iOS NEPacketTunnelProvider darwin:
 //
-// CRITICAL: this is HOST byte order, NOT network byte order. IPA-C1
-// shipped with binary.BigEndian and iOS kernel silently dropped every
-// outbound synth packet because the AF prefix was 0x00000002 instead
-// of 0x02000000 — apps never received responses, "ничего не открывает".
-// Fix in IPA-C2 uses binary.NativeEndian (= LittleEndian on arm64).
+// **The fd returned by `packetFlow.value(forKeyPath: "socket.fileDescriptor")`
+// uses the standard utun_control protocol — every read/write is
+// prefixed with a 4-byte address-family header in NETWORK byte order
+// (= htonl(AF_INET) = `00 00 00 02` for IPv4).** Verified against:
+//   - hev-socks5-tunnel `src/hev-tunnel-macos.h:21-39`: readv/writev
+//     with `htonl(AF_INET)` in iovec[0] for darwin path
+//   - sing-tun `tun_darwin.go`: `PacketOffset = 4`, prefix
+//     `{0x00, 0x00, 0x00, AF_INET}` (network order) used uniformly
+//     whether the fd was opened internally or via Options.FileDescriptor
+//   - Tun2SocksKit (a shipping iOS NE consumer of hev) hands the
+//     KVO-scanned utun fd straight into hev's macOS path
 //
-// Reference: Apple's source comments + lwIP-on-darwin implementations
-// (e.g. hev-socks5-tunnel src/hev-tun.c, sing-tun's tun_darwin.go
-// readPacketDarwin / writePacketDarwin).
+// IPA-C1: AF prefix added with binary.BigEndian = network byte order
+// (correct). But C1 silently failed because the impl files had
+// `//go:build ios && netstack_real` — gomobile's iOS build didn't
+// match the `ios` tag → stub linked. Misdiagnosed as endianness.
+//
+// IPA-C2: dropped the `ios` build tag (correct fix), but
+// "fixed" endianness from BigEndian to NativeEndian (= LittleEndian on
+// arm64). Wrong direction — that produced `02 00 00 00` instead of
+// `00 00 00 02`. iOS kernel rejected outbound writes silently.
+//
+// IPA-C4: misread hev's Linux/FreeBSD path (which DOES use raw IP)
+// as evidence that iOS doesn't need AF prefix either. Removed prefix
+// entirely. parseIPv4 then started receiving `00 00 00 02 45 ...`
+// (the prefix iOS still sent), saw `0x00>>4 != 4`, returned false —
+// silent drop of every packet. Symptom: pps=0, "ничего не открывает".
+//
+// IPA-C5 (this version): reverts to C1's correct BigEndian + 4-byte
+// prefix while keeping C2's build tag fix + C3's no-bind() + C4's
+// UAF fix.
 const utunHdrLen = 4
 
 const (
@@ -30,15 +49,7 @@ const (
 	afINET6 = 30 // darwin AF_INET6
 )
 
-// pktBufSize matches our advertised utun MTU exactly. iOS NE
-// NEPacketTunnelNetworkSettings.mtu = 4064 (sing-box-for-apple
-// recommendation, per project_ios_singtun_ground_truth.md). +
-// utun's 4-byte AF prefix.
-//
-// Comment on the empirical sweet spot: above 4064 (= 4096-UTUN_IF_HEADROOM_SIZE)
-// the tun-loop performance "drops significantly... may be a system bug"
-// per sing-box source comment at protocol/tun/inbound.go:107. Below
-// 4064 means more iovec scratch + 3-4× syscalls per byte.
+// pktBufSize matches utun MTU + 4-byte AF prefix.
 const (
 	tunMTU      = 4064
 	pktBufSize  = tunMTU + utunHdrLen
@@ -95,8 +106,8 @@ var sharedPktPool = sync.Pool{
 	},
 }
 
-// readUtun reads one packet from the utun fd. Returns the IP-header-and-
-// payload slice (the 4-byte AF prefix has been stripped) and the AF tag
+// readUtun reads one packet from the utun fd. Strips the 4-byte AF
+// prefix and returns the IP-header-and-payload slice + the AF tag
 // (afINET=2 or afINET6=30). The slice is sliced into the supplied
 // backing buffer; do NOT modify until done with the read.
 //
@@ -109,20 +120,20 @@ func readUtun(fd int, buf *[pktBufSize]byte) (afTag uint32, ip []byte, err error
 	if n < utunHdrLen {
 		return 0, nil, fmt.Errorf("utun read short: %d bytes", n)
 	}
-	// AF prefix is host-byte-order uint32 on darwin.
-	afTag = binary.NativeEndian.Uint32(buf[0:4])
+	// AF prefix is network-byte-order uint32 on darwin (= htonl(AF_INET)).
+	afTag = binary.BigEndian.Uint32(buf[0:4])
 	return afTag, buf[utunHdrLen:n], nil
 }
 
 // writeUtun writes one packet to the utun fd. ipPkt is the IP header
 // + payload (without the 4-byte AF prefix). Caller supplies a backing
 // buffer with at least utunHdrLen bytes of headroom AT buf[0:utunHdrLen]
-// — we'll write the AF prefix there.
+// — we'll write the AF prefix there in network byte order.
 //
 // Convention: caller has already filled buf[utunHdrLen:utunHdrLen+ipLen]
 // and tells us ipLen.
 func writeUtun(fd int, buf *[pktBufSize]byte, afTag uint32, ipLen int) error {
-	binary.NativeEndian.PutUint32(buf[0:4], afTag)
+	binary.BigEndian.PutUint32(buf[0:4], afTag)
 	_, err := syscall.Write(fd, buf[:utunHdrLen+ipLen])
 	return err
 }

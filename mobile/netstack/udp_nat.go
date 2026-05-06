@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,7 +56,7 @@ var pumpReadBufPool = sync.Pool{
 type udpFlow struct {
 	tup      fivetuple
 	remote   net.PacketConn
-	lastSeen time.Time
+	lastSeen atomic.Int64
 	closeMu  sync.Mutex
 	closed   bool
 	ctx      context.Context
@@ -65,19 +66,48 @@ type udpFlow struct {
 // udpTable is the bounded map of 5-tuple → *udpFlow. LRU-evicts oldest
 // when at MaxUDPFlows capacity.
 type udpTable struct {
-	mu    sync.Mutex
-	flows map[fivetuple]*udpFlow
+	mu      sync.Mutex
+	flows   map[fivetuple]*udpFlow
+	dialing map[fivetuple]struct{}
 }
 
 func newUDPTable() *udpTable {
-	return &udpTable{flows: make(map[fivetuple]*udpFlow, MaxUDPFlows)}
+	return &udpTable{
+		flows:   make(map[fivetuple]*udpFlow, MaxUDPFlows),
+		dialing: make(map[fivetuple]struct{}, 16),
+	}
+}
+
+// markDialing returns true if caller is the FIRST to dial this 5-tuple;
+// false if a dial is already in flight (caller should drop the packet).
+// Also returns false if the flow is already established (caller should
+// re-lookup on the next packet).
+func (t *udpTable) markDialing(tup fivetuple) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.flows[tup]; ok {
+		return false
+	}
+	if _, ok := t.dialing[tup]; ok {
+		return false
+	}
+	t.dialing[tup] = struct{}{}
+	return true
+}
+
+// finishDialing removes the 5-tuple from in-flight set. Safe to call
+// even if not in set.
+func (t *udpTable) finishDialing(tup fivetuple) {
+	t.mu.Lock()
+	delete(t.dialing, tup)
+	t.mu.Unlock()
 }
 
 func (t *udpTable) lookup(tup fivetuple) *udpFlow {
 	t.mu.Lock()
 	f := t.flows[tup]
 	if f != nil {
-		f.lastSeen = time.Now()
+		f.lastSeen.Store(time.Now().UnixNano())
 	}
 	t.mu.Unlock()
 	return f
@@ -93,12 +123,13 @@ func (t *udpTable) insert(tup fivetuple, f *udpFlow) {
 		// Evict oldest. Linear scan — at MaxUDPFlows=128 this is a few
 		// microseconds, far cheaper than maintaining a heap.
 		var oldestKey fivetuple
-		var oldestAt time.Time
+		var oldestAt int64
 		first := true
 		for k, e := range t.flows {
-			if first || e.lastSeen.Before(oldestAt) {
+			ts := e.lastSeen.Load()
+			if first || ts < oldestAt {
 				oldestKey = k
-				oldestAt = e.lastSeen
+				oldestAt = ts
 				first = false
 			}
 		}
@@ -183,9 +214,21 @@ func (t *tunnel) udpOnPacket(ip parsedV4, udp parsedUDP) {
 		return
 	}
 
-	// New flow. Spawn dial off-hot-path. Drop this packet — the iOS app
-	// will retransmit (UDP retry from app or kernel DNS resolver).
-	go t.udpDial(tup, udp.payload)
+	if !t.udp.markDialing(tup) {
+		// Dial already in flight or flow already exists — drop this
+		// packet, iOS app will retransmit.
+		return
+	}
+
+	// New flow. Spawn dial off-hot-path with a COPY of the payload —
+	// the original udp.payload is sliced into the pktBufPool buffer,
+	// which gets put back to the pool when dispatch returns. Without
+	// the copy, by the time udpDial actually runs (after dial latency
+	// on the order of ms), the buffer has been recycled and the
+	// payload bytes are garbage. Bug class: use-after-free.
+	payloadCopy := make([]byte, len(udp.payload))
+	copy(payloadCopy, udp.payload)
+	go t.udpDial(tup, payloadCopy)
 }
 
 // udpDial does tamizdat.DialUDP and inserts the flow. Drops the FIRST
@@ -193,6 +236,7 @@ func (t *tunnel) udpOnPacket(ip parsedV4, udp parsedUDP) {
 // to handle the dial-completes-before-app-retransmits race, but iOS
 // apps are aggressive on UDP retry so this is fine).
 func (t *tunnel) udpDial(tup fivetuple, firstPayload []byte) {
+	defer t.udp.finishDialing(tup)
 	release, ok := acquireDial(t.ctx)
 	if !ok {
 		return
@@ -211,12 +255,12 @@ func (t *tunnel) udpDial(tup fivetuple, firstPayload []byte) {
 
 	fctx, fcancel := context.WithCancel(t.ctx)
 	f := &udpFlow{
-		tup:      tup,
-		remote:   remote,
-		lastSeen: time.Now(),
-		ctx:      fctx,
-		cancel:   fcancel,
+		tup:    tup,
+		remote: remote,
+		ctx:    fctx,
+		cancel: fcancel,
 	}
+	f.lastSeen.Store(time.Now().UnixNano())
 	t.udp.insert(tup, f)
 
 	// Send the first payload that triggered the dial. Best-effort.
@@ -250,7 +294,7 @@ func (f *udpFlow) pumpRemoteToLocal(t *tunnel) {
 		// from iOS perspective, this packet is FROM the real server
 		// (=our flow's dst) TO the iOS app (=our flow's src).
 		t.sendUDP(f.tup, buf[:n])
-		f.lastSeen = time.Now()
+		f.lastSeen.Store(time.Now().UnixNano())
 	}
 }
 

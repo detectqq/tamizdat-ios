@@ -102,6 +102,7 @@ func startTunnel(ctx context.Context, fd int32, configBlob string) error {
 
 	go t.run()
 	go t.reaperLoop()
+	startMemWatch(tctx)
 
 	rtLog(fmt.Sprintf("info: netstack started fd=%d server=%s:%d sni=%s mtu=%d (Path 5 / Option A)",
 		fd, cfg.ServerHost, cfg.ServerPort, cfg.SNI, tunMTU))
@@ -193,8 +194,8 @@ func (t *tunnel) sendTCP(tup fivetuple, seq, ack uint32, flags byte, win uint16,
 	bufp := t.pkts.get()
 	defer t.pkts.put(bufp)
 
-	// Layout in bufp:
-	//   [0:4]      utun AF prefix
+	// Layout in bufp (4-byte AF prefix at start, see tun_io.go header):
+	//   [0:4]      utun AF prefix (BigEndian uint32 = htonl(AF_INET))
 	//   [4:24]     IPv4 header
 	//   [24:44]    TCP header
 	//   [44:end]   payload
@@ -220,12 +221,10 @@ func (t *tunnel) sendTCP(tup fivetuple, seq, ack uint32, flags byte, win uint16,
 	// Build TCP header. Ports swap correspondingly.
 	buildTCP(bufp[tcpStart:end], tup.dst.Port(), tup.src.Port(), seq, ack, flags, win, srcIP, dstIP, end-tcpStart)
 
-	// Set utun AF prefix (HOST byte order uint32 = AF_INET).
-	// CRITICAL: darwin utun expects host byte order here, NOT network
-	// byte order. IPA-C1 shipped with BigEndian and iOS kernel
-	// silently dropped every outbound packet — apps never received
-	// responses, "ничего не открывает".
-	binary.NativeEndian.PutUint32(bufp[0:4], afINET)
+	// AF prefix in network byte order (= htonl(AF_INET) = 0x00000002).
+	// This is the iOS utun_control wire format per hev's macOS path
+	// (hev-tunnel-macos.h:21-39) and sing-tun's tun_darwin.go.
+	binary.BigEndian.PutUint32(bufp[0:4], afINET)
 
 	t.writeMu.Lock()
 	_, _ = syscall.Write(t.fd, bufp[:end])
@@ -233,7 +232,7 @@ func (t *tunnel) sendTCP(tup fivetuple, seq, ack uint32, flags byte, win uint16,
 }
 
 // sendUDP synthesizes one IP+UDP packet for tamizdat-side response back
-// to iOS. Same buffer layout as sendTCP.
+// to iOS. Same buffer layout as sendTCP — 4-byte AF prefix at start.
 func (t *tunnel) sendUDP(tup fivetuple, payload []byte) {
 	bufp := t.pkts.get()
 	defer t.pkts.put(bufp)
@@ -273,12 +272,12 @@ func (t *tunnel) reaperLoop() {
 			for _, f := range t.tcp.snapshot() {
 				if now-f.lastSeen.Load() > int64(flowIdleTimeout) {
 					t.tcp.remove(f.tup)
-					go f.shutdown()
+					go f.reset(t)
 				}
 			}
-			cutoff := time.Now().Add(-flowIdleTimeout)
+			cutoff := time.Now().Add(-flowIdleTimeout).UnixNano()
 			for _, f := range t.udp.snapshot() {
-				if f.lastSeen.Before(cutoff) {
+				if f.lastSeen.Load() < cutoff {
 					t.udp.remove(f.tup)
 					go f.shutdown()
 				}
