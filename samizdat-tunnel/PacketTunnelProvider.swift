@@ -143,6 +143,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // pushed IPA-B1 over the 50 MB iOS jetsam cap when Roblox
             // launched mid-speedtest. The lamp will show stale "—offline—"
             // data on Path 4 until Phase 2 wires NetstackStatus getters.
+            self.appendExtLog("info: setTunnelNetworkSettings OK — starting netstack")
             self.startNetstack(configBlob: activeBlob, completionHandler: completionHandler)
         }
     }
@@ -481,24 +482,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// from IPA-A4 through A8 — plus removing the SOCKS5 protocol
     /// overhead between the two stacks.
     private func startNetstack(configBlob: String, completionHandler: @escaping (Error?) -> Void) {
-        // utun fd discovery — same as Path 3. KVO is the public-private
-        // API every shipping iOS proxy uses (wireguard-apple,
-        // sing-box-for-apple, Tun2SocksKit). Fallback fd-scanner kept
-        // as a diagnostic for the iCloud Private Relay edge case.
-        let kvoFD = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
-        let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) ?? -1
-        appendExtLog("info: utun fd kvo=\(kvoFD) scan=\(scanFD)")
-        let rawFD: Int32
-        if kvoFD >= 0 {
-            rawFD = kvoFD
-        } else if scanFD >= 0 {
-            appendExtLog("warn: KVO fd unavailable, falling back to scan")
-            rawFD = scanFD
-        } else {
-            appendExtLog("error: could not locate utun fd (KVO + scan both failed)")
-            completionHandler(makeError("utun fd not found"))
+        // IPA-C6 (DR Stage 1.3): drop the KVO path; use only the
+        // getpeername/CTLIOCGINFO fd scan that WireGuard ships.
+        guard let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) else {
+            appendExtLog("error: could not locate utun fd via fd scan")
+            completionHandler(makeError("utun fd not found via scan"))
             return
         }
+        let rawFD: Int32 = scanFD
+        appendExtLog("info: utun fd selected via scan = \(rawFD)")
 
         // IPA-B1 spec audit (B10/O1): dup the fd before handing it to
         // Go. sing-tun wraps the int with `os.NewFile(uintptr(fd), ...)`
@@ -758,58 +750,47 @@ misc:
         // truncates incoming frames at the kernel boundary.
         settings.mtu = 4064
 
-        // IPA-B3: switched 198.18.0.1/24 → 172.19.0.1/30 to match
-        // sing-box-for-apple's documented default
-        // (docs/configuration/inbound/tun.md:162). /30 = 4-host subnet
-        // (.0,.1,.2,.3); System/Mixed stack uses .1 as listener bind, .2
-        // as spoofed source. Both /24 and /30 satisfy
-        // HasNextAddress(prefix,1)==true so the System stack accepts it,
-        // but /30 is the well-trodden path with ~hundreds of millions of
-        // installed apps in the field.
-        let ipv4 = NEIPv4Settings(addresses: ["172.19.0.1"], subnetMasks: ["255.255.255.252"])
+        // IPA-C6 (DR recommendation): switched 172.19.0.1/30 → 10.7.0.2/24
+        // to match WireGuard-iOS defaults. Both prefix sizes pass our
+        // userspace stack's HasNextAddress check; /24 is the well-trodden
+        // path with hundreds of millions of installed devices.
+        let ipv4 = NEIPv4Settings(addresses: ["10.7.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        if let serverIP {
-            ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255")]
-        }
-        // Critically: exclude 127.0.0.1/8 from the tunnel so hev's SOCKS5
-        // dial to the main app's listener does NOT loop back through us.
-        // (iOS may special-case loopback here but explicit is safer.)
-        ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
+
+        // IPA-C6 (DR root cause): removed 1.1.1.1, 8.8.8.8, 77.88.8.0
+        // from excludedRoutes. Previous list combined with
+        // dnsSettings.servers=[1.1.1.1, 8.8.8.8] caused iOS DNS resolver
+        // to route via physical interface (matching the excluded route),
+        // fetch A records outside tunnel, and apps then connected outside
+        // the tunnel too — net result: zero packets in utun.
+        //
+        // Only keep:
+        //   - serverIP/32 (must NOT loop the tamizdat outer-TCP through itself)
+        //   - 127.0.0.0/8 (loopback)
+        // Removed:
+        //   - 1.1.1.1, 8.8.8.8 (replaced by in-tunnel DNS via Quad9 below)
+        //   - 77.88.8.0/24 (probe target — Phase 2 problem, not now)
+        var excluded: [NEIPv4Route] = [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
-            // IPA-Q: WhitelistDetector probe targets must reach the
-            // underlying interface, not loop through our own utun.
-            // 1.1.1.1 + 8.8.8.8 are the global "is internet up" canaries;
-            // 77.88.8.0/24 covers all Yandex DNS variants used as the
-            // RU-whitelisted canary.
-            NEIPv4Route(destinationAddress: "1.1.1.1", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "8.8.8.8", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "77.88.8.0", subnetMask: "255.255.255.0"),
         ]
+        if let serverIP {
+            excluded.append(NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255"))
+        }
+        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 
         // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
         settings.ipv6Settings = nil
 
-        // IPA-J: force DNS through the tunnel.
-        //
-        // Earlier (IPA-F) we set dnsSettings = nil on the theory that iOS
-        // mDNSResponder would scope DNS queries to the underlying Wi-Fi
-        // interface (IP_BOUND_IF) and bypass the tunnel. On iOS 17/18 with
-        // a default-route VPN, this is not what happens: with no
-        // dnsSettings installed, iOS treats name resolution as broken
-        // ("iPhone не подключен к интернету"), the captive-portal probe
-        // to captive.apple.com fails, and Safari refuses to load even
-        // direct-IP URLs.
-        //
-        // Now that IPA-I added cmd=0x05 / FWD_UDP support in SocksStub
-        // backed by samizdat.Client.DialUDP, we can safely force DNS
-        // (UDP/53) through the tunnel: hev wraps it as cmd=0x05, our
-        // SocksStub opens a samizdat UDP tunnel to 1.1.1.1:53 / 8.8.8.8:53,
-        // and the response comes back the same way. matchDomains=[""]
-        // catches every domain (the empty-string match-all sentinel).
-        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
-        dns.matchDomains = [""]
-        settings.dnsSettings = dns
+        // IPA-C6: DNS via Quad9 (9.9.9.9) — NOT excluded from the tunnel,
+        // so DNS queries go through utun → our shim → tamizdat upstream.
+        // This is the structural fix for "apps don't open": with our previous
+        // setup DNS routed via physical interface + DNS server IPs were also
+        // excluded → app fetched A records outside tunnel → no traffic
+        // reached our shim. Quad9 is publicly recursive, supports DoT but
+        // we just use plain UDP/53 over the tunnel.
+        settings.dnsSettings = NEDNSSettings(servers: ["9.9.9.9", "149.112.112.112"])
+        settings.dnsSettings?.matchDomains = [""]
 
         return settings
     }

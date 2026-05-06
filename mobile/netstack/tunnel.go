@@ -5,12 +5,14 @@ package netstack
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -100,6 +102,12 @@ func startTunnel(ctx context.Context, fd int32, configBlob string) error {
 	// returns to Swift quickly.
 	rtRes = &runResources{tunnel: t}
 
+	// IPA-C6 diagnostic: confirm we have a real utun fd before we
+	// commit to a read loop on it. If KVO returned a stale fd or the
+	// scan picked a wrong-shape descriptor, this surfaces the mismatch
+	// in the log instead of letting syscall.Read block silently.
+	diagFdIdentity(int(fd))
+
 	go t.run()
 	go t.reaperLoop()
 	startMemWatch(tctx)
@@ -113,6 +121,8 @@ func startTunnel(ctx context.Context, fd int32, configBlob string) error {
 //
 // Termination: ctx cancel triggers run() exit via syscall.Read returning
 // EBADF after fd is closed. We close fd on ctx cancel via tearDown.
+var diagReadCount atomic.Int32
+
 func (t *tunnel) run() {
 	for {
 		if t.ctx.Err() != nil {
@@ -125,6 +135,21 @@ func (t *tunnel) run() {
 			// fd closed (EBADF) on tearDown — exit cleanly.
 			return
 		}
+
+		// IPA-C6 diagnostic: hex-dump first 10 reads to verify
+		// the on-the-wire framing matches our parser's expectations.
+		// Per DR: head=0000000245... means AF_INET prefix + IPv4
+		// (working). head=45... means no prefix (different framing).
+		// head=000000001E60... means IPv6 (we drop those).
+		if c := diagReadCount.Add(1); c <= 10 {
+			n := len(ip) + 4 // include the AF prefix in the dump
+			if n > 24 {
+				n = 24
+			}
+			rtLog(fmt.Sprintf("info: diag read#%d ip_len=%d head=%s",
+				c, len(ip), hex.EncodeToString(buf[:n])))
+		}
+
 		t.dispatch(ip)
 		t.pkts.put(buf)
 	}
