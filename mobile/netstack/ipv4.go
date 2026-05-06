@@ -1,4 +1,4 @@
-//go:build ios && netstack_real
+//go:build netstack_real
 
 // Package netstack — Path 5 / Option A custom userspace TCP+UDP for iOS NE.
 // This file: IPv4 + TCP + UDP header parse/build with zero allocations.

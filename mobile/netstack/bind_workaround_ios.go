@@ -1,4 +1,4 @@
-//go:build ios && netstack_real
+//go:build netstack_real
 
 package netstack
 

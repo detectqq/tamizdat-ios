@@ -1,4 +1,4 @@
-//go:build ios && netstack_real
+//go:build netstack_real
 
 package netstack
 
@@ -220,8 +220,12 @@ func (t *tunnel) sendTCP(tup fivetuple, seq, ack uint32, flags byte, win uint16,
 	// Build TCP header. Ports swap correspondingly.
 	buildTCP(bufp[tcpStart:end], tup.dst.Port(), tup.src.Port(), seq, ack, flags, win, srcIP, dstIP, end-tcpStart)
 
-	// Set utun AF prefix (BE uint32 = AF_INET).
-	binary.BigEndian.PutUint32(bufp[0:4], afINET)
+	// Set utun AF prefix (HOST byte order uint32 = AF_INET).
+	// CRITICAL: darwin utun expects host byte order here, NOT network
+	// byte order. IPA-C1 shipped with BigEndian and iOS kernel
+	// silently dropped every outbound packet — apps never received
+	// responses, "ничего не открывает".
+	binary.NativeEndian.PutUint32(bufp[0:4], afINET)
 
 	t.writeMu.Lock()
 	_, _ = syscall.Write(t.fd, bufp[:end])
@@ -322,6 +326,28 @@ var rtRes *runResources
 // ~950 Mbps from ~300 Mbps. tamizdat.ClientConfig.Dialer is the hook
 // — see bind_workaround_ios.go for the wrapper.
 func buildTamizdatClient(cfg *configparse.Config, utunIP netip.Addr) (*tamizdat.Client, error) {
+	// IPA-C1 ships V1 (single H2 pipe, MaxTransports=1, StrictSingleH2=true).
+	// V1 is the production-safe pool variant for TSPU defense: max 1 entry
+	// in the #546 fingerprint counter per (src_IP, cover-SNI, JA3) per
+	// device, regardless of multi-app activity. V2/V3 are experimental
+	// per operator memory `feedback_overnight_2026_05_02_priorities` and
+	// the 2026-05-06 followup memory `feedback_v1_buffer_shrink_incompatible`.
+	//
+	// Why V1 works in C1 but crashed in B3 under iOS multi-app burst:
+	// B3's failure mode was NOT V1 itself but the goroutine+buffer churn
+	// inside the OLD handler.go when 588× ErrPoolBackpressure errors hit
+	// in <1 sec. Each failed udpDemux dial allocated stacks + 64 KiB
+	// buffers that piled up faster than GC could reclaim → +60 MB spike →
+	// jetsam. C1's tcp_state.f.reset(t) handles "tamizdat at cap" by
+	// sending a single RST packet to iOS (~1 KiB transient alloc) and
+	// removing the flow from the table. iOS apps retry naturally; no
+	// goroutine pile-up.
+	//
+	// MaxStreamsPerConn=150 = V1 capacity limit. Our shim's MaxTCPFlows=
+	// 128 + MaxUDPFlows=128 = 256 worst case, but in practice only ~150
+	// will succeed dialing through tamizdat at any moment; excess get
+	// RST'd at the netstack level. This is the desired backpressure
+	// shape — graceful shedding rather than uncontrolled allocation.
 	clientCfg := tamizdat.ClientConfig{
 		ServerAddr:        net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)),
 		ServerName:        cfg.SNI,
@@ -330,8 +356,8 @@ func buildTamizdatClient(cfg *configparse.Config, utunIP netip.Addr) (*tamizdat.
 		Fingerprint:       cfg.Fingerprint,
 		MaxStreamsPerConn: 150,
 		IdleTimeout:       30 * time.Second,
-		PoolVariant:       "v2",
-		StrictSingleH2:    false,
+		PoolVariant:       "v1",
+		StrictSingleH2:    true,
 		Dialer:            iosBindDialer(utunIP),
 	}
 	if len(cfg.SNIPool) > 1 {

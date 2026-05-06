@@ -75,6 +75,13 @@ func Start(fd int32, configBlob string) error {
 		return errors.New("invalid utun fd")
 	}
 
+	// IPA-C2 diagnostic: log unconditionally before startTunnel so the
+	// App Group log shows which build flavor is linked. With the new
+	// build-tag scheme (just netstack_real, no ios), this should always
+	// be the real Path 5 impl. Helps catch a future repeat of the C1
+	// silent stub-link surprise.
+	rtLogPretunnel(fd)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := startTunnel(ctx, fd, configBlob); err != nil {
 		cancel()

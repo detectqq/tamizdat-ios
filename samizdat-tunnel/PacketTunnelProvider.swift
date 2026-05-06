@@ -545,7 +545,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     completionHandler(self.makeError("NetstackStart: \(startErr.localizedDescription)"))
                     return
                 }
-                self.appendExtLog("info: netstack up (Path 4 / sing-tun + sagernet/gvisor)")
+                self.appendExtLog("info: netstack up (Path 5 / Option A — custom userspace TCP+UDP)")
                 completionHandler(nil)
             }
         }
