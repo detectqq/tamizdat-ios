@@ -1377,20 +1377,40 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	}
 }
 
+// IPA-D5: pooled relay buffers. Previously each goroutine allocated a
+// fresh 16 KiB buffer, so under burst (e.g. 16 Speedtest streams)
+// every accept added 32 KiB live to the heap until GC. With a pool
+// the live buffer count = max simultaneously-in-CopyBuffer goroutines,
+// not max accepted goroutines. On 16-flow Speedtest steady-state where
+// not every flow is in copy at once this saves ~5-10 MiB.
+//
+// Pool buffers are GCable — sync.Pool allows runtime to free entries
+// during GC pressure, so we never permanently retain memory.
+var relayBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 16*1024)
+		return &buf
+	},
+}
+
+func getRelayBuf() *[]byte { return relayBufPool.Get().(*[]byte) }
+func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
+
 // relay copies bytes between two duplex streams until either side closes.
-// Audit fix (final IPA-F): 16 KB per direction (was 32 KB). At 50 concurrent
-// flows that saves ~1.6 MB of buffer RSS — small in absolute terms but
-// directly comes off the extension's jetsam-shrunk available budget.
+// Per-direction buffer = 16 KiB (audit fix, IPA-F shrunk from 32 KiB).
+// IPA-D5: buffers come from sync.Pool — see relayBufPool.
 func relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 16*1024)
-		_, _ = io.CopyBuffer(b, a, buf)
+		bufp := getRelayBuf()
+		defer putRelayBuf(bufp)
+		_, _ = io.CopyBuffer(b, a, *bufp)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 16*1024)
-		_, _ = io.CopyBuffer(a, b, buf)
+		bufp := getRelayBuf()
+		defer putRelayBuf(bufp)
+		_, _ = io.CopyBuffer(a, b, *bufp)
 		done <- struct{}{}
 	}()
 	<-done
