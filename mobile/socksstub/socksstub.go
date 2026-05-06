@@ -127,10 +127,11 @@ var verboseFlowLogs atomic.Bool
 // burst 24, Allow-not-Wait) AND pendingNew cap (64). Excess accepts
 // are Close()d (RST → iOS app retry). Established flows untouched.
 var (
-	protectUntil     int64 // atomic unix-nano; if > now → protect mode active
-	pendingNew       int32 // atomic; in-flight DialContext during protect
-	burstShedTotal   int64 // atomic
-	burstEngageTotal int64 // atomic
+	protectUntil      int64 // atomic unix-nano; if > now → protect mode active
+	recoveryConfirmed int32 // atomic; 1 == Swift saw avail>=18MiB after last engage
+	pendingNew        int32 // atomic; in-flight DialContext during protect
+	burstShedTotal    int64 // atomic
+	burstEngageTotal  int64 // atomic
 
 	// accept-rate counters, only meaningful during protect detection.
 	// Two sliding windows: 100 ms (cap=48) and 500 ms (cap=180).
@@ -196,7 +197,11 @@ func enterProtect(d time.Duration) {
 }
 
 func inProtect(now time.Time) bool {
-	return now.UnixNano() < atomic.LoadInt64(&protectUntil)
+	if now.UnixNano() < atomic.LoadInt64(&protectUntil) {
+		return true
+	}
+	// TTL elapsed; only release if Swift has confirmed memory recovery.
+	return atomic.LoadInt32(&recoveryConfirmed) == 0
 }
 
 // acceptBurstHit returns true if the accept-rate window has been exceeded.
@@ -229,16 +234,16 @@ func EnterProtectMode(millis int) {
 	if millis <= 0 {
 		millis = int(protectTTL / time.Millisecond)
 	}
+	atomic.StoreInt32(&recoveryConfirmed, 0)
 	enterProtect(time.Duration(millis) * time.Millisecond)
 }
 
 // MaybeReleaseProtect is called from Swift's heartbeat when
-// os_proc_available_memory() >= 18 MiB. Does NOT shorten the window;
-// release is purely time-based once the 5 s TTL has elapsed.
-// (This function is currently a no-op placeholder; left exported in
-// case future tuning needs an explicit "memory-OK" signal.)
+// os_proc_available_memory() >= 18 MiB. Sets the recovery-confirmed
+// flag so inProtect() can release once the protect TTL has elapsed.
+// gomobile binding exposes this to Swift as SocksstubMaybeReleaseProtect().
 func MaybeReleaseProtect() {
-	// Nothing to do — protectUntil is checked lazily on the accept hot path.
+	atomic.StoreInt32(&recoveryConfirmed, 1)
 }
 
 // BurstShedTotal / BurstEngageTotal / BurstActive expose counters for
