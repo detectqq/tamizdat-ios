@@ -1,43 +1,55 @@
-// Package netstack is the Path 4 entry point — a single-process iOS
-// extension data path using sing-tun + sagernet/gvisor in place of
-// the IPA-Z series' "hev + SOCKS5 loopback" architecture.
+// Package netstack is the Path 5 / Option A entry point — a single-
+// process iOS extension data path that owns the utun fd directly,
+// implements userspace TCP+UDP, and forwards every flow through the
+// existing tamizdat.Client.
 //
-// On startup, the iOS Network Extension hands us the utun fd and
-// configBlob via Start(fd, configBlob). sing-tun's gvisor stack reads
-// packets directly from the fd into its TCP/UDP demuxers; our Handler
-// (handler.go) bridges each accepted flow to tamizdat.Client.DialContext
-// (TCP) or .DialUDP (UDP) and pumps bytes between gvisor and tamizdat.
+// History:
+//   - IPA-A series (Path 3): hev-socks5-tunnel (C/lwIP) + SOCKS5 loopback
+//     + mobile/socksstub. Hit memory ceiling under multi-app load.
+//   - IPA-B series (Path 4): sing-tun + sagernet/gvisor. B1=gvisor mode
+//     (30 Mbps cap from iOS-specific TCP buffer cap). B2=Mixed mode (TCP
+//     NAT loopback broken on iOS NE). B3=full sing-box-for-apple parity
+//     (Mixed worked but tamizdat V1 cap=150 saturated under iOS multi-
+//     app burst). B4=V2 mode (cap=300 streams) + sync.Pool. B5=shrink
+//     all per-flow buffers.
+//   - IPA-C series (Path 5 / Option A): this package. Drops sing-tun +
+//     sagernet/gvisor entirely; writes our own minimal TCP+UDP shim
+//     tuned for iOS NE 50 MB jetsam cap. Per-flow ≤9 KiB (vs sing-tun
+//     ~96 KiB), bounded MaxFlows=128, hot path zero-alloc steady state.
+//     Architecture per Psiphon production playbook: tunnel IP packets,
+//     not per-flow Go structs.
 //
-// The hev xcframework, the SOCKS5 loopback (mobile/socksstub), and the
-// Swift PacketBridge (deleted in IPA-A1) all become unnecessary.
+// On startup, the iOS Network Extension hands us the utun fd
+// (already dup()ed in Swift per IPA-B1) plus the config blob. We open
+// our own TCP/UDP machinery and dispatch packets directly to
+// tamizdat.Client.DialContext (TCP) / .DialUDP (UDP).
 //
 // Build tags:
-//   - default: Start returns "netstack disabled" — the package compiles
-//     for unit-testing the parser/state but cannot drive a tunnel.
-//   - -tags=netstack_real: bridge.go + handler.go + dial_cap.go are
-//     linked. Requires -tags=with_gvisor too (sing-tun's gvisor stack
-//     is itself behind that tag — see with_gvisor_required.go for the
-//     compile-time guard).
+//   - default: Start returns "netstack disabled" — package compiles for
+//     unit-testing the parser/state but cannot drive a tunnel.
+//   - -tags=netstack_real: tunnel.go + tcp_*.go + udp_nat.go + ipv4.go +
+//     bind_workaround_ios.go are linked. iOS-only path (//go:build ios
+//     && netstack_real). Path 5 NO LONGER requires with_gvisor or
+//     sing-tun.
 package netstack
 
 import (
 	"context"
 	"errors"
-	"runtime/debug"
 	"sync"
 )
 
-// runtime is package-global state for the singleton netstack instance.
-// On iOS we run exactly one VPN tunnel at a time; multiple-call
-// patterns (Stop+Start in sequence) are supported but concurrent
+// netstackState is package-global state for the singleton netstack
+// instance. On iOS we run exactly one VPN tunnel at a time; multiple-
+// call patterns (Stop+Start in sequence) are supported but concurrent
 // active stacks are not.
-type runtime struct {
+type netstackState struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	fd     int32
 }
 
-var rt = &runtime{}
+var rt = &netstackState{}
 
 // Start hands the iOS-supplied utun fd and the user's config blob to
 // the netstack engine. On success, packet I/O runs on internal
@@ -48,35 +60,23 @@ var rt = &runtime{}
 // mobile/internal/configparse — the same parser the main app's
 // "Connect" button uses to validate the user's pasted URL.
 //
-// Memory budget: SetMemoryLimit(37 MB) is set before bridgeStart
-// runs (75% of iOS NEPacketTunnelProvider's 50 MB jetsam cap, per
-// sing-box-for-apple's empirical formula). The limit is a soft
-// target for Go's GC — under sustained allocation it forces aggressive
-// GC but does NOT bound RSS (mmap, gvisor pools, cgo all escape).
-// Calibrate empirically against jetsam fires; drop to 30 MB if needed.
+// Memory limit + GC tuning is configured INSIDE startTunnel because
+// it depends on the build (tunnel.go for Path 5, bridge.go for the
+// older sing-tun-based code in case we keep parallel paths). See
+// project_ios_singtun_ground_truth.md memory file for the
+// 50 MB × 3/4 = 37.5 MB rationale.
 func Start(fd int32, configBlob string) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if rt.cancel != nil {
 		return errors.New("netstack already started")
 	}
-	// Reject fd <= 0: sing-tun's tun.Options treats FileDescriptor == 0
-	// as the "create / open utun device" sentinel on darwin (see
-	// sing-tun@v0.8.9/tun_darwin.go:94-122). The iOS
-	// NEPacketTunnelProvider hands us a real fd that is always > 0;
-	// receiving 0 here means the bridge wired up wrong.
 	if fd <= 0 {
 		return errors.New("invalid utun fd")
 	}
 
-	// Set the limit BEFORE bridgeStart so the very first allocations
-	// (TLS handshake bytes, x509 certs, h2 framer scratch) already
-	// observe the cap. Re-applying it under runtime.mu also makes
-	// double-Start a no-op for the limit setter.
-	debug.SetMemoryLimit(37 * 1024 * 1024)
-
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := bridgeStart(ctx, fd, configBlob); err != nil {
+	if err := startTunnel(ctx, fd, configBlob); err != nil {
 		cancel()
 		return err
 	}
@@ -85,15 +85,11 @@ func Start(fd int32, configBlob string) error {
 	return nil
 }
 
-// Stop tears down the gvisor stack, closes flows, and releases the
-// fd back to iOS for reclaim. Idempotent — a second Stop after the
-// first is a no-op.
+// Stop tears down the netstack and closes flows. Idempotent.
 //
-// Ordering of teardown is delegated to bridgeStop (defined in either
-// bridge.go or bridge_stub.go depending on build tags) to keep this
-// shim tag-agnostic. bridgeStop runs OUTSIDE the runtime mutex per
-// hermes' Phase 0 review note — long-running close paths shouldn't
-// serialize a future Start re-entry.
+// Ordering inside stopTunnel: cancel ctx → close flow tables → close
+// tamizdat client → close fd (last, so any in-flight syscall.Read
+// gets EBADF and exits the run loop cleanly).
 func Stop() {
 	rt.mu.Lock()
 	cancel := rt.cancel
@@ -104,10 +100,5 @@ func Stop() {
 	if cancel != nil {
 		cancel()
 	}
-	bridgeStop()
+	stopTunnel()
 }
-
-// Phase 0 carry: import-touches keeps sing-tun + sing in the
-// `require` graph during go mod tidy even when this package's other
-// files don't reference them (e.g. when netstack_real is not set).
-var _ = importTouches
