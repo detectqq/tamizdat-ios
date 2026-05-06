@@ -358,7 +358,28 @@ func buildTamizdatClient(cfg *configparse.Config, utunIP netip.Addr) (*tamizdat.
 		IdleTimeout:       30 * time.Second,
 		PoolVariant:       "v1",
 		StrictSingleH2:    true,
-		Dialer:            iosBindDialer(utunIP),
+		// IPA-C3: removed iosBindDialer(utunIP) here. The bind()
+		// workaround from Apple developer thread #681516 was meant to
+		// recover 3× TCP perf from full-tunnel route loops, but on iOS
+		// NE the utun's address (172.19.0.1) is NOT a kernel-bindable
+		// endpoint for outbound TCP from the extension context — the
+		// kernel returns EADDRNOTAVAIL ("can't assign requested
+		// address") for every dial. Apple's example was for macOS
+		// desktop where the tun's address is reachable via the host's
+		// routing table; iOS NE extension is sandboxed differently.
+		//
+		// C2 device smoke (samizdat-2026-05-06T07-27-17Z.log) showed
+		// every UDP/TCP dial failing with:
+		//   error: UDP dial 8.8.8.8:53: getting transport:
+		//   TCP dial to odikee.dpdns.org:778: dial tcp
+		//   172.19.0.1:0->38.135.53.241:778: connect: can't assign
+		//   requested address
+		//
+		// Fix: leave Dialer nil so tamizdat uses default net.Dialer
+		// (no LocalAddr). Yields 1× TCP perf on full-tunnel; we'll
+		// revisit the 3× recovery path later if profiling shows it
+		// matters (likely needs a different binding approach like
+		// SO_BINDTOIFINDEX on the underlying interface, not the tun).
 	}
 	if len(cfg.SNIPool) > 1 {
 		clientCfg.ServerNames = cfg.SNIPool
