@@ -17,12 +17,12 @@
 //
 // Public gomobile API:
 //
-//   func Start(socketPath string) error
-//   func Stop()
-//   func Status() string                       // "stopped" | "listening"
-//   func ConnectionsCount() int
-//   func SetSamizdatConfig(blob string) error  // empty string → direct dial
-//   func Logs() string
+//	func Start(socketPath string) error
+//	func Stop()
+//	func Status() string                       // "stopped" | "listening"
+//	func ConnectionsCount() int
+//	func SetSamizdatConfig(blob string) error  // empty string → direct dial
+//	func Logs() string
 package socksstub
 
 import (
@@ -51,10 +51,10 @@ import (
 )
 
 const (
-	socksVersion5      = 0x05
-	socksMethodNoAuth  = 0x00
-	socksCmdConnect    = 0x01
-	socksCmdUDPAssoc   = 0x03
+	socksVersion5     = 0x05
+	socksMethodNoAuth = 0x00
+	socksCmdConnect   = 0x01
+	socksCmdUDPAssoc  = 0x03
 	// socksCmdFwdUDP is hev-socks5-tunnel's custom command for
 	// "UDP-in-TCP" forwarding (HEV_SOCKS5_REQ_CMD_FWD_UDP). It is what
 	// hev sends when the YAML has `socks5.udp: 'tcp'`. After the SOCKS5
@@ -97,6 +97,15 @@ type runtimeState struct {
 
 var rt = &runtimeState{logsMax: 500}
 
+func init() {
+	// IPA-D1: Go 1.19+ memory soft limit. 35 MiB = 70% of the iOS
+	// 50 MiB jetsam cap, leaves headroom for hev's C-side and the
+	// Go runtime baseline (~5 MiB). Drives aggressive GC under
+	// pressure WITHOUT calling debug.FreeOSMemory() (which has
+	// documented iOS gomobile crashes per golang/go#16644).
+	debug.SetMemoryLimit(35 << 20)
+}
+
 // Log file mirror — same App Group file the extension writes to. The
 // main-app side calls SetLogSink at startup so SocksStub heartbeats
 // appear in the same unified log the user sees in the LogView.
@@ -119,6 +128,42 @@ var (
 // surface it. Heartbeat + errors + lifecycle events are NOT gated and
 // always show.
 var verboseFlowLogs atomic.Bool
+
+var relayBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 8192)
+		return &b
+	},
+}
+
+var errDialSemFull = errors.New("dial semaphore full or context cancelled")
+
+// IPA-D1: bounded dial semaphore for backpressure between the SOCKS5
+// accept loop and tamizdat.DialContext. Without this, http2 client
+// blocks on pendingRequests at MaxConcurrentStreams=150 and goroutines
+// accumulate (golang/go#13774). Capacity = 1.5× MaxStreamsPerConn for
+// V1 mode, allowing graceful absorption of small bursts without
+// piling up. Excess dials get RST'd at SOCKS5 level → iOS app retries
+// → load shed by lwIP's bounded session count (max-session-count=1200).
+const dialSemCap = 225 // V1: 150 streams × 1.5 = 225
+
+var dialSem = make(chan struct{}, dialSemCap)
+
+// acquireDial blocks up to ctx.Done; returns false on context cancel
+// or — for fast-fail under heavy burst — if the semaphore can't be
+// acquired within 100 ms (apps will retry; we don't queue indefinitely).
+func acquireDial(ctx context.Context) bool {
+	select {
+	case dialSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-time.After(100 * time.Millisecond):
+		return false
+	}
+}
+
+func releaseDial() { <-dialSem }
 
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
@@ -183,19 +228,8 @@ func Start(addrSpec string) error {
 	}
 	rt.mu.Unlock()
 
-	// Pin the Go runtime under iOS's NEPacketTunnelProvider memory cap.
-	// iOS jetsam-reaps the extension if RSS approaches ~50 MB.
-	//
-	// IPA-Z5: bump soft limit 25 MB → 37 MB (sing-box-for-apple's
-	// formula: 75% of the 50 MB jetsam cap). At 25 MB the GC pacer was
-	// running so aggressively that small bursts couldn't be absorbed
-	// without paging — and the headroom we kept (25 MB unused) was
-	// just sitting useless because Go won't touch it. 37 MB lets the
-	// heap actually breathe under speedtest fanout while still leaving
-	// 13 MB headroom for non-Go state (Swift, hev, NEPacketTunnel
-	// internals). GOGC=20 (steeper-than-default GC ramp) is kept —
-	// Go's pacer will start aggressive collection well before 37 MB.
-	debug.SetMemoryLimit(37 * 1024 * 1024)
+	// IPA-D1: memory soft limit is set in init() at 35 MiB. Keep the
+	// existing steeper-than-default GC ramp.
 	debug.SetGCPercent(20)
 
 	network := "tcp"
@@ -458,7 +492,13 @@ func SetSamizdatConfig(blob string) error {
 		// whether it was TCP dial, TLS handshake, or H2 settings that died.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		conn, err := client.DialContext(ctx, "tcp", "1.1.1.1:443")
+		const warmupTarget = "1.1.1.1:443"
+		if !acquireDial(ctx) {
+			rt.appendLog(fmt.Sprintf("warn: dial semaphore full or ctx cancel for %s", warmupTarget))
+			return
+		}
+		conn, err := client.DialContext(ctx, "tcp", warmupTarget)
+		releaseDial()
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("warn: samizdat warm-up dial: %v (cold start will be slower)", err))
 			return
@@ -608,13 +648,10 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 	}, nil
 }
 
-// FreeOSMemory triggers Go's runtime to return as much memory as possible
-// to the OS via madvise(MADV_FREE_REUSABLE) on darwin. iOS will count
-// pages we hold against our jetsam ledger even after Go has freed them
-// internally; calling this from the extension's 2 s heartbeat loop
-// keeps the visible process RSS as low as the live-set permits.
+// FreeOSMemory is intentionally a no-op on Path 3 D1. debug.FreeOSMemory
+// has documented iOS gomobile crashes (golang/go#16644); memory pressure
+// is handled by debug.SetMemoryLimit instead.
 func FreeOSMemory() {
-	debug.FreeOSMemory()
 }
 
 // SetPoolVariant selects the tamizdat connection-pool strategy on the
@@ -833,6 +870,9 @@ func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string
 	cancel()
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("error: conn#%d dial %s failed after %dms: %v", idx, dest, time.Since(dialStart).Milliseconds(), err))
+		if errors.Is(err, errDialSemFull) {
+			return // close the SOCKS5 conn; hev RSTs iOS-side and apps retry
+		}
 		code := byte(socksReplyHostUnk)
 		var oerr *net.OpError
 		if errors.As(err, &oerr) && oerr.Err != nil {
@@ -875,6 +915,11 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 		return d.DialContext(ctx, "tcp", dest)
 	}
 	// Stage 2: route through the samizdat H2 CONNECT tunnel.
+	if !acquireDial(ctx) {
+		rt.appendLog(fmt.Sprintf("warn: dial semaphore full or ctx cancel for %s", dest))
+		return nil, fmt.Errorf("%w for %s", errDialSemFull, dest)
+	}
+	defer releaseDial()
 	return client.DialContext(ctx, "tcp", dest)
 }
 
@@ -894,6 +939,11 @@ func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 		// dest; ReadFrom returns dest as Addr).
 		return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
 	}
+	if !acquireDial(ctx) {
+		rt.appendLog(fmt.Sprintf("warn: dial semaphore full or ctx cancel for %s", dest))
+		return nil, fmt.Errorf("%w for %s", errDialSemFull, dest)
+	}
+	defer releaseDial()
 	return client.DialUDP(ctx, dest)
 }
 
@@ -964,14 +1014,14 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		port uint16
 	}
 	type pcEntry struct {
-		pc           net.PacketConn
-		atyp         byte   // remember the atyp for the reverse frame header
-		addrEncoded  []byte // pre-encoded addr+port bytes (without atyp)
-		lastActive   atomic.Int64 // unix nanos, reset on every forward/reverse activity
+		pc          net.PacketConn
+		atyp        byte         // remember the atyp for the reverse frame header
+		addrEncoded []byte       // pre-encoded addr+port bytes (without atyp)
+		lastActive  atomic.Int64 // unix nanos, reset on every forward/reverse activity
 	}
 	const (
-		fwdUDPMaxEntries = 128                 // hard cap on pcs map
-		fwdUDPIdleNanos  = 60 * 1_000_000_000  // 60 s idle → evict
+		fwdUDPMaxEntries = 128                // hard cap on pcs map
+		fwdUDPIdleNanos  = 60 * 1_000_000_000 // 60 s idle → evict
 	)
 	var (
 		pcMu      sync.Mutex
@@ -1182,19 +1232,24 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 }
 
 // relay copies bytes between two duplex streams until either side closes.
-// Audit fix (final IPA-F): 16 KB per direction (was 32 KB). At 50 concurrent
-// flows that saves ~1.6 MB of buffer RSS — small in absolute terms but
-// directly comes off the extension's jetsam-shrunk available budget.
 func relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 16*1024)
-		_, _ = io.CopyBuffer(b, a, buf)
+		// IPA-D1: shrink relay buffer 32 KiB → 8 KiB. At 588 burst flows:
+		// 588 × 32 × 2 = 36 MiB → 588 × 8 × 2 = 9 MiB. Removes the dominant
+		// memory spike contributor identified by the strategic DR.
+		bufp := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufp)
+		_, _ = io.CopyBuffer(b, a, *bufp)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 16*1024)
-		_, _ = io.CopyBuffer(a, b, buf)
+		// IPA-D1: shrink relay buffer 32 KiB → 8 KiB. At 588 burst flows:
+		// 588 × 32 × 2 = 36 MiB → 588 × 8 × 2 = 9 MiB. Removes the dominant
+		// memory spike contributor identified by the strategic DR.
+		bufp := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufp)
+		_, _ = io.CopyBuffer(a, b, *bufp)
 		done <- struct{}{}
 	}()
 	<-done

@@ -41,30 +41,20 @@ jobs:
       - name: gomobile init
         run: gomobile init
 
-      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub + netstack)
+      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub)
         working-directory: mobile
         run: |
           mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
-          # IPA-C1 (Path 5 / Option A) build tags:
-          #   netstack_real — gates our Path 5 implementation files
-          #                   (tunnel.go, tcp_*.go, udp_nat.go, ipv4.go,
-          #                   bind_workaround_ios.go). All these files
-          #                   also have `//go:build ios` so they're only
-          #                   linked on iOS targets — gomobile bind
-          #                   sets GOOS=ios automatically.
-          #
-          # Sing-tun, sagernet/gvisor, and the with_gvisor / with_low_memory
-          # / badlinkname tags from IPA-B3..B5 are no longer needed:
-          # Path 5 implements its own minimal IPv4+TCP+UDP stack
-          # (~9 KiB per flow vs sing-tun's ~96 KiB per flow). go.mod
-          # still has sing-tun + sing in `require` for now (cleanup in
-          # IPA-C2 once the architecture is proven on device).
+          # IPA-D1: pivoted back to Path 3 (hev xcframework + Go SOCKS5 +
+          # tamizdat). Drop ./netstack from the bind list — Path 5 custom
+          # Go userspace TCP is shelved. netstack package files remain in
+          # the repo for now (research artifact); not built into the
+          # xcframework.
           gomobile bind -v \
-            -tags=netstack_real \
             -target=ios,iossimulator \
             -iosversion=17.0 \
             -o "${{ env.FRAMEWORK_OUT }}" \
-            ./samizdat ./socksstub ./netstack
+            ./samizdat ./socksstub
           ls -la "${{ env.FRAMEWORK_OUT }}"
 
       - name: Build HevSocks5Tunnel.xcframework

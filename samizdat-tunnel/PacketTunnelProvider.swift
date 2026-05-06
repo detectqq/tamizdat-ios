@@ -7,18 +7,17 @@ import Darwin
 import HevSocks5Tunnel
 import SamizdatClient
 
-/// Path 3 PacketTunnelProvider — pure C/lwIP via hev-socks5-tunnel, no Go
-/// runtime in the extension. The heavy lifting (Go SOCKS5 listener,
-/// optional samizdat proxy) lives in the main-app process where there is
-/// no jetsam memory cap. The extension's job in this design is reduced to
-/// just three things:
+/// Path 3 PacketTunnelProvider — C/lwIP via hev-socks5-tunnel plus the
+/// gomobile SOCKS5/tamizdat stub inside the extension. The extension's
+/// job in this design is reduced to four things:
 ///
 ///   1. install NEPacketTunnelNetworkSettings;
-///   2. find the utun file descriptor that NEPacketTunnelProvider just
+///   2. start the local SOCKS5 listener and build the tamizdat client;
+///   3. find the utun file descriptor that NEPacketTunnelProvider just
 ///      opened for us (Apple does not pass it through the public API; we
 ///      enumerate fds and match the "com.apple.net.utun_control" socket
 ///      pattern — same trick every shipping iOS proxy app uses);
-///   3. call hev_socks5_tunnel_main_from_str(config, len, fd), which
+///   4. call hev_socks5_tunnel_main_from_str(config, len, fd), which
 ///      blocks until hev_socks5_tunnel_quit().
 ///
 /// Memory profile observed on production iOS proxy clients (V2Box, FoXray,
@@ -47,6 +46,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var swiftHeartbeatTimer: DispatchSourceTimer?
     private var swiftLogHandle: FileHandle?
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
+    private var hevYAML: String?  // kept alive for hev's lifetime
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
     // Mirrors what V2Box / FoXray / Hiddify do: when the OS default interface
@@ -113,12 +113,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
         appendExtLog("info: endpoint mode = \(mode.rawValue) (backup configured: \(split.backup != nil))")
 
-        // IPA-B2: open the App Group log sinks (both samizdat-side and
-        // socksstub-side, even though socksstub is now idle, in case
-        // rewireUpstream wakes it later). This used to live inside
-        // startInProcessSocks; pulled out so we can skip the heavy
-        // tamizdat-client-build path (~10 MB heap-resident duplicate
-        // of what netstack already owns).
+        // IPA-D1: Path 3 needs App Group log sinks before both the
+        // Go-side SOCKS5/tamizdat listener and hev start writing.
         Self.openAppGroupLogSinks()
 
         let settings = makeNetworkSettings(serverIP: serverIP)
@@ -130,27 +126,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler(error)
                 return
             }
-            // IPA-B1 / B2 (Path 4): hand the utun fd + config blob to the
-            // in-process sing-tun stack (Mixed mode = system TCP + gvisor
-            // UDP, matching sing-box-for-apple). hev xcframework + lwIP +
-            // SOCKS5 loopback are no longer in the data path.
-            //
-            // The Path-3 socksstub package is still gomobile-bound (its
-            // status-getter symbols are referenced by the lamp UI) but
-            // we deliberately do NOT call startInProcessSocks anymore —
-            // building a second tamizdat.Client just to serve a
-            // never-accepted SOCKS5 listener wasted ~10 MB of heap and
-            // pushed IPA-B1 over the 50 MB iOS jetsam cap when Roblox
-            // launched mid-speedtest. The lamp will show stale "—offline—"
-            // data on Path 4 until Phase 2 wires NetstackStatus getters.
-            self.appendExtLog("info: setTunnelNetworkSettings OK — starting netstack")
-            self.startNetstack(configBlob: activeBlob, completionHandler: completionHandler)
+            self.appendExtLog("info: setTunnelNetworkSettings OK — starting hev (Path 3)")
+            // IPA-D1: pivoted from Path 5 (custom Go TCP) back to Path 3
+            // (hev xcframework + Go SOCKS5 + tamizdat upstream). Path 5 was
+            // a tar pit; Path 3 worked in IPA-A9. We add 4 specific tunings
+            // (DR-recommended) below in startHev's YAML and in the Go side.
+            guard Self.startInProcessSocks(configBlob: activeBlob, log: { self.appendExtLog($0) }) else {
+                completionHandler(self.makeError("SocksStub failed to start"))
+                return
+            }
+            self.startHev(configBlob: activeBlob, completionHandler: completionHandler)
         }
     }
 
-    /// IPA-B2: minimum log-sink wiring without building any
-    /// tamizdat clients. Called from startTunnel on Path 4. Both
-    /// samizdat and socksstub Go packages keep their own
+    /// IPA-D1: shared App Group log-sink wiring. Both samizdat and
+    /// socksstub Go packages keep their own
     /// package-global file handles; we point both at the same App
     /// Group file so messages from either side end up in the bridge
     /// tail. Concurrent appends < PIPE_BUF (4 KiB on Darwin) are
@@ -176,16 +166,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ) {
             let logURL = containerURL.appendingPathComponent(logFileName)
             SocksstubSetLogSink(logURL.path)
-            // IPA-B1: also point the samizdat package's log sink at the
-            // same App Group file. Path 4's netstack package routes its
-            // runtime logs through samizdat.AddLog (rtlog.go), which
-            // mirrors to samizdat's OWN package-global logSink — a
-            // separate file handle from socksstub's. Without this call,
-            // every gvisor-side error / dial failure / "netstack started"
-            // line accumulates in samizdat's in-memory ring but never
-            // hits disk → bridge tail invisible. (Path 3 didn't need
-            // this because hev's C-side logging routed through socksstub
-            // exclusively.)
+            // IPA-D1: also point the samizdat package's log sink at the
+            // same App Group file. socksstub and samizdat keep separate
+            // package-global sinks, so set both before building the client.
             SamizdatSetLogSink(logURL.path)
         }
         var startErr: NSError?
@@ -220,6 +203,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason,
                              completionHandler: @escaping () -> Void) {
+        // IPA-D1: release kernel-side routing/DNS state cleanly. Apple
+        // sample (davlxd/NEPacketTunnelVPNDemo) and Quinn DTS guidance
+        // recommend nil'ing settings before tunnel teardown. Skipping
+        // this can leak routes/DNS into next session and pin neagent
+        // memory.
+        self.setTunnelNetworkSettings(nil) { [weak self] _ in
+            guard let self else {
+                completionHandler()
+                return
+            }
+            self.continueStopTunnel(reason: reason, completionHandler: completionHandler)
+        }
+    }
+
+    private func continueStopTunnel(reason: NEProviderStopReason,
+                                    completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
@@ -227,16 +226,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         whitelistDetector = nil
         WhitelistStatusStore.reset()
         pathMonitor.cancel()
-        // IPA-B1 (Phase C / Path 4): stop the in-process gvisor netstack
-        // that owns the data path now. The teardown order inside
-        // bridgeStop is: stack.Close (drains gvisor) → tunIf.Close (closes
-        // the fd) → client.Close (closes tamizdat transports). Idempotent
-        // — second call is a no-op. We deliberately do NOT call
-        // hev_socks5_tunnel_quit() any more; hev is no longer in the
-        // data path. Phase 3 deletes the import entirely.
-        NetstackStop()
+        // IPA-D1: Path 3 teardown. Stop hev's lwIP loop and the Go-side
+        // SOCKS5/tamizdat listener. Both calls are idempotent enough for
+        // hot-restart cleanup.
+        hev_socks5_tunnel_quit()
+        SocksstubStop()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
+        hevYAML = nil
         try? swiftLogHandle?.close()
         swiftLogHandle = nil
         completionHandler()
@@ -328,20 +325,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
-        // IPA-B2: rewire via SocksstubSetSamizdatConfig is now a no-op
-        // path because Path 4 doesn't run a SOCKS5 listener — the
-        // tamizdat client lives inside netstack/. Building a duplicate
-        // in socksstub here would re-introduce the ~10 MB heap pressure
-        // that pushed IPA-B1 over the iOS jetsam cap during Roblox
-        // launch. Phase 2 wires NetstackSetSamizdatConfig to
-        // rebuild netstack's tamizdat client on path-monitor flips
-        // (wifi ↔ cellular). For IPA-B2 the rewire just logs the path
-        // change; the existing in-flight tamizdat connections will
-        // either survive the interface change (sockets resume on the
-        // new default interface within a few RTTs) or fail and be
-        // reaped by IdleTimeout=30s, with new dials going through the
-        // current default interface naturally.
-        appendExtLog("info: path change rewire deferred (mode=\(mode.rawValue)) — Phase 2 NetstackSetSamizdatConfig pending")
+        // IPA-D1: Path 3 owns upstream through socksstub. Rebuild the
+        // tamizdat client on path flips and endpoint switches so new
+        // dials use the current interface / selected endpoint.
+        SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
+        var cfgErr: NSError?
+        SocksstubSetSamizdatConfig(blob, &cfgErr)
+        if let cfgErr {
+            appendExtLog("error: SocksstubSetSamizdatConfig rewire: \(cfgErr.localizedDescription)")
+            return
+        }
+        appendExtLog("info: upstream rewired (mode=\(mode.rawValue))")
     }
 
     /// Picks the appropriate blob for a given mode. In manual modes
@@ -462,119 +456,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    // MARK: – Path 4 netstack invocation (IPA-B1)
-
-    /// Phase 1 of the gvisor migration. Replaces startHev's role entirely:
-    /// we still find the utun fd via the same KVO+scan dance (Apple still
-    /// hides it from the public API), but instead of feeding YAML to hev's
-    /// lwIP + a SOCKS5 loopback, we hand (fd, configBlob) directly to the
-    /// in-process sing-tun + sagernet/gvisor netstack. NetstackStart is
-    /// generated by gomobile from `mobile/netstack/netstack.go:Start` and
-    /// kicks off the gvisor TCP/UDP forwarders + the tamizdat client on
-    /// internal goroutines, returning synchronously.
-    ///
-    /// Memory profile vs. Path 3: hev's lwIP (~5-15 MB RSS) and the
-    /// SocksStub Go listener (~10-20 MB) collapse into one in-process
-    /// gvisor stack (target ~25-30 MB RSS for both stack and tamizdat
-    /// combined under a 37 MB GOMEMLIMIT). The savings come from
-    /// eliminating the buffer-mismatch backpressure between lwIP's
-    /// outbound buffer and Go h2's stream window — a problem we tracked
-    /// from IPA-A4 through A8 — plus removing the SOCKS5 protocol
-    /// overhead between the two stacks.
-    private func startNetstack(configBlob: String, completionHandler: @escaping (Error?) -> Void) {
-        // IPA-C6 (DR Stage 1.3): drop the KVO path; use only the
-        // getpeername/CTLIOCGINFO fd scan that WireGuard ships.
-        guard let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) else {
-            appendExtLog("error: could not locate utun fd via fd scan")
-            completionHandler(makeError("utun fd not found via scan"))
-            return
-        }
-        let rawFD: Int32 = scanFD
-        appendExtLog("info: utun fd selected via scan = \(rawFD)")
-
-        // IPA-B1 spec audit (B10/O1): dup the fd before handing it to
-        // Go. sing-tun wraps the int with `os.NewFile(uintptr(fd), ...)`
-        // which TAKES OWNERSHIP — its `tunFile.Close()` will close the
-        // underlying fd. iOS's NEPacketTunnelProvider may also close
-        // the same int on cancelTunnel. Without dup, two close()
-        // calls race on one fd; if the runtime has reused the fd
-        // for an unrelated open in between, the second close() lands
-        // on the WRONG file → silent corruption (closing a random
-        // socket of ours). dup() gives Go its own fd to own and
-        // close at will; iOS keeps closing the original.
-        let dupFD = dup(rawFD)
-        if dupFD < 0 {
-            let errnoVal = errno
-            appendExtLog("error: dup(utun fd \(rawFD)) failed errno=\(errnoVal)")
-            completionHandler(makeError("dup utun fd failed (errno \(errnoVal))"))
-            return
-        }
-        let fd = dupFD
-        appendExtLog("info: utun fd selected = \(rawFD), duped → \(fd) for Go ownership")
-
-        startSwiftHeartbeat()
-        startPathMonitor()
-        startWhitelistDetectorIfNeeded()
-        isRunning = true
-
-        // NetstackStart blocks only long enough to bring up the gvisor
-        // stack + tamizdat client — packet I/O runs on internal Go
-        // goroutines after return. Run the call on a background queue
-        // so we don't block the main extension thread for the typical
-        // 50-200 ms TLS handshake during cold start.
-        hevQueue.async { [weak self] in
-            guard let self else { return }
-            do {
-                var startErr: NSError?
-                NetstackStart(fd, configBlob, &startErr)
-                if let startErr {
-                    self.appendExtLog("error: NetstackStart: \(startErr.localizedDescription)")
-                    self.runningState.withLock { $0 = false }
-                    // NetstackStart failure means the Go side did NOT
-                    // wrap fd in os.NewFile — ownership stayed with us.
-                    // Close it ourselves so we don't leak the dup.
-                    close(fd)
-                    completionHandler(self.makeError("NetstackStart: \(startErr.localizedDescription)"))
-                    return
-                }
-                self.appendExtLog("info: netstack up (Path 5 / Option A — custom userspace TCP+UDP)")
-                completionHandler(nil)
-            }
-        }
-    }
-
-    // MARK: – hev invocation (Path 3 legacy — no longer in the data
-    // path as of IPA-B1; retained while Phase 3 cleanup is pending so
-    // the source diff stays small. Will be deleted along with the
-    // HevSocks5Tunnel xcframework import.)
+    // MARK: – hev invocation (Path 3 data path)
 
     private func startHev(configBlob: String, completionHandler: @escaping (Error?) -> Void) {
-        // hev's YAML config. iOS knobs from heiher's published memory-tuning
-        // recommendations (issue #109): tiny task stacks, small TCP buffer,
-        // bounded session count. socks5 endpoint = our main-app SOCKS5
-        // listener on localhost. UDP-over-TCP keeps memory bounded for
-        // QUIC-heavy traffic.
-        // Notes from the Path 3 audit:
-        //   - lwIP needs an explicit ipv4 in the tunnel block on some
-        //     code paths, otherwise it silently drops packets.
-        //   - connect-timeout 2 s (down from 5) — first DNS query
-        //     should not stall 5 s on a brief startup race.
-        // IPA-A7: revert A4's hev YAML caps. The 2nd analyst's review
-        // identified A4's `tcp-buffer-size: 16 KiB` as the smoking gun
-        // for Go heap explosion in the A4 log: lwIP outbound buffer
-        // (16 KiB) was too small relative to Go h2 stream window
-        // (64 KiB), producing backpressure pile-up that pinned 200
-        // streams × ~100 KB = 20+ MiB of "released-but-stuck" Go state.
-        // A5 added pcs eviction but kept the YAML, so heap explosions
-        // continued under load.
-        //
-        // Back to defaults — let lwIP run with its standard 64 KiB
-        // tcp-buffer matched against Go's 64 KiB stream window. The
-        // pcs-map leak (the original A3 9-min YouTube cause) is still
-        // bounded by Phase A in IPA-A5.
-        //
-        // Only retained: task-stack-size 24 KiB (default 84 KiB,
-        // historic iOS budget choice — out of scope to revisit).
+        // hev's YAML config. Path 3 = hev lwIP + local Go SOCKS5/tamizdat.
+        // UDP-over-TCP keeps memory bounded for QUIC-heavy traffic.
         let yaml = """
 tunnel:
   mtu: 1280
@@ -586,7 +472,13 @@ socks5:
   udp: 'tcp'
 
 misc:
+  # IPA-D1: documented hev iOS low-memory profile, verbatim from
+  # https://github.com/heiher/hev-socks5-tunnel/blob/main/README.md
+  # iOS section. Couples task-stack-size (20480 + tcp-buffer-size)
+  # — they MUST move together.
   task-stack-size: 24576
+  tcp-buffer-size: 4096
+  max-session-count: 1200
   log-level: 'info'
   connect-timeout: 2000
   read-write-timeout: 60000
@@ -617,12 +509,11 @@ misc:
         }
         appendExtLog("info: utun fd selected = \(fd)")
 
-        // Verify main app's SOCKS5 listener is reachable before handing
-        // packets to hev. If the app hasn't started SocksStubStart yet,
-        // fail fast with a clear error so the user sees "open the app".
+        // Verify the in-process SOCKS5 listener is reachable before handing
+        // packets to hev.
         if !Self.probeSocks5(port: Self.socksPort, timeout: 1.0) {
-            appendExtLog("error: SOCKS5 listener not reachable on 127.0.0.1:\(Self.socksPort) — open the main app first")
-            completionHandler(makeError("Open the Samizdat app first to start the SOCKS5 listener."))
+            appendExtLog("error: SOCKS5 listener not reachable on 127.0.0.1:\(Self.socksPort)")
+            completionHandler(makeError("SocksStub listener not reachable."))
             return
         }
         appendExtLog("info: SOCKS5 reachable; handing packets to hev")
@@ -633,14 +524,16 @@ misc:
         isRunning = true
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
-        // dedicated background queue.
-        let yamlCopy = yaml
+        // dedicated background queue. Keep YAML alive for hev's lifetime
+        // in case the C-side parser retains references to the buffer.
+        self.hevYAML = yaml
         hevQueue.async { [weak self] in
-            let rc = yamlCopy.withCString { cstr -> Int32 in
-                hev_socks5_tunnel_main_from_str(cstr, UInt32(yamlCopy.utf8.count), fd)
+            guard let self, let yaml = self.hevYAML else { return }
+            let rc = yaml.withCString { cstr -> Int32 in
+                hev_socks5_tunnel_main_from_str(cstr, UInt32(yaml.utf8.count), fd)
             }
-            self?.appendExtLog("info: hev returned rc=\(rc)")
-            self?.runningState.withLock { $0 = false }
+            self.appendExtLog("info: hev returned rc=\(rc)")
+            self.runningState.withLock { $0 = false }
         }
 
         // hev itself does not have a "ready" callback — it starts
@@ -741,56 +634,21 @@ misc:
     private func makeNetworkSettings(serverIP: String?) -> NEPacketTunnelNetworkSettings {
         let remoteAddress = serverIP ?? "127.0.0.1"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress)
-        // IPA-B3: bumped MTU 1280 → 4064 to match sing-box-for-apple's
-        // iOS NEPacketTunnelProvider default. sing-box source comment at
-        // protocol/tun/inbound.go:107 says "above 4064 the tun loop
-        // performance drops significantly" (4096 - UTUN_IF_HEADROOM_SIZE);
-        // below it means more iovec scratch + 3-4× syscalls per byte.
-        // Go-side bridge.go:iosTunMTU must match this exactly or sing-tun
-        // truncates incoming frames at the kernel boundary.
-        settings.mtu = 4064
-
-        // IPA-C6 (DR recommendation): switched 172.19.0.1/30 → 10.7.0.2/24
-        // to match WireGuard-iOS defaults. Both prefix sizes pass our
-        // userspace stack's HasNextAddress check; /24 is the well-trodden
-        // path with hundreds of millions of installed devices.
-        let ipv4 = NEIPv4Settings(addresses: ["10.7.0.2"], subnetMasks: ["255.255.255.0"])
+        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-
-        // IPA-C6 (DR root cause): removed 1.1.1.1, 8.8.8.8, 77.88.8.0
-        // from excludedRoutes. Previous list combined with
-        // dnsSettings.servers=[1.1.1.1, 8.8.8.8] caused iOS DNS resolver
-        // to route via physical interface (matching the excluded route),
-        // fetch A records outside tunnel, and apps then connected outside
-        // the tunnel too — net result: zero packets in utun.
-        //
-        // Only keep:
-        //   - serverIP/32 (must NOT loop the tamizdat outer-TCP through itself)
-        //   - 127.0.0.0/8 (loopback)
-        // Removed:
-        //   - 1.1.1.1, 8.8.8.8 (replaced by in-tunnel DNS via Quad9 below)
-        //   - 77.88.8.0/24 (probe target — Phase 2 problem, not now)
-        var excluded: [NEIPv4Route] = [
+        ipv4.excludedRoutes = [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
         ]
         if let serverIP {
-            excluded.append(NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255"))
+            ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
+                NEIPv4Route(destinationAddress: serverIP, subnetMask: "255.255.255.255"),
+            ]
         }
-        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
-
-        // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
         settings.ipv6Settings = nil
-
-        // IPA-C6: DNS via Quad9 (9.9.9.9) — NOT excluded from the tunnel,
-        // so DNS queries go through utun → our shim → tamizdat upstream.
-        // This is the structural fix for "apps don't open": with our previous
-        // setup DNS routed via physical interface + DNS server IPs were also
-        // excluded → app fetched A records outside tunnel → no traffic
-        // reached our shim. Quad9 is publicly recursive, supports DoT but
-        // we just use plain UDP/53 over the tunnel.
-        settings.dnsSettings = NEDNSSettings(servers: ["9.9.9.9", "149.112.112.112"])
+        settings.dnsSettings = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
         settings.dnsSettings?.matchDomains = [""]
+        settings.mtu = 1280
 
         return settings
     }
@@ -835,9 +693,9 @@ misc:
             let goRelKB   = SocksstubMemHeapReleasedKB()
             let numGC     = SocksstubMemNumGC()
 
-            // Ask the Go runtime to return freed pages to iOS so they
-            // don't sit on our jetsam ledger between heartbeats.
-            SocksstubFreeOSMemory()
+            // IPA-D1: no explicit debug.FreeOSMemory from Swift. Go-side
+            // memory pressure is handled by debug.SetMemoryLimit; explicit
+            // FreeOSMemory has documented iOS gomobile crashes.
 
             // IPA-A1: pps comes from hev's own tunnel-stats counters
             // (it now owns the data path again — no bridge counters
