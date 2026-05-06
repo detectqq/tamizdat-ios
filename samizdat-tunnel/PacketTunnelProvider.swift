@@ -677,11 +677,16 @@ misc:
     }
 
     private func startBurstProtection() {
+        // IPA-D7: nuclear close pattern from sing-box-for-apple.
+        // On kernel CRITICAL → close ALL active flows + force GC. iOS apps
+        // see RST and reconnect; iOS reclaims memory; we survive.
+        // Surgical admission control (D1-D6) was the wrong abstraction —
+        // sing-box doesn't do it and survives. We follow their pattern.
         let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
         let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
         src.setEventHandler { [weak self] in
-            self?.appendExtLog("warn: kernel memorypressure CRITICAL — engaging protect mode")
-            SocksstubEnterProtectMode(5000)
+            let closed = SocksstubCloseAllFlows()
+            self?.appendExtLog("warn: kernel memorypressure CRITICAL — nuclear close (\(closed) flows)")
         }
         src.activate()
         self.memPressureSrc = src
@@ -705,14 +710,14 @@ misc:
             // iOS's apple-supplied "available before jetsam" gauge.
             let availKB = os_proc_available_memory() / 1024
 
-            // IPA-D2: drive protect mode from per-process memory headroom.
+            // IPA-D7: per-process memory backstop. If avail drops below
+            // 8 MiB we trigger nuclear close (matches sing-box pattern —
+            // no surgical admission, just close everything and let apps
+            // reconnect). Above 8 MiB do nothing.
             let availBytes = os_proc_available_memory()
-            if availBytes > 0 {
-                if availBytes < 12 * 1024 * 1024 {
-                    SocksstubEnterProtectMode(5000)
-                } else if availBytes >= 18 * 1024 * 1024 {
-                    SocksstubMaybeReleaseProtect()
-                }
+            if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
+                let closed = SocksstubCloseAllFlows()
+                self.appendExtLog("warn: avail<8MiB heartbeat — nuclear close (\(closed) flows)")
             }
 
             // Go heap detail — disambiguates "Go is bloating" from

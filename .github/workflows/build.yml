@@ -51,6 +51,7 @@ jobs:
           gomobile bind -v \
             -target=ios,iossimulator \
             -iosversion=17.0 \
+            -tags=with_low_memory \
             -o "${{ env.FRAMEWORK_OUT }}" \
             ./samizdat ./socksstub
           ls -la "${{ env.FRAMEWORK_OUT }}"

@@ -48,6 +48,7 @@ import (
 	// is github.com/detectqq/tamizdat (`package tamizdat`). All call
 	// sites continue to use `samizdat.Client` etc. via this alias.
 	samizdat "github.com/detectqq/tamizdat"
+	singBufio "github.com/sagernet/sing/common/bufio"
 	"golang.org/x/time/rate"
 )
 
@@ -1485,24 +1486,24 @@ var relayBufPool = sync.Pool{
 func getRelayBuf() *[]byte { return relayBufPool.Get().(*[]byte) }
 func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
 
-// relay copies bytes between two duplex streams until either side closes.
-// Per-direction buffer = 16 KiB (audit fix, IPA-F shrunk from 32 KiB).
-// IPA-D5: buffers come from sync.Pool — see relayBufPool.
-// IPA-D6: takes idx so we can update flowRegistry's lastActive on each
-// successful chunk transfer. Inlined CopyBuffer loop instead of
-// io.CopyBuffer so we can call markFlowActive() between iterations.
+// IPA-D7: relay using sing-box's bufio.Copy with `with_low_memory` build
+// tag. This forces all copies through copyWaitWithPool — pool-managed
+// refcounted buffers from sing/common/buf/alloc.go (power-of-2 sync.Pool
+// from 64 B to 64 KiB). With the build tag, BufferSize=16 KiB and
+// LowMemory const = true so even non-WaitReader sources go through pool.
+//
+// This is the EXACT pattern sing-box-for-apple uses on iOS to survive
+// the 50 MiB jetsam cap. We copied verbatim because (per operator memory
+// rule "find what works > rollback") working open-source projects on
+// the same platform under same constraints have already solved this.
 func relay(a, b net.Conn, idx uint64) {
 	done := make(chan struct{}, 2)
 	go func() {
-		bufp := getRelayBuf()
-		defer putRelayBuf(bufp)
-		copyWithActivity(b, a, *bufp, idx)
+		_, _ = singBufio.Copy(b, a)
 		done <- struct{}{}
 	}()
 	go func() {
-		bufp := getRelayBuf()
-		defer putRelayBuf(bufp)
-		copyWithActivity(a, b, *bufp, idx)
+		_, _ = singBufio.Copy(a, b)
 		done <- struct{}{}
 	}()
 	<-done
@@ -1510,37 +1511,26 @@ func relay(a, b net.Conn, idx uint64) {
 	_ = b.Close()
 }
 
-// copyWithActivity is io.CopyBuffer + markFlowActive on each chunk.
-// Returns (n, err) like io.CopyBuffer for completeness, but neither
-// is used by the caller currently.
-func copyWithActivity(dst io.Writer, src io.Reader, buf []byte, idx uint64) (written int64, err error) {
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			markFlowActive(idx)
-			nw, ew := dst.Write(buf[:nr])
-			if nw < 0 || nr < nw {
-				nw = 0
-				if ew == nil {
-					ew = io.ErrShortWrite
-				}
-			}
-			written += int64(nw)
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
+// CloseAllFlows force-closes every registered flow. Called from
+// Swift's kernel memorypressure CRITICAL handler (the nuclear teardown
+// pattern from sing-box). Apps see RST and reconnect; iOS gets the
+// memory back; we survive.
+//
+// gomobile binding exposes this as SocksstubCloseAllFlows().
+func CloseAllFlows() int32 {
+	closed := int32(0)
+	flowRegistry.Range(func(k, v any) bool {
+		fs := v.(*flowState)
+		_ = fs.conn.Close()
+		if fs.cancel != nil {
+			fs.cancel()
 		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
+		closed++
+		return true
+	})
+	if closed > 0 {
+		rt.appendLog(fmt.Sprintf("warn: nuclear close — %d flows terminated under memory pressure", closed))
 	}
-	return written, err
+	debug.FreeOSMemory()
+	return closed
 }
