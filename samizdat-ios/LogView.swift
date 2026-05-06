@@ -117,11 +117,22 @@ struct LogView: View {
                     .disabled(sendStatus == .sending)
                     .tint(telegramTint)
 
-                    // IPA-D9: heap profile to telegram
+                    // IPA-D9/D10: manual heap snapshot to telegram
                     Button {
                         sendHeapToTelegram()
                     } label: {
                         Label("Heap", systemImage: "memorychip")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(sendStatus == .sending)
+
+                    // IPA-D11: send latest auto-dumped profile (saved
+                    // automatically right before nuclear close fired)
+                    Button {
+                        sendLatestAutoDumpToTelegram()
+                    } label: {
+                        Label("Crit", systemImage: "exclamationmark.triangle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -262,6 +273,73 @@ struct LogView: View {
                 }
             case .failure(let err):
                 sendStatus = .failed("heap: \(err.errorDescription ?? "unknown")")
+            }
+        }
+    }
+
+    /// IPA-D11: find the most recent auto-dumped heap profile in App Group
+    /// container and upload it to Telegram. These are written automatically
+    /// by the extension RIGHT BEFORE nuclear close on memory pressure
+    /// — the highest-signal snapshot for diagnosing leaks.
+    private func sendLatestAutoDumpToTelegram() {
+        guard TelegramReporter.isConfigured else {
+            sendStatus = .failed("Configure bot token first.")
+            return
+        }
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SamizdatBridge.appGroupID
+        ) else {
+            sendStatus = .failed("App Group container not available")
+            return
+        }
+
+        // Find heap-*.pb.gz files in container, pick the most recent.
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: containerURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            sendStatus = .failed("Cannot read App Group dir")
+            return
+        }
+        let heapFiles = entries
+            .filter { $0.lastPathComponent.hasPrefix("heap-") &&
+                      $0.lastPathComponent.hasSuffix(".pb.gz") }
+            .compactMap { url -> (URL, Date)? in
+                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate) ?? .distantPast
+                return (url, date)
+            }
+            .sorted { $0.1 > $1.1 }
+
+        guard let latest = heapFiles.first?.0 else {
+            sendStatus = .failed("No auto-dumped heap profile found yet. Wait for nuclear close to fire.")
+            return
+        }
+        guard let data = try? Data(contentsOf: latest) else {
+            sendStatus = .failed("Could not read \(latest.lastPathComponent)")
+            return
+        }
+
+        sendStatus = .sending
+        let caption = TelegramReporter.defaultCaption(
+            extra: "auto-dump (\(latest.lastPathComponent))"
+        )
+        TelegramReporter.sendFile(
+            data: data,
+            filename: latest.lastPathComponent,
+            mimeType: "application/gzip",
+            caption: caption
+        ) { result in
+            switch result {
+            case .success:
+                sendStatus = .sent
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    if case .sent = sendStatus { sendStatus = .idle }
+                }
+            case .failure(let err):
+                sendStatus = .failed("crit-dump: \(err.errorDescription ?? "unknown")")
             }
         }
     }
