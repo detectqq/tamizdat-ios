@@ -98,6 +98,74 @@ type runtimeState struct {
 
 var rt = &runtimeState{logsMax: 500}
 
+// IPA-D6: proactive idle eviction (Shadowrocket Tier-3 pattern).
+// Every active SOCKS5 flow registers itself in flowRegistry and updates
+// lastActiveNano on every successful read/write iteration. A background
+// goroutine ticks every 3 seconds and force-closes any flow that has
+// been idle for > 5 seconds. This is NOT memory-pressure-driven —
+// it runs ALL THE TIME, keeping the active set small enough that
+// memory never grows large.
+//
+// Shadowrocket decomp showed their mem_trim handler is empty stub
+// and os_proc_available_memory is used only for logging. Their actual
+// stop-crank is proactive: closeIfNeeded cuts streams by count/3,
+// removeAnyStreams evicts LRU idle > 10 seconds. We use 5 seconds for
+// more aggressive memory containment under our heavier per-flow cost.
+type flowState struct {
+	conn           net.Conn
+	cancel         context.CancelFunc
+	createdNano    int64
+	lastActiveNano atomic.Int64
+}
+
+var flowRegistry sync.Map // idx (uint64) → *flowState
+
+const (
+	idleEvictionTickInterval = 3 * time.Second
+	idleEvictionThreshold    = 5 * time.Second
+)
+
+// markFlowActive bumps the lastActiveNano of a registered flow.
+// Called from relay() on every successful CopyBuffer chunk.
+func markFlowActive(idx uint64) {
+	if v, ok := flowRegistry.Load(idx); ok {
+		v.(*flowState).lastActiveNano.Store(time.Now().UnixNano())
+	}
+}
+
+// startIdleEvictor launches the background ticker. Call once at Start.
+func startIdleEvictor(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(idleEvictionTickInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				now := time.Now().UnixNano()
+				cutoff := now - idleEvictionThreshold.Nanoseconds()
+				closed := 0
+				flowRegistry.Range(func(k, v any) bool {
+					fs := v.(*flowState)
+					if fs.lastActiveNano.Load() < cutoff {
+						// Idle too long. Close.
+						_ = fs.conn.Close()
+						if fs.cancel != nil {
+							fs.cancel()
+						}
+						closed++
+					}
+					return true
+				})
+				if closed > 0 {
+					rt.appendLog(fmt.Sprintf("info: idle-evict closed %d flows", closed))
+				}
+			}
+		}
+	}()
+}
+
 // Log file mirror — same App Group file the extension writes to. The
 // main-app side calls SetLogSink at startup so SocksStub heartbeats
 // appear in the same unified log the user sees in the LogView.
@@ -393,6 +461,7 @@ func Start(addrSpec string) error {
 
 	rt.appendLog(fmt.Sprintf("info: socks listener up on %s://%s", network, addr))
 	go acceptLoop(ctx, ln)
+	startIdleEvictor(ctx) // IPA-D6: proactive idle eviction
 	return nil
 }
 
@@ -543,10 +612,16 @@ func SetSamizdatConfig(blob string) error {
 		//               Roblox+YouTube combo. 150 × ~130 KB live per
 		//               active stream = ~19 MiB peak instead of ~26 MiB
 		//               at 200 — frees ~6-7 MiB headroom under jetsam.
-		//               Realistic concurrent load: Safari ~50 + Roblox
-		//               ~8 + YouTube ~20 + speedtest fanout ~32 ≈ 110.
-		//               Cap=150 still has 36% buffer over that.
-		MaxStreamsPerConn: 150,
+		//               IPA-D6: 150→8. Per-flow Go heap is ~1.5 MiB under
+		//               sustained download (empirically). Cannot match
+		//               Shadowrocket's per-flow cost (50 bytes - 20 KB) —
+		//               it's architectural Go-runtime overhead. Compensate
+		//               by hard-bounding parallelism: 16-stream Speedtest
+		//               forced into 2 batches of 8. Heap = 8 × 1.5 MiB =
+		//               12 MiB. Tradeoff: Speedtest throughput halved;
+		//               YouTube (~6 streams) unaffected; Roblox/Telegram
+		//               unaffected; heavy Safari fanout serializes.
+		MaxStreamsPerConn: 8,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
@@ -889,10 +964,17 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			n := rt.connsTotal.Add(1)
 			rt.connsActive.Add(1)
 			flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
+			// IPA-D6: register flow for proactive idle eviction.
+			flowCtx, flowCancel := context.WithCancel(ctx)
+			fs := &flowState{conn: c, cancel: flowCancel, createdNano: time.Now().UnixNano()}
+			fs.lastActiveNano.Store(fs.createdNano)
+			flowRegistry.Store(n, fs)
 			go func(client net.Conn, idx uint64) {
 				defer client.Close()
 				defer rt.connsActive.Add(-1)
-				handleSocks(ctx, client, idx)
+				defer flowRegistry.Delete(idx)
+				defer flowCancel()
+				handleSocks(flowCtx, client, idx)
 			}(c, n)
 			continue
 		}
@@ -912,11 +994,18 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 		n := rt.connsTotal.Add(1)
 		rt.connsActive.Add(1)
 		flowLogf("info: accept #%d from %s (protect mode)", n, c.RemoteAddr())
+		// IPA-D6: register protect-mode flow too.
+		flowCtx, flowCancel := context.WithCancel(ctx)
+		fs := &flowState{conn: c, cancel: flowCancel, createdNano: time.Now().UnixNano()}
+		fs.lastActiveNano.Store(fs.createdNano)
+		flowRegistry.Store(n, fs)
 		go func(client net.Conn, idx uint64) {
 			defer atomic.AddInt32(&pendingNew, -1)
 			defer client.Close()
 			defer rt.connsActive.Add(-1)
-			handleSocks(ctx, client, idx)
+			defer flowRegistry.Delete(idx)
+			defer flowCancel()
+			handleSocks(flowCtx, client, idx)
 		}(c, n)
 	}
 }
@@ -1046,7 +1135,7 @@ func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string
 		rt.appendLog(fmt.Sprintf("warn: conn#%d success-reply write: %v", idx, err))
 		return
 	}
-	relay(client, upstream)
+	relay(client, upstream, idx)
 	flowLogf("info: conn#%d closed (lifetime %dms)", idx, time.Since(dialStart).Milliseconds())
 }
 
@@ -1399,21 +1488,59 @@ func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
 // relay copies bytes between two duplex streams until either side closes.
 // Per-direction buffer = 16 KiB (audit fix, IPA-F shrunk from 32 KiB).
 // IPA-D5: buffers come from sync.Pool — see relayBufPool.
-func relay(a, b net.Conn) {
+// IPA-D6: takes idx so we can update flowRegistry's lastActive on each
+// successful chunk transfer. Inlined CopyBuffer loop instead of
+// io.CopyBuffer so we can call markFlowActive() between iterations.
+func relay(a, b net.Conn, idx uint64) {
 	done := make(chan struct{}, 2)
 	go func() {
 		bufp := getRelayBuf()
 		defer putRelayBuf(bufp)
-		_, _ = io.CopyBuffer(b, a, *bufp)
+		copyWithActivity(b, a, *bufp, idx)
 		done <- struct{}{}
 	}()
 	go func() {
 		bufp := getRelayBuf()
 		defer putRelayBuf(bufp)
-		_, _ = io.CopyBuffer(a, b, *bufp)
+		copyWithActivity(a, b, *bufp, idx)
 		done <- struct{}{}
 	}()
 	<-done
 	_ = a.Close()
 	_ = b.Close()
+}
+
+// copyWithActivity is io.CopyBuffer + markFlowActive on each chunk.
+// Returns (n, err) like io.CopyBuffer for completeness, but neither
+// is used by the caller currently.
+func copyWithActivity(dst io.Writer, src io.Reader, buf []byte, idx uint64) (written int64, err error) {
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			markFlowActive(idx)
+			nw, ew := dst.Write(buf[:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = io.ErrShortWrite
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
 }
