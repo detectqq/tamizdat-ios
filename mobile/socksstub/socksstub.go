@@ -132,6 +132,13 @@ var (
 	burstRecoveryTicks int32 // atomic; consecutive heartbeat ticks with avail>=15MiB after cooldown
 	burstShedTotal     int64 // atomic; counter for log heartbeat
 	burstEngageTotal   int64 // atomic; counter for log heartbeat
+
+	// burstMu guards SetBurst's and MaybeClearBurst's critical sections
+	// against each other. Not held by the accept hot path — readers of
+	// burstFlag use atomic.LoadInt32 only. Both writers are called from
+	// Swift dispatch queues (heartbeat 1 Hz + memory-pressure source) at
+	// most ~1×/s combined, so contention is effectively zero.
+	burstMu sync.Mutex
 )
 
 const burstCap = 64
@@ -151,15 +158,24 @@ func SetVerboseFlowLogs(enabled bool) {
 
 // SetBurst is called from Swift to engage burst protection.
 // gomobile binding exposes this to Swift as SocksstubSetBurst(int32).
+//
+// Holds burstMu so the engage transition (flag flip + burstSince refresh
+// + recovery-tick reset) is mutually exclusive with MaybeClearBurst's
+// disengage transition. Without this lock a concurrent disengage that
+// already passed the cooldown check would still flip the flag to 0
+// even when SetBurst has just refreshed burstSince.
 func SetBurst(on int32) {
-	if on == 1 {
-		if atomic.CompareAndSwapInt32(&burstFlag, 0, 1) {
-			atomic.AddInt64(&burstEngageTotal, 1)
-			rt.appendLog("warn: burst protection ENGAGED (memory pressure)")
-		}
-		atomic.StoreInt64(&burstSince, time.Now().UnixNano())
-		atomic.StoreInt32(&burstRecoveryTicks, 0)
+	if on != 1 {
+		return
 	}
+	burstMu.Lock()
+	defer burstMu.Unlock()
+	if atomic.CompareAndSwapInt32(&burstFlag, 0, 1) {
+		atomic.AddInt64(&burstEngageTotal, 1)
+		rt.appendLog("warn: burst protection ENGAGED (memory pressure)")
+	}
+	atomic.StoreInt64(&burstSince, time.Now().UnixNano())
+	atomic.StoreInt32(&burstRecoveryTicks, 0)
 }
 
 // MaybeClearBurst is called from Swift's 1-second heartbeat when
@@ -167,33 +183,34 @@ func SetBurst(on int32) {
 //   - >= 5 seconds elapsed since last engage event
 //   - this is the 2nd consecutive heartbeat tick where avail>=15MiB after cooldown
 //
+// The disengage is performed under burstMu so a concurrent SetBurst
+// cannot race-refresh burstSince between our cooldown check and the
+// flag flip. The fast-path check at the top is lock-free so the
+// no-op case (already cleared) costs only an atomic load.
+//
 // gomobile binding exposes this to Swift as SocksstubMaybeClearBurst().
 func MaybeClearBurst() {
+	// Fast path without lock — the common case is "already cleared".
+	if atomic.LoadInt32(&burstFlag) == 0 {
+		return
+	}
+	burstMu.Lock()
+	defer burstMu.Unlock()
+	// Re-check inside the lock; flag may have flipped during acquisition.
 	if atomic.LoadInt32(&burstFlag) == 0 {
 		return
 	}
 	since := atomic.LoadInt64(&burstSince)
 	if time.Since(time.Unix(0, since)) < 5*time.Second {
-		// Still in cool-down; reset recovery counter so we require fresh consecutive ticks afterward.
+		// Still in cool-down; reset recovery counter so we require fresh
+		// consecutive ticks once cooldown elapses.
 		atomic.StoreInt32(&burstRecoveryTicks, 0)
 		return
 	}
 	if atomic.AddInt32(&burstRecoveryTicks, 1) >= 2 {
-		// Re-verify cooldown with a fresh burstSince load. If a concurrent
-		// SetBurst(1) refreshed burstSince after our earlier load, the
-		// cooldown will fail and we abort the disengage. Without this
-		// re-check, we could race-disengage right after a .critical event.
-		sinceNow := atomic.LoadInt64(&burstSince)
-		if time.Since(time.Unix(0, sinceNow)) < 5*time.Second {
-			atomic.StoreInt32(&burstRecoveryTicks, 0)
-			return
-		}
-		// Use CAS to ensure we only flip 1→0 (defensive against any
-		// future re-entry).
-		if atomic.CompareAndSwapInt32(&burstFlag, 1, 0) {
-			atomic.StoreInt32(&burstRecoveryTicks, 0)
-			rt.appendLog("info: burst protection DISENGAGED")
-		}
+		atomic.StoreInt32(&burstFlag, 0)
+		atomic.StoreInt32(&burstRecoveryTicks, 0)
+		rt.appendLog("info: burst protection DISENGAGED")
 	}
 }
 
