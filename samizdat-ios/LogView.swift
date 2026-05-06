@@ -232,32 +232,21 @@ struct LogView: View {
         }
         let stamp = Int(Date().timeIntervalSince1970)
         let heapPath = containerURL.appendingPathComponent("heap-manual-\(stamp).pb.gz").path
-        let goroutinePath = containerURL.appendingPathComponent("goroutine-manual-\(stamp).txt").path
 
-        // Trigger Go to write profiles. These are synchronous-ish (heap
-        // writeProfile takes <100ms typically; goroutine even faster).
         let heapErr = SocksstubWriteHeapProfile(heapPath)
         if !heapErr.isEmpty {
             sendStatus = .failed("WriteHeapProfile: \(heapErr)")
             return
         }
-        let groutineErr = SocksstubWriteGoroutineProfile(goroutinePath)
-        if !groutineErr.isEmpty {
-            sendStatus = .failed("WriteGoroutineProfile: \(groutineErr)")
+
+        guard let heapData = try? Data(contentsOf: URL(fileURLWithPath: heapPath)) else {
+            sendStatus = .failed("Could not read heap profile back")
             return
         }
 
-        guard let heapData = try? Data(contentsOf: URL(fileURLWithPath: heapPath)),
-              let goroutineData = try? Data(contentsOf: URL(fileURLWithPath: goroutinePath)) else {
-            sendStatus = .failed("Could not read profile files back")
-            return
-        }
-
-        let caption = TelegramReporter.defaultCaption(extra: "heap+goroutine snapshot")
+        let caption = TelegramReporter.defaultCaption(extra: "heap snapshot")
         let heapName = "heap-\(stamp).pb.gz"
-        let goName = "goroutine-\(stamp).txt"
 
-        // Send both files sequentially. If first fails, show that and stop.
         TelegramReporter.sendFile(
             data: heapData,
             filename: heapName,
@@ -266,21 +255,9 @@ struct LogView: View {
         ) { result in
             switch result {
             case .success:
-                TelegramReporter.sendFile(
-                    data: goroutineData,
-                    filename: goName,
-                    mimeType: "text/plain; charset=utf-8",
-                    caption: caption + " (goroutines)"
-                ) { result2 in
-                    switch result2 {
-                    case .success:
-                        sendStatus = .sent
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-                            if case .sent = sendStatus { sendStatus = .idle }
-                        }
-                    case .failure(let err):
-                        sendStatus = .failed("goroutine: \(err.errorDescription ?? "unknown")")
-                    }
+                sendStatus = .sent
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    if case .sent = sendStatus { sendStatus = .idle }
                 }
             case .failure(let err):
                 sendStatus = .failed("heap: \(err.errorDescription ?? "unknown")")

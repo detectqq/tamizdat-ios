@@ -701,18 +701,11 @@ misc:
         }
         let stamp = Int(Date().timeIntervalSince1970)
         let heapURL = containerURL.appendingPathComponent("heap-\(reason)-\(stamp).pb.gz")
-        let goroutineURL = containerURL.appendingPathComponent("goroutine-\(reason)-\(stamp).txt")
         let heapErr = SocksstubWriteHeapProfile(heapURL.path)
-        let goroutineErr = SocksstubWriteGoroutineProfile(goroutineURL.path)
         if heapErr.isEmpty {
             appendExtLog("info: heap-dump → \(heapURL.lastPathComponent)")
         } else {
             appendExtLog("warn: heap-dump failed: \(heapErr)")
-        }
-        if goroutineErr.isEmpty {
-            appendExtLog("info: goroutine-dump → \(goroutineURL.lastPathComponent)")
-        } else {
-            appendExtLog("warn: goroutine-dump failed: \(goroutineErr)")
         }
     }
 

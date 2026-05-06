@@ -1565,21 +1565,3 @@ func WriteHeapProfile(path string) string {
 	return ""
 }
 
-// WriteGoroutineProfile dumps current goroutine stacks. Useful for
-// diagnosing goroutine leaks.
-func WriteGoroutineProfile(path string) string {
-	f, err := os.Create(path)
-	if err != nil {
-		return fmt.Sprintf("create %s: %v", path, err)
-	}
-	defer f.Close()
-	p := pprof.Lookup("goroutine")
-	if p == nil {
-		return "no goroutine profile available"
-	}
-	if err := p.WriteTo(f, 2); err != nil { // 2 = full stacks
-		return fmt.Sprintf("write profile: %v", err)
-	}
-	rt.appendLog(fmt.Sprintf("info: goroutine profile written to %s", path))
-	return ""
-}
