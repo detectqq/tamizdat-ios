@@ -179,9 +179,21 @@ func MaybeClearBurst() {
 		return
 	}
 	if atomic.AddInt32(&burstRecoveryTicks, 1) >= 2 {
-		atomic.StoreInt32(&burstFlag, 0)
-		atomic.StoreInt32(&burstRecoveryTicks, 0)
-		rt.appendLog("info: burst protection DISENGAGED")
+		// Re-verify cooldown with a fresh burstSince load. If a concurrent
+		// SetBurst(1) refreshed burstSince after our earlier load, the
+		// cooldown will fail and we abort the disengage. Without this
+		// re-check, we could race-disengage right after a .critical event.
+		sinceNow := atomic.LoadInt64(&burstSince)
+		if time.Since(time.Unix(0, sinceNow)) < 5*time.Second {
+			atomic.StoreInt32(&burstRecoveryTicks, 0)
+			return
+		}
+		// Use CAS to ensure we only flip 1→0 (defensive against any
+		// future re-entry).
+		if atomic.CompareAndSwapInt32(&burstFlag, 1, 0) {
+			atomic.StoreInt32(&burstRecoveryTicks, 0)
+			rt.appendLog("info: burst protection DISENGAGED")
+		}
 	}
 }
 
