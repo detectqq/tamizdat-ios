@@ -1822,8 +1822,15 @@ var (
 //
 // It returns max(1, min(peer's advertised max frame size,
 // Request.ContentLength+1, 512KB)).
+//
+// IPA-D12 vendor patch: cap was 512 KiB upstream. On iOS extension we
+// hit 50 MiB jetsam at 50 × 512 KiB = 25 MiB just for these scratch
+// buffers (heap profile pinpointed 85% of in-use heap here). Shrunk
+// to 16 KiB — bw.Flush() runs after every WriteData (line ~1948 below)
+// so a smaller scratch doesn't reduce throughput; it just bounds the
+// per-stream outgoing memory footprint.
 func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
-	const max = 512 << 10
+	const max = 16 << 10
 	n := int64(maxFrameSize)
 	if n > max {
 		n = max
