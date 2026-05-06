@@ -56,14 +56,14 @@ const (
 	// uses 1000 stream cap (no memory cap on desktop). To match that
 	// on iOS we drop the per-stream window.
 	//
-	// IPA-D13: 64 KiB → 128 KiB. After D12 fixed the real leak
-	// (frameScratchBufferLen 512K→16K saves ~24 MiB), we have budget
-	// to widen the receive window for better per-stream throughput.
-	// 200 streams × 128 KiB = 25 MiB max reserved (in practice <30% active
-	// → ~7 MiB live). Per-stream throughput cap @ 30 ms RTT:
-	// 128 KiB × 33/s = 35 Mbps, much closer to YouTube/Speedtest expected
-	// single-stream behaviour without ramping (was bottlenecked at ~17 Mbps).
-	transportDefaultStreamFlow = 128 << 10
+	// IPA-D16: 128 KiB → 256 KiB. D14 confirmed heap stays at 5-10 MB
+	// even under heavy load (writeRequestBody leak fixed in D12). We
+	// have plenty of budget for bigger receive window.
+	// 500 streams × 256 KiB = 125 MiB max reserved (in practice <20% active
+	// → ~10 MiB live). Per-stream throughput @ 30 ms RTT:
+	// 256 KiB × 33/s = 70 Mbps single-stream — Speedtest single-conn
+	// shows this kind of number, YouTube quality switches faster.
+	transportDefaultStreamFlow = 256 << 10
 
 	defaultUserAgent = "Go-http-client/2.0"
 

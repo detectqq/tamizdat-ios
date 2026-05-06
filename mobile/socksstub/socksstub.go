@@ -51,7 +51,6 @@ import (
 	// sites continue to use `samizdat.Client` etc. via this alias.
 	samizdat "github.com/detectqq/tamizdat"
 	singBufio "github.com/sagernet/sing/common/bufio"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -101,73 +100,19 @@ type runtimeState struct {
 
 var rt = &runtimeState{logsMax: 500}
 
-// IPA-D6: proactive idle eviction (Shadowrocket Tier-3 pattern).
-// Every active SOCKS5 flow registers itself in flowRegistry and updates
-// lastActiveNano on every successful read/write iteration. A background
-// goroutine ticks every 3 seconds and force-closes any flow that has
-// been idle for > 5 seconds. This is NOT memory-pressure-driven —
-// it runs ALL THE TIME, keeping the active set small enough that
-// memory never grows large.
+// flowState is registered for every active SOCKS5 flow. The registry
+// is walked by CloseAllFlows() (called from Swift's kernel
+// memorypressure CRITICAL handler) to close all live conns at once.
 //
-// Shadowrocket decomp showed their mem_trim handler is empty stub
-// and os_proc_available_memory is used only for logging. Their actual
-// stop-crank is proactive: closeIfNeeded cuts streams by count/3,
-// removeAnyStreams evicts LRU idle > 10 seconds. We use 5 seconds for
-// more aggressive memory containment under our heavier per-flow cost.
+// Originally also drove a 3-sec idle eviction ticker (D6) that closed
+// flows idle >5 sec, but that was killing Roblox's persistent
+// low-traffic control TCP. Idle eviction was disabled in D14 and
+// removed in D15. flowRegistry is retained for nuclear close only.
 type flowState struct {
-	conn           net.Conn
-	cancel         context.CancelFunc
-	createdNano    int64
-	lastActiveNano atomic.Int64
+	conn net.Conn
 }
 
 var flowRegistry sync.Map // idx (uint64) → *flowState
-
-const (
-	idleEvictionTickInterval = 3 * time.Second
-	idleEvictionThreshold    = 5 * time.Second
-)
-
-// markFlowActive bumps the lastActiveNano of a registered flow.
-// Called from relay() on every successful CopyBuffer chunk.
-func markFlowActive(idx uint64) {
-	if v, ok := flowRegistry.Load(idx); ok {
-		v.(*flowState).lastActiveNano.Store(time.Now().UnixNano())
-	}
-}
-
-// startIdleEvictor launches the background ticker. Call once at Start.
-func startIdleEvictor(ctx context.Context) {
-	go func() {
-		t := time.NewTicker(idleEvictionTickInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				now := time.Now().UnixNano()
-				cutoff := now - idleEvictionThreshold.Nanoseconds()
-				closed := 0
-				flowRegistry.Range(func(k, v any) bool {
-					fs := v.(*flowState)
-					if fs.lastActiveNano.Load() < cutoff {
-						// Idle too long. Close.
-						_ = fs.conn.Close()
-						if fs.cancel != nil {
-							fs.cancel()
-						}
-						closed++
-					}
-					return true
-				})
-				if closed > 0 {
-					rt.appendLog(fmt.Sprintf("info: idle-evict closed %d flows", closed))
-				}
-			}
-		}
-	}()
-}
 
 // Log file mirror — same App Group file the extension writes to. The
 // main-app side calls SetLogSink at startup so SocksStub heartbeats
@@ -192,124 +137,12 @@ var (
 // always show.
 var verboseFlowLogs atomic.Bool
 
-// IPA-D2 hybrid burst protection. Three-input OR trigger
-// (accept-rate burst OR avail<12MiB OR kernel .critical). During the
-// 5-second protect window, two-axis admission: rate.Limiter (120/s
-// burst 24, Allow-not-Wait) AND pendingNew cap (64). Excess accepts
-// are Close()d (RST → iOS app retry). Established flows untouched.
-var (
-	protectUntil int64 // atomic unix-nano; if > now → protect mode active
-
-	// recoveryConfirmed defaults to 1 ("memory OK, no engage yet") so
-	// that on cold start (before any engage) inProtect() returns false.
-	// Cleared to 0 inside enterProtect() under protectMu on every
-	// (re-)engage; set to 1 by MaybeReleaseProtect() after a fresh
-	// avail≥18 MiB observation provided protectUntil has already elapsed.
-	recoveryConfirmed int32 = 1
-
-	pendingNew       int32 // atomic; in-flight DialContext during protect
-	burstShedTotal   int64 // atomic
-	burstEngageTotal int64 // atomic
-
-	// accept-rate counters, only meaningful during protect detection.
-	// Two sliding windows: 100 ms (cap=48) and 500 ms (cap=180).
-	acceptTimes100 = newRingTimes(64)  // ring of unix-nanos, sized > worst-case 100 ms hits
-	acceptTimes500 = newRingTimes(256) // ring sized > worst-case 500 ms hits
-	acceptRateMu   sync.Mutex          // guards both rings
-
-	burstLimiter = rate.NewLimiter(rate.Limit(120), 24) // active only in protect mode
-
-	// protectMu guards the engage/release transitions in enterProtect()
-	// and MaybeReleaseProtect() so they cannot interleave. Without this,
-	// a concurrent MaybeReleaseProtect() could set recoveryConfirmed=1
-	// using a stale "memory OK" observation that was made before a
-	// fresh engage, causing release on next TTL expiry without any
-	// post-engage avail≥18 MiB confirmation. The hot path (inProtect()
-	// in acceptLoop) does NOT take this lock — it only does atomic
-	// reads, so accept overhead is unchanged.
-	protectMu sync.Mutex
-)
-
-const (
-	pendingCap        = 64
-	protectTTL        = 5 * time.Second
-	burstWindow100    = 100 * time.Millisecond
-	burstWindow500    = 500 * time.Millisecond
-	burstThreshold100 = 48
-	burstThreshold500 = 180
-)
-
-// ringTimes is a tiny lock-protected ring buffer of unix-nanos for
-// counting how many events fell in the last N ms.
-type ringTimes struct {
-	buf  []int64
-	head int
-	n    int
-}
-
-func newRingTimes(cap int) *ringTimes { return &ringTimes{buf: make([]int64, cap)} }
-
-func (r *ringTimes) addAndCountSince(now int64, since int64) int {
-	// Push current event. Overwrites oldest if full (we only care about
-	// the last `since` ns anyway).
-	r.buf[r.head] = now
-	r.head = (r.head + 1) % len(r.buf)
-	if r.n < len(r.buf) {
-		r.n++
-	}
-	cnt := 0
-	for i := 0; i < r.n; i++ {
-		if r.buf[i] >= since {
-			cnt++
-		}
-	}
-	return cnt
-}
-
-// enterProtect is the single engage point used by all three triggers
-// (Swift kernel critical, Swift heartbeat avail<12MiB, Go accept-rate
-// burst). It clears recoveryConfirmed=0 atomically with the protectUntil
-// extension under protectMu, so any concurrent MaybeReleaseProtect()
-// either runs entirely before or entirely after this engage.
-func enterProtect(d time.Duration) {
-	until := time.Now().Add(d).UnixNano()
-	protectMu.Lock()
-	defer protectMu.Unlock()
-	old := atomic.LoadInt64(&protectUntil)
-	if until <= old {
-		return
-	}
-	atomic.StoreInt64(&protectUntil, until)
-	// Always reset recovery confirmation on every (re-)engage. Done
-	// under protectMu so the store is ordered with the protectUntil
-	// extension — a concurrent MaybeReleaseProtect cannot leave
-	// recoveryConfirmed=1 in front of this fresh engage.
-	atomic.StoreInt32(&recoveryConfirmed, 0)
-	// Count the engagement only when transitioning from inactive.
-	if old < time.Now().UnixNano() {
-		atomic.AddInt64(&burstEngageTotal, 1)
-		rt.appendLog("warn: burst protection ENGAGED")
-	}
-}
-
-func inProtect(now time.Time) bool {
-	if now.UnixNano() < atomic.LoadInt64(&protectUntil) {
-		return true
-	}
-	// TTL elapsed; only release if Swift has confirmed memory recovery.
-	return atomic.LoadInt32(&recoveryConfirmed) == 0
-}
-
-// acceptBurstHit returns true if the accept-rate window has been exceeded.
-// Updates both rings as a side effect.
-func acceptBurstHit(now time.Time) bool {
-	nowNs := now.UnixNano()
-	acceptRateMu.Lock()
-	defer acceptRateMu.Unlock()
-	c100 := acceptTimes100.addAndCountSince(nowNs, nowNs-burstWindow100.Nanoseconds())
-	c500 := acceptTimes500.addAndCountSince(nowNs, nowNs-burstWindow500.Nanoseconds())
-	return c100 >= burstThreshold100 || c500 >= burstThreshold500
-}
+// (D15 cleanup) Removed: D2-D8 admission control machinery — burstFlag,
+// protectUntil, recoveryConfirmed, pendingNew, accept-rate ring detector,
+// rate.Limiter, protectMu — never fired in production after D12 fixed
+// the real leak. Code lived from D1 to D14 as failed attempts at
+// chasing memory pressure surgically. Kept only what works:
+// nuclear close on kernel critical (D7) + flowRegistry (D6).
 
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
@@ -320,53 +153,6 @@ func SetVerboseFlowLogs(enabled bool) {
 	} else {
 		rt.appendLog("info: verbose per-flow logs = OFF (errors+heartbeat only)")
 	}
-}
-
-// EnterProtectMode is called from Swift on memory-pressure signals
-// (kernel .critical or os_proc_available_memory < 12 MiB). The
-// `millis` argument extends the protect window from now.
-// gomobile binding exposes this to Swift as SocksstubEnterProtectMode(int).
-//
-// recoveryConfirmed is cleared inside enterProtect() under protectMu;
-// no separate clear is needed here.
-func EnterProtectMode(millis int) {
-	if millis <= 0 {
-		millis = int(protectTTL / time.Millisecond)
-	}
-	enterProtect(time.Duration(millis) * time.Millisecond)
-}
-
-// MaybeReleaseProtect is called from Swift's heartbeat when
-// os_proc_available_memory() >= 18 MiB. Sets the recovery-confirmed
-// flag so inProtect() can release once the protect TTL has elapsed.
-//
-// Held under protectMu so the store is ordered with concurrent
-// enterProtect() engages; additionally gated on protectUntil being
-// in the past so a stale "memory OK" observation made before a recent
-// engage cannot apply to that fresh engage. While protectUntil is
-// in the future, our observation is necessarily older than that
-// engage and must be discarded; the next heartbeat tick (≤1 s later,
-// once protectUntil has elapsed) will re-confirm if avail still ≥18 MiB.
-//
-// gomobile binding exposes this to Swift as SocksstubMaybeReleaseProtect().
-func MaybeReleaseProtect() {
-	protectMu.Lock()
-	defer protectMu.Unlock()
-	if time.Now().UnixNano() < atomic.LoadInt64(&protectUntil) {
-		return
-	}
-	atomic.StoreInt32(&recoveryConfirmed, 1)
-}
-
-// BurstShedTotal / BurstEngageTotal / BurstActive expose counters for
-// the Swift heartbeat log.
-func BurstShedTotal() int64   { return atomic.LoadInt64(&burstShedTotal) }
-func BurstEngageTotal() int64 { return atomic.LoadInt64(&burstEngageTotal) }
-func BurstActive() int32 {
-	if inProtect(time.Now()) {
-		return 1
-	}
-	return 0
 }
 
 // flowLogf is a gated wrapper for per-flow info logs. Errors and
@@ -464,18 +250,6 @@ func Start(addrSpec string) error {
 
 	rt.appendLog(fmt.Sprintf("info: socks listener up on %s://%s", network, addr))
 	go acceptLoop(ctx, ln)
-	// IPA-D14: idle evictor DISABLED. Was added in D6 to chase memory pressure
-	// when we hadn't yet found the real leak (vendored x-net writeRequestBody
-	// scratch buffer, fixed in D12). With the leak fixed, idle eviction is
-	// no longer needed for memory and was breaking persistent low-traffic
-	// connections (Roblox control TCP, idle Telegram channels, etc).
-	//
-	// Symptom on D8/D12/D13: Roblox would connect, players load, then freeze
-	// after ~1 sec — Roblox client closes idle control sockets at 5s
-	// threshold while game is still active.
-	//
-	// startIdleEvictor(ctx) // intentionally disabled in D14
-	_ = startIdleEvictor // keep symbol referenced to avoid unused-func errors
 	return nil
 }
 
@@ -632,7 +406,13 @@ func SetSamizdatConfig(blob string) error {
 		//               streams. 200 × 16K scratch = 3.2 MiB outgoing.
 		//               Reduces queueing under Safari/Roblox fanout where
 		//               apps want >150 concurrent dials.
-		MaxStreamsPerConn: 200,
+		//               IPA-D16: 200→500. D14 confirmed heap stays at 5-10
+		//               MB under heavy multi-app load. 500 × 16K scratch =
+		//               8 MiB outgoing — still well within budget. Lets
+		//               Safari pages with hundreds of subresources, Roblox
+		//               + game-server fanout, and YouTube pre-buffer all
+		//               coexist without per-stream queueing.
+		MaxStreamsPerConn: 500,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
@@ -951,6 +731,11 @@ func (r *runtimeState) appendLog(line string) {
 }
 
 // acceptLoop services incoming SOCKS5 client connections.
+//
+// (D15 cleanup) Removed admission/protect-mode branches — D12 fixed
+// the real memory leak so we no longer need any kind of accept-time
+// throttling. Every accepted conn gets its own goroutine; nuclear
+// close (D7) handles emergencies.
 func acceptLoop(ctx context.Context, ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -963,60 +748,25 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			rt.appendLog(fmt.Sprintf("warn: accept: %v", err))
 			return
 		}
-		now := time.Now()
-
-		// Detect accept-rate burst. Side-effect updates rings.
-		if acceptBurstHit(now) {
-			enterProtect(protectTTL)
-		}
-
-		// Fast path when not in protect mode — byte-identical to A9.
-		if !inProtect(now) {
-			n := rt.connsTotal.Add(1)
-			rt.connsActive.Add(1)
-			flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
-			// IPA-D6: register flow for proactive idle eviction.
-			flowCtx, flowCancel := context.WithCancel(ctx)
-			fs := &flowState{conn: c, cancel: flowCancel, createdNano: time.Now().UnixNano()}
-			fs.lastActiveNano.Store(fs.createdNano)
-			flowRegistry.Store(n, fs)
-			go func(client net.Conn, idx uint64) {
-				defer client.Close()
-				defer rt.connsActive.Add(-1)
-				defer flowRegistry.Delete(idx)
-				defer flowCancel()
-				handleSocks(flowCtx, client, idx)
-			}(c, n)
-			continue
-		}
-
-		// Protect mode: rate-limit (Allow, not Wait) and cap pending.
-		if !burstLimiter.Allow() {
-			atomic.AddInt64(&burstShedTotal, 1)
-			_ = c.Close()
-			continue
-		}
-		if atomic.AddInt32(&pendingNew, 1) > pendingCap {
-			atomic.AddInt32(&pendingNew, -1)
-			atomic.AddInt64(&burstShedTotal, 1)
-			_ = c.Close()
-			continue
+		// IPA-D16: TCP_NODELAY on loopback. The hev tun-bridge speaks
+		// SOCKS5 to us over 127.0.0.1; Nagle on a localhost socket adds
+		// 40 ms before each small request frame is forwarded — every
+		// HTTP/2 SETTINGS, every short SOCKS5 reply pays this tax. We
+		// already disabled buffering on the tamizdat side (singBufio.Copy
+		// pool); flipping NoDelay here makes loopback handoff symmetric.
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
 		}
 		n := rt.connsTotal.Add(1)
 		rt.connsActive.Add(1)
-		flowLogf("info: accept #%d from %s (protect mode)", n, c.RemoteAddr())
-		// IPA-D6: register protect-mode flow too.
-		flowCtx, flowCancel := context.WithCancel(ctx)
-		fs := &flowState{conn: c, cancel: flowCancel, createdNano: time.Now().UnixNano()}
-		fs.lastActiveNano.Store(fs.createdNano)
+		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
+		fs := &flowState{conn: c}
 		flowRegistry.Store(n, fs)
 		go func(client net.Conn, idx uint64) {
-			defer atomic.AddInt32(&pendingNew, -1)
 			defer client.Close()
 			defer rt.connsActive.Add(-1)
 			defer flowRegistry.Delete(idx)
-			defer flowCancel()
-			handleSocks(flowCtx, client, idx)
+			handleSocks(ctx, client, idx)
 		}(c, n)
 	}
 }

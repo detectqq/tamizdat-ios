@@ -21,7 +21,6 @@ require (
 	github.com/detectqq/tamizdat v0.0.0-00010101000000-000000000000
 	github.com/sagernet/sing v0.8.9
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
-	golang.org/x/time v0.12.0
 	gvisor.dev/gvisor v0.0.0-20260325202830-7644cf3a343c
 )
 
@@ -37,5 +36,6 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
 )
