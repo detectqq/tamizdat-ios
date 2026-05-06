@@ -145,6 +145,25 @@ const burstCap = 64
 
 var burstSem = make(chan struct{}, burstCap)
 
+// IPA-D3: HARD cap on concurrent SOCKS5 flows, applied ALWAYS (not just
+// during burst). Sized so that worst-case per-flow heap (relay buffers
+// 32 KB + tamizdat H/2 stream state ~130 KB + goroutine stack 8 KB) ×
+// flowCap fits well under the 50 MiB iOS jetsam ceiling.
+//
+// Rationale: D2 (burst-only admission control on kernel .critical) was
+// shown insufficient on a real YouTube/Speedtest combo — by the time
+// the kernel signals memory critical, we already have ~500 active
+// goroutines from the burst, and the heap grows past SetMemoryLimit
+// before burst protection's accept-side cap can do anything (existing
+// flows are not limited).
+//
+// flowCap = 100: 100 × (32 + 130 + 8) KiB ≈ 17 MiB worst case for
+// per-flow heap. Plus baseline Go runtime (~10 MiB) + Swift/hev/iOS
+// overhead leaves >20 MiB headroom.
+const flowCap = 100
+
+var flowSem = make(chan struct{}, flowCap)
+
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
 func SetVerboseFlowLogs(enabled bool) {
@@ -790,6 +809,21 @@ func (r *runtimeState) appendLog(line string) {
 }
 
 // acceptLoop services incoming SOCKS5 client connections.
+//
+// IPA-D3 admission policy:
+//
+//   1. ALWAYS: hard cap of `flowCap` concurrent in-flight goroutines.
+//      Excess accepts are immediately Close()d → iOS app sees RST and
+//      retries normally. This is the primary memory safety mechanism.
+//
+//   2. ADDITIONALLY during burst (kernel .critical OR avail<8 MiB):
+//      tighten effective cap to min(flowCap, burstCap=64). burstSem is
+//      checked only when burstFlag == 1; otherwise flowSem alone gates.
+//
+// Both gates use buffered channels as semaphores. The hot path in
+// normal state is one TryAcquire on flowSem (a non-blocking channel
+// send), which is comparable to an atomic operation in cost — fast
+// enough for line-rate accept loops.
 func acceptLoop(ctx context.Context, ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -802,34 +836,49 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			rt.appendLog(fmt.Sprintf("warn: accept: %v", err))
 			return
 		}
-		// IPA-D2: burst gate. Fast path when burstFlag==0 (normal state).
-		if atomic.LoadInt32(&burstFlag) == 0 {
-			n := rt.connsTotal.Add(1)
-			rt.connsActive.Add(1)
-			flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
-			go func(client net.Conn, idx uint64) {
-				defer client.Close()
-				defer rt.connsActive.Add(-1)
-				handleSocks(ctx, client, idx)
-			}(c, n)
-			continue
-		}
-		// Burst mode: try to acquire a slot. If full, shed (Close → RST → app retry).
+
+		// Hard cap (always). If we already have flowCap goroutines in
+		// flight, shed — close the connection so iOS retries. This is
+		// what protects the heap from a 500-flow burst.
 		select {
-		case burstSem <- struct{}{}:
-			n := rt.connsTotal.Add(1)
-			rt.connsActive.Add(1)
-			flowLogf("info: accept #%d from %s (burst gate ok)", n, c.RemoteAddr())
-			go func(client net.Conn, idx uint64) {
-				defer func() { <-burstSem }()
-				defer client.Close()
-				defer rt.connsActive.Add(-1)
-				handleSocks(ctx, client, idx)
-			}(c, n)
+		case flowSem <- struct{}{}:
+			// Got a slot.
 		default:
 			atomic.AddInt64(&burstShedTotal, 1)
 			_ = c.Close()
+			continue
 		}
+
+		// Additional burst gate during kernel-critical / low-avail mode.
+		// We already hold a flowSem token; check burstSem and release if
+		// we couldn't get one.
+		burst := atomic.LoadInt32(&burstFlag) == 1
+		if burst {
+			select {
+			case burstSem <- struct{}{}:
+				// Both gates passed.
+			default:
+				<-flowSem // release flow slot
+				atomic.AddInt64(&burstShedTotal, 1)
+				_ = c.Close()
+				continue
+			}
+		}
+
+		n := rt.connsTotal.Add(1)
+		rt.connsActive.Add(1)
+		flowLogf("info: accept #%d from %s (burst=%v)", n, c.RemoteAddr(), burst)
+		go func(client net.Conn, idx uint64, burst bool) {
+			defer func() {
+				if burst {
+					<-burstSem
+				}
+				<-flowSem
+			}()
+			defer client.Close()
+			defer rt.connsActive.Add(-1)
+			handleSocks(ctx, client, idx)
+		}(c, n, burst)
 	}
 }
 
