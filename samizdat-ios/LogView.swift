@@ -1,4 +1,5 @@
 import SwiftUI
+import SamizdatClient // for SocksstubWriteHeapProfile (D10 heap dump button)
 
 struct LogView: View {
     @Environment(\.dismiss) private var dismiss
