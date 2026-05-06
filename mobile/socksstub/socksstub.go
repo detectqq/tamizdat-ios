@@ -157,10 +157,13 @@ var burstSem = make(chan struct{}, burstCap)
 // before burst protection's accept-side cap can do anything (existing
 // flows are not limited).
 //
-// flowCap = 100: 100 × (32 + 130 + 8) KiB ≈ 17 MiB worst case for
-// per-flow heap. Plus baseline Go runtime (~10 MiB) + Swift/hev/iOS
-// overhead leaves >20 MiB headroom.
-const flowCap = 100
+// flowCap = 50: D3 (cap=100) survived 78s under sustained kernel
+// .critical pressure on a YouTube heavy combo, but eventually died —
+// real per-flow heap was ~420 KiB (vs my 170 KiB estimate; TLS state
+// + tamizdat per-stream state are larger than expected). Cutting cap
+// to 50 targets ~21 MiB go-heap worst-case, ~25 MiB total dirty
+// memory budget for Go side, ~25 MiB headroom under the 50 MiB cap.
+const flowCap = 50
 
 var flowSem = make(chan struct{}, flowCap)
 
@@ -489,8 +492,14 @@ func SetSamizdatConfig(blob string) error {
 		//               at 200 — frees ~6-7 MiB headroom under jetsam.
 		//               Realistic concurrent load: Safari ~50 + Roblox
 		//               ~8 + YouTube ~20 + speedtest fanout ~32 ≈ 110.
-		//               Cap=150 still has 36% buffer over that.
-		MaxStreamsPerConn: 150,
+		//               IPA-D4: dropped 150→50 to match flowCap=50 (Go
+		//               socksstub admission ceiling). With flowCap binding
+		//               concurrent SOCKS5 work, MaxStreamsPerConn just
+		//               sets the H/2 server-advertised stream limit; it
+		//               must be ≥ flowCap. Setting them equal gives a
+		//               clean lower bound on H/2 receive-buffer state
+		//               (50 × stream-flow-window = ~3 MiB).
+		MaxStreamsPerConn: 50,
 		IdleTimeout:       30 * time.Second,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
