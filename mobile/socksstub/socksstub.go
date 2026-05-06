@@ -127,11 +127,18 @@ var verboseFlowLogs atomic.Bool
 // burst 24, Allow-not-Wait) AND pendingNew cap (64). Excess accepts
 // are Close()d (RST → iOS app retry). Established flows untouched.
 var (
-	protectUntil      int64 // atomic unix-nano; if > now → protect mode active
-	recoveryConfirmed int32 // atomic; 1 == Swift saw avail>=18MiB after last engage
-	pendingNew        int32 // atomic; in-flight DialContext during protect
-	burstShedTotal    int64 // atomic
-	burstEngageTotal  int64 // atomic
+	protectUntil int64 // atomic unix-nano; if > now → protect mode active
+
+	// recoveryConfirmed defaults to 1 ("memory OK, no engage yet") so
+	// that on cold start (before any engage) inProtect() returns false.
+	// Cleared to 0 inside enterProtect() under protectMu on every
+	// (re-)engage; set to 1 by MaybeReleaseProtect() after a fresh
+	// avail≥18 MiB observation provided protectUntil has already elapsed.
+	recoveryConfirmed int32 = 1
+
+	pendingNew       int32 // atomic; in-flight DialContext during protect
+	burstShedTotal   int64 // atomic
+	burstEngageTotal int64 // atomic
 
 	// accept-rate counters, only meaningful during protect detection.
 	// Two sliding windows: 100 ms (cap=48) and 500 ms (cap=180).
@@ -140,6 +147,16 @@ var (
 	acceptRateMu   sync.Mutex          // guards both rings
 
 	burstLimiter = rate.NewLimiter(rate.Limit(120), 24) // active only in protect mode
+
+	// protectMu guards the engage/release transitions in enterProtect()
+	// and MaybeReleaseProtect() so they cannot interleave. Without this,
+	// a concurrent MaybeReleaseProtect() could set recoveryConfirmed=1
+	// using a stale "memory OK" observation that was made before a
+	// fresh engage, causing release on next TTL expiry without any
+	// post-engage avail≥18 MiB confirmation. The hot path (inProtect()
+	// in acceptLoop) does NOT take this lock — it only does atomic
+	// reads, so accept overhead is unchanged.
+	protectMu sync.Mutex
 )
 
 const (
@@ -178,21 +195,29 @@ func (r *ringTimes) addAndCountSince(now int64, since int64) int {
 	return cnt
 }
 
+// enterProtect is the single engage point used by all three triggers
+// (Swift kernel critical, Swift heartbeat avail<12MiB, Go accept-rate
+// burst). It clears recoveryConfirmed=0 atomically with the protectUntil
+// extension under protectMu, so any concurrent MaybeReleaseProtect()
+// either runs entirely before or entirely after this engage.
 func enterProtect(d time.Duration) {
 	until := time.Now().Add(d).UnixNano()
-	for {
-		old := atomic.LoadInt64(&protectUntil)
-		if until <= old {
-			return
-		}
-		if atomic.CompareAndSwapInt64(&protectUntil, old, until) {
-			// Count the engagement only when transitioning from inactive.
-			if old < time.Now().UnixNano() {
-				atomic.AddInt64(&burstEngageTotal, 1)
-				rt.appendLog("warn: burst protection ENGAGED")
-			}
-			return
-		}
+	protectMu.Lock()
+	defer protectMu.Unlock()
+	old := atomic.LoadInt64(&protectUntil)
+	if until <= old {
+		return
+	}
+	atomic.StoreInt64(&protectUntil, until)
+	// Always reset recovery confirmation on every (re-)engage. Done
+	// under protectMu so the store is ordered with the protectUntil
+	// extension — a concurrent MaybeReleaseProtect cannot leave
+	// recoveryConfirmed=1 in front of this fresh engage.
+	atomic.StoreInt32(&recoveryConfirmed, 0)
+	// Count the engagement only when transitioning from inactive.
+	if old < time.Now().UnixNano() {
+		atomic.AddInt64(&burstEngageTotal, 1)
+		rt.appendLog("warn: burst protection ENGAGED")
 	}
 }
 
@@ -230,19 +255,35 @@ func SetVerboseFlowLogs(enabled bool) {
 // (kernel .critical or os_proc_available_memory < 12 MiB). The
 // `millis` argument extends the protect window from now.
 // gomobile binding exposes this to Swift as SocksstubEnterProtectMode(int).
+//
+// recoveryConfirmed is cleared inside enterProtect() under protectMu;
+// no separate clear is needed here.
 func EnterProtectMode(millis int) {
 	if millis <= 0 {
 		millis = int(protectTTL / time.Millisecond)
 	}
-	atomic.StoreInt32(&recoveryConfirmed, 0)
 	enterProtect(time.Duration(millis) * time.Millisecond)
 }
 
 // MaybeReleaseProtect is called from Swift's heartbeat when
 // os_proc_available_memory() >= 18 MiB. Sets the recovery-confirmed
 // flag so inProtect() can release once the protect TTL has elapsed.
+//
+// Held under protectMu so the store is ordered with concurrent
+// enterProtect() engages; additionally gated on protectUntil being
+// in the past so a stale "memory OK" observation made before a recent
+// engage cannot apply to that fresh engage. While protectUntil is
+// in the future, our observation is necessarily older than that
+// engage and must be discarded; the next heartbeat tick (≤1 s later,
+// once protectUntil has elapsed) will re-confirm if avail still ≥18 MiB.
+//
 // gomobile binding exposes this to Swift as SocksstubMaybeReleaseProtect().
 func MaybeReleaseProtect() {
+	protectMu.Lock()
+	defer protectMu.Unlock()
+	if time.Now().UnixNano() < atomic.LoadInt64(&protectUntil) {
+		return
+	}
 	atomic.StoreInt32(&recoveryConfirmed, 1)
 }
 
