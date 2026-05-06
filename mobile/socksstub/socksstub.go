@@ -17,12 +17,12 @@
 //
 // Public gomobile API:
 //
-//   func Start(socketPath string) error
-//   func Stop()
-//   func Status() string                       // "stopped" | "listening"
-//   func ConnectionsCount() int
-//   func SetSamizdatConfig(blob string) error  // empty string → direct dial
-//   func Logs() string
+//	func Start(socketPath string) error
+//	func Stop()
+//	func Status() string                       // "stopped" | "listening"
+//	func ConnectionsCount() int
+//	func SetSamizdatConfig(blob string) error  // empty string → direct dial
+//	func Logs() string
 package socksstub
 
 import (
@@ -48,13 +48,14 @@ import (
 	// is github.com/detectqq/tamizdat (`package tamizdat`). All call
 	// sites continue to use `samizdat.Client` etc. via this alias.
 	samizdat "github.com/detectqq/tamizdat"
+	"golang.org/x/time/rate"
 )
 
 const (
-	socksVersion5      = 0x05
-	socksMethodNoAuth  = 0x00
-	socksCmdConnect    = 0x01
-	socksCmdUDPAssoc   = 0x03
+	socksVersion5     = 0x05
+	socksMethodNoAuth = 0x00
+	socksCmdConnect   = 0x01
+	socksCmdUDPAssoc  = 0x03
 	// socksCmdFwdUDP is hev-socks5-tunnel's custom command for
 	// "UDP-in-TCP" forwarding (HEV_SOCKS5_REQ_CMD_FWD_UDP). It is what
 	// hev sends when the YAML has `socks5.udp: 'tcp'`. After the SOCKS5
@@ -120,6 +121,95 @@ var (
 // always show.
 var verboseFlowLogs atomic.Bool
 
+// IPA-D2 hybrid burst protection. Three-input OR trigger
+// (accept-rate burst OR avail<12MiB OR kernel .critical). During the
+// 5-second protect window, two-axis admission: rate.Limiter (120/s
+// burst 24, Allow-not-Wait) AND pendingNew cap (64). Excess accepts
+// are Close()d (RST → iOS app retry). Established flows untouched.
+var (
+	protectUntil     int64 // atomic unix-nano; if > now → protect mode active
+	pendingNew       int32 // atomic; in-flight DialContext during protect
+	burstShedTotal   int64 // atomic
+	burstEngageTotal int64 // atomic
+
+	// accept-rate counters, only meaningful during protect detection.
+	// Two sliding windows: 100 ms (cap=48) and 500 ms (cap=180).
+	acceptTimes100 = newRingTimes(64)  // ring of unix-nanos, sized > worst-case 100 ms hits
+	acceptTimes500 = newRingTimes(256) // ring sized > worst-case 500 ms hits
+	acceptRateMu   sync.Mutex          // guards both rings
+
+	burstLimiter = rate.NewLimiter(rate.Limit(120), 24) // active only in protect mode
+)
+
+const (
+	pendingCap        = 64
+	protectTTL        = 5 * time.Second
+	burstWindow100    = 100 * time.Millisecond
+	burstWindow500    = 500 * time.Millisecond
+	burstThreshold100 = 48
+	burstThreshold500 = 180
+)
+
+// ringTimes is a tiny lock-protected ring buffer of unix-nanos for
+// counting how many events fell in the last N ms.
+type ringTimes struct {
+	buf  []int64
+	head int
+	n    int
+}
+
+func newRingTimes(cap int) *ringTimes { return &ringTimes{buf: make([]int64, cap)} }
+
+func (r *ringTimes) addAndCountSince(now int64, since int64) int {
+	// Push current event. Overwrites oldest if full (we only care about
+	// the last `since` ns anyway).
+	r.buf[r.head] = now
+	r.head = (r.head + 1) % len(r.buf)
+	if r.n < len(r.buf) {
+		r.n++
+	}
+	cnt := 0
+	for i := 0; i < r.n; i++ {
+		if r.buf[i] >= since {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func enterProtect(d time.Duration) {
+	until := time.Now().Add(d).UnixNano()
+	for {
+		old := atomic.LoadInt64(&protectUntil)
+		if until <= old {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&protectUntil, old, until) {
+			// Count the engagement only when transitioning from inactive.
+			if old < time.Now().UnixNano() {
+				atomic.AddInt64(&burstEngageTotal, 1)
+				rt.appendLog("warn: burst protection ENGAGED")
+			}
+			return
+		}
+	}
+}
+
+func inProtect(now time.Time) bool {
+	return now.UnixNano() < atomic.LoadInt64(&protectUntil)
+}
+
+// acceptBurstHit returns true if the accept-rate window has been exceeded.
+// Updates both rings as a side effect.
+func acceptBurstHit(now time.Time) bool {
+	nowNs := now.UnixNano()
+	acceptRateMu.Lock()
+	defer acceptRateMu.Unlock()
+	c100 := acceptTimes100.addAndCountSince(nowNs, nowNs-burstWindow100.Nanoseconds())
+	c500 := acceptTimes500.addAndCountSince(nowNs, nowNs-burstWindow500.Nanoseconds())
+	return c100 >= burstThreshold100 || c500 >= burstThreshold500
+}
+
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
 func SetVerboseFlowLogs(enabled bool) {
@@ -129,6 +219,37 @@ func SetVerboseFlowLogs(enabled bool) {
 	} else {
 		rt.appendLog("info: verbose per-flow logs = OFF (errors+heartbeat only)")
 	}
+}
+
+// EnterProtectMode is called from Swift on memory-pressure signals
+// (kernel .critical or os_proc_available_memory < 12 MiB). The
+// `millis` argument extends the protect window from now.
+// gomobile binding exposes this to Swift as SocksstubEnterProtectMode(int).
+func EnterProtectMode(millis int) {
+	if millis <= 0 {
+		millis = int(protectTTL / time.Millisecond)
+	}
+	enterProtect(time.Duration(millis) * time.Millisecond)
+}
+
+// MaybeReleaseProtect is called from Swift's heartbeat when
+// os_proc_available_memory() >= 18 MiB. Does NOT shorten the window;
+// release is purely time-based once the 5 s TTL has elapsed.
+// (This function is currently a no-op placeholder; left exported in
+// case future tuning needs an explicit "memory-OK" signal.)
+func MaybeReleaseProtect() {
+	// Nothing to do — protectUntil is checked lazily on the accept hot path.
+}
+
+// BurstShedTotal / BurstEngageTotal / BurstActive expose counters for
+// the Swift heartbeat log.
+func BurstShedTotal() int64   { return atomic.LoadInt64(&burstShedTotal) }
+func BurstEngageTotal() int64 { return atomic.LoadInt64(&burstEngageTotal) }
+func BurstActive() int32 {
+	if inProtect(time.Now()) {
+		return 1
+	}
+	return 0
 }
 
 // flowLogf is a gated wrapper for per-flow info logs. Errors and
@@ -710,14 +831,43 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			rt.appendLog(fmt.Sprintf("warn: accept: %v", err))
 			return
 		}
+		now := time.Now()
+
+		// Detect accept-rate burst. Side-effect updates rings.
+		if acceptBurstHit(now) {
+			enterProtect(protectTTL)
+		}
+
+		// Fast path when not in protect mode — byte-identical to A9.
+		if !inProtect(now) {
+			n := rt.connsTotal.Add(1)
+			rt.connsActive.Add(1)
+			flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
+			go func(client net.Conn, idx uint64) {
+				defer client.Close()
+				defer rt.connsActive.Add(-1)
+				handleSocks(ctx, client, idx)
+			}(c, n)
+			continue
+		}
+
+		// Protect mode: rate-limit (Allow, not Wait) and cap pending.
+		if !burstLimiter.Allow() {
+			atomic.AddInt64(&burstShedTotal, 1)
+			_ = c.Close()
+			continue
+		}
+		if atomic.AddInt32(&pendingNew, 1) > pendingCap {
+			atomic.AddInt32(&pendingNew, -1)
+			atomic.AddInt64(&burstShedTotal, 1)
+			_ = c.Close()
+			continue
+		}
 		n := rt.connsTotal.Add(1)
 		rt.connsActive.Add(1)
-		// IPA-G: per-connection accept log. If this never appears
-		// while hev says it's forwarding traffic, loopback in
-		// NEPacketTunnelProvider is sandbox-blocked — the headline
-		// data-plane diagnosis we need.
-		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
+		flowLogf("info: accept #%d from %s (protect mode)", n, c.RemoteAddr())
 		go func(client net.Conn, idx uint64) {
+			defer atomic.AddInt32(&pendingNew, -1)
 			defer client.Close()
 			defer rt.connsActive.Add(-1)
 			handleSocks(ctx, client, idx)
@@ -964,14 +1114,14 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		port uint16
 	}
 	type pcEntry struct {
-		pc           net.PacketConn
-		atyp         byte   // remember the atyp for the reverse frame header
-		addrEncoded  []byte // pre-encoded addr+port bytes (without atyp)
-		lastActive   atomic.Int64 // unix nanos, reset on every forward/reverse activity
+		pc          net.PacketConn
+		atyp        byte         // remember the atyp for the reverse frame header
+		addrEncoded []byte       // pre-encoded addr+port bytes (without atyp)
+		lastActive  atomic.Int64 // unix nanos, reset on every forward/reverse activity
 	}
 	const (
-		fwdUDPMaxEntries = 128                 // hard cap on pcs map
-		fwdUDPIdleNanos  = 60 * 1_000_000_000  // 60 s idle → evict
+		fwdUDPMaxEntries = 128                // hard cap on pcs map
+		fwdUDPIdleNanos  = 60 * 1_000_000_000 // 60 s idle → evict
 	)
 	var (
 		pcMu      sync.Mutex

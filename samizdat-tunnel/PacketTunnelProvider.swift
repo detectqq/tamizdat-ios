@@ -46,6 +46,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var swiftHeartbeatTimer: DispatchSourceTimer?
     private var swiftLogHandle: FileHandle?
+    private var memPressureSrc: DispatchSourceMemoryPressure?
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
@@ -189,6 +190,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
+        stopBurstProtection()  // IPA-D2
         try? swiftLogHandle?.close()
         swiftLogHandle = nil
         completionHandler()
@@ -494,6 +496,7 @@ misc:
         appendExtLog("info: SOCKS5 reachable; handing packets to hev")
 
         startSwiftHeartbeat()
+        startBurstProtection()  // IPA-D2
         startPathMonitor()
         startWhitelistDetectorIfNeeded()
         isRunning = true
@@ -673,6 +676,22 @@ misc:
         }
     }
 
+    private func startBurstProtection() {
+        let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
+        let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
+        src.setEventHandler { [weak self] in
+            self?.appendExtLog("warn: kernel memorypressure CRITICAL — engaging protect mode")
+            SocksstubEnterProtectMode(5000)
+        }
+        src.activate()
+        self.memPressureSrc = src
+    }
+
+    private func stopBurstProtection() {
+        self.memPressureSrc?.cancel()
+        self.memPressureSrc = nil
+    }
+
     private func startSwiftHeartbeat() {
         let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -685,6 +704,16 @@ misc:
             guard let self, self.isRunning else { return }
             // iOS's apple-supplied "available before jetsam" gauge.
             let availKB = os_proc_available_memory() / 1024
+
+            // IPA-D2: drive protect mode from per-process memory headroom.
+            let availBytes = os_proc_available_memory()
+            if availBytes > 0 {
+                if availBytes < 12 * 1024 * 1024 {
+                    SocksstubEnterProtectMode(5000)
+                } else if availBytes >= 18 * 1024 * 1024 {
+                    SocksstubMaybeReleaseProtect()
+                }
+            }
 
             // Go heap detail — disambiguates "Go is bloating" from
             // "non-Go is bloating" on a crash.
