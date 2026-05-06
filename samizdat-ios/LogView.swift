@@ -116,6 +116,16 @@ struct LogView: View {
                     .disabled(sendStatus == .sending)
                     .tint(telegramTint)
 
+                    // IPA-D9: heap profile to telegram
+                    Button {
+                        sendHeapToTelegram()
+                    } label: {
+                        Label("Heap", systemImage: "memorychip")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(sendStatus == .sending)
+
                     Button(role: .destructive) {
                         bridge.clearLogs()
                     } label: {
@@ -201,6 +211,80 @@ struct LogView: View {
         case .failed: return .red
         case .sent:   return .green
         default:      return .secondary
+        }
+    }
+
+    /// IPA-D9: dumps heap + goroutine profile NOW and uploads both as
+    /// Telegram documents. Operator hits this button under load to get
+    /// a snapshot of where memory is going.
+    private func sendHeapToTelegram() {
+        guard TelegramReporter.isConfigured else {
+            sendStatus = .failed("Configure bot token in Telegram settings (gear icon).")
+            return
+        }
+        sendStatus = .sending
+
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SamizdatBridge.appGroupID
+        ) else {
+            sendStatus = .failed("App Group container not available")
+            return
+        }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let heapPath = containerURL.appendingPathComponent("heap-manual-\(stamp).pb.gz").path
+        let goroutinePath = containerURL.appendingPathComponent("goroutine-manual-\(stamp).txt").path
+
+        // Trigger Go to write profiles. These are synchronous-ish (heap
+        // writeProfile takes <100ms typically; goroutine even faster).
+        let heapErr = SocksstubWriteHeapProfile(heapPath)
+        if !heapErr.isEmpty {
+            sendStatus = .failed("WriteHeapProfile: \(heapErr)")
+            return
+        }
+        let groutineErr = SocksstubWriteGoroutineProfile(goroutinePath)
+        if !groutineErr.isEmpty {
+            sendStatus = .failed("WriteGoroutineProfile: \(groutineErr)")
+            return
+        }
+
+        guard let heapData = try? Data(contentsOf: URL(fileURLWithPath: heapPath)),
+              let goroutineData = try? Data(contentsOf: URL(fileURLWithPath: goroutinePath)) else {
+            sendStatus = .failed("Could not read profile files back")
+            return
+        }
+
+        let caption = TelegramReporter.defaultCaption(extra: "heap+goroutine snapshot")
+        let heapName = "heap-\(stamp).pb.gz"
+        let goName = "goroutine-\(stamp).txt"
+
+        // Send both files sequentially. If first fails, show that and stop.
+        TelegramReporter.sendFile(
+            data: heapData,
+            filename: heapName,
+            mimeType: "application/gzip",
+            caption: caption
+        ) { result in
+            switch result {
+            case .success:
+                TelegramReporter.sendFile(
+                    data: goroutineData,
+                    filename: goName,
+                    mimeType: "text/plain; charset=utf-8",
+                    caption: caption + " (goroutines)"
+                ) { result2 in
+                    switch result2 {
+                    case .success:
+                        sendStatus = .sent
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                            if case .sent = sendStatus { sendStatus = .idle }
+                        }
+                    case .failure(let err):
+                        sendStatus = .failed("goroutine: \(err.errorDescription ?? "unknown")")
+                    }
+                }
+            case .failure(let err):
+                sendStatus = .failed("heap: \(err.errorDescription ?? "unknown")")
+            }
         }
     }
 

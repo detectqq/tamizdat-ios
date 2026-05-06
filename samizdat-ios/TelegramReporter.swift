@@ -133,6 +133,70 @@ enum TelegramReporter {
         }.resume()
     }
 
+    /// Sends arbitrary binary data as a Telegram document. Used for heap
+    /// profiles, goroutine dumps, etc. — see `LogView` "Send heap profile"
+    /// button (D9).
+    static func sendFile(
+        data: Data,
+        filename: String,
+        mimeType: String,
+        caption: String,
+        completion: @escaping (Result<Void, SendError>) -> Void
+    ) {
+        let token = botToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chat  = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty, !chat.isEmpty else {
+            DispatchQueue.main.async { completion(.failure(.notConfigured)) }
+            return
+        }
+        let url = URL(string: "https://api.telegram.org/bot\(token)/sendDocument")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        func append(_ s: String) { body.append(Data(s.utf8)) }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
+        append("\(chat)\r\n")
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"caption\"\r\n\r\n")
+        append("\(caption)\r\n")
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"document\"; filename=\"\(filename)\"\r\n")
+        append("Content-Type: \(mimeType)\r\n\r\n")
+        body.append(data)
+        append("\r\n--\(boundary)--\r\n")
+
+        request.httpBody = body
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 30 // bigger timeout — heap profile may be 100s of KB
+        cfg.timeoutIntervalForResource = 60
+        let session = URLSession(configuration: cfg)
+
+        session.dataTask(with: request) { data, response, error in
+            session.finishTasksAndInvalidate()
+            DispatchQueue.main.async {
+                if let error {
+                    completion(.failure(.transport(error)))
+                    return
+                }
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200...299).contains(code) {
+                    completion(.success(()))
+                } else {
+                    let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? "(empty)"
+                    completion(.failure(.http(code, body)))
+                }
+            }
+        }.resume()
+    }
+
     /// Builds a one-line caption with device + app metadata.
     static func defaultCaption(extra: String? = nil) -> String {
         let device = UIDevice.current

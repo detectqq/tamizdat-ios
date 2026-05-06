@@ -54,7 +54,7 @@ final class SamizdatBridge: ObservableObject {
     private var didLogFileStale = false
     private var logFileTimer: DispatchSourceTimer?
 
-    private static let appGroupID = "group.com.anarki.samizdat-test"
+    static let appGroupID = "group.com.anarki.samizdat-test"
     private static let logFileName = "extension-log.txt"
 
     init() {
