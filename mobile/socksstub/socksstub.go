@@ -464,7 +464,18 @@ func Start(addrSpec string) error {
 
 	rt.appendLog(fmt.Sprintf("info: socks listener up on %s://%s", network, addr))
 	go acceptLoop(ctx, ln)
-	startIdleEvictor(ctx) // IPA-D6: proactive idle eviction
+	// IPA-D14: idle evictor DISABLED. Was added in D6 to chase memory pressure
+	// when we hadn't yet found the real leak (vendored x-net writeRequestBody
+	// scratch buffer, fixed in D12). With the leak fixed, idle eviction is
+	// no longer needed for memory and was breaking persistent low-traffic
+	// connections (Roblox control TCP, idle Telegram channels, etc).
+	//
+	// Symptom on D8/D12/D13: Roblox would connect, players load, then freeze
+	// after ~1 sec — Roblox client closes idle control sockets at 5s
+	// threshold while game is still active.
+	//
+	// startIdleEvictor(ctx) // intentionally disabled in D14
+	_ = startIdleEvictor // keep symbol referenced to avoid unused-func errors
 	return nil
 }
 
