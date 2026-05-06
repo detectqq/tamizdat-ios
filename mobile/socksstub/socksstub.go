@@ -120,6 +120,24 @@ var (
 // always show.
 var verboseFlowLogs atomic.Bool
 
+// IPA-D2 burst protection. In normal state, burstFlag is 0 and the accept
+// loop is byte-identical to A9. When kernel `.critical` fires or
+// os_proc_available_memory() drops below 8 MiB, Swift sets burstFlag=1 and
+// new SOCKS5 accepts are gated through burstSem (cap 64). Excess accepts
+// are Close()d immediately so iOS apps see RST and retry — established
+// flows are NEVER affected.
+var (
+	burstFlag          int32 // atomic; 1 == shedding active
+	burstSince         int64 // atomic unix-nano of latest engage
+	burstRecoveryTicks int32 // atomic; consecutive heartbeat ticks with avail>=15MiB after cooldown
+	burstShedTotal     int64 // atomic; counter for log heartbeat
+	burstEngageTotal   int64 // atomic; counter for log heartbeat
+)
+
+const burstCap = 64
+
+var burstSem = make(chan struct{}, burstCap)
+
 // SetVerboseFlowLogs toggles per-flow log emission. Exposed to Swift as
 // SocksstubSetVerboseFlowLogs(bool) for a future debug toggle.
 func SetVerboseFlowLogs(enabled bool) {
@@ -130,6 +148,51 @@ func SetVerboseFlowLogs(enabled bool) {
 		rt.appendLog("info: verbose per-flow logs = OFF (errors+heartbeat only)")
 	}
 }
+
+// SetBurst is called from Swift to engage burst protection.
+// gomobile binding exposes this to Swift as SocksstubSetBurst(int32).
+func SetBurst(on int32) {
+	if on == 1 {
+		if atomic.CompareAndSwapInt32(&burstFlag, 0, 1) {
+			atomic.AddInt64(&burstEngageTotal, 1)
+			rt.appendLog("warn: burst protection ENGAGED (memory pressure)")
+		}
+		atomic.StoreInt64(&burstSince, time.Now().UnixNano())
+		atomic.StoreInt32(&burstRecoveryTicks, 0)
+	}
+}
+
+// MaybeClearBurst is called from Swift's 1-second heartbeat when
+// os_proc_available_memory() reports >= 15 MiB. Disengages only if both:
+//   - >= 5 seconds elapsed since last engage event
+//   - this is the 2nd consecutive heartbeat tick where avail>=15MiB after cooldown
+//
+// gomobile binding exposes this to Swift as SocksstubMaybeClearBurst().
+func MaybeClearBurst() {
+	if atomic.LoadInt32(&burstFlag) == 0 {
+		return
+	}
+	since := atomic.LoadInt64(&burstSince)
+	if time.Since(time.Unix(0, since)) < 5*time.Second {
+		// Still in cool-down; reset recovery counter so we require fresh consecutive ticks afterward.
+		atomic.StoreInt32(&burstRecoveryTicks, 0)
+		return
+	}
+	if atomic.AddInt32(&burstRecoveryTicks, 1) >= 2 {
+		atomic.StoreInt32(&burstFlag, 0)
+		atomic.StoreInt32(&burstRecoveryTicks, 0)
+		rt.appendLog("info: burst protection DISENGAGED")
+	}
+}
+
+// BurstShedTotal returns total accepts shed since process start (gomobile-exported).
+func BurstShedTotal() int64 { return atomic.LoadInt64(&burstShedTotal) }
+
+// BurstEngageTotal returns total burst-mode engages since process start.
+func BurstEngageTotal() int64 { return atomic.LoadInt64(&burstEngageTotal) }
+
+// BurstActive returns 1 if burst protection is currently engaged.
+func BurstActive() int32 { return atomic.LoadInt32(&burstFlag) }
 
 // flowLogf is a gated wrapper for per-flow info logs. Errors and
 // warnings should still use rt.appendLog directly so they're never
@@ -710,18 +773,34 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 			rt.appendLog(fmt.Sprintf("warn: accept: %v", err))
 			return
 		}
-		n := rt.connsTotal.Add(1)
-		rt.connsActive.Add(1)
-		// IPA-G: per-connection accept log. If this never appears
-		// while hev says it's forwarding traffic, loopback in
-		// NEPacketTunnelProvider is sandbox-blocked — the headline
-		// data-plane diagnosis we need.
-		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
-		go func(client net.Conn, idx uint64) {
-			defer client.Close()
-			defer rt.connsActive.Add(-1)
-			handleSocks(ctx, client, idx)
-		}(c, n)
+		// IPA-D2: burst gate. Fast path when burstFlag==0 (normal state).
+		if atomic.LoadInt32(&burstFlag) == 0 {
+			n := rt.connsTotal.Add(1)
+			rt.connsActive.Add(1)
+			flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
+			go func(client net.Conn, idx uint64) {
+				defer client.Close()
+				defer rt.connsActive.Add(-1)
+				handleSocks(ctx, client, idx)
+			}(c, n)
+			continue
+		}
+		// Burst mode: try to acquire a slot. If full, shed (Close → RST → app retry).
+		select {
+		case burstSem <- struct{}{}:
+			n := rt.connsTotal.Add(1)
+			rt.connsActive.Add(1)
+			flowLogf("info: accept #%d from %s (burst gate ok)", n, c.RemoteAddr())
+			go func(client net.Conn, idx uint64) {
+				defer func() { <-burstSem }()
+				defer client.Close()
+				defer rt.connsActive.Add(-1)
+				handleSocks(ctx, client, idx)
+			}(c, n)
+		default:
+			atomic.AddInt64(&burstShedTotal, 1)
+			_ = c.Close()
+		}
 	}
 }
 
