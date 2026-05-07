@@ -1,6 +1,6 @@
-# samizdat-ios
+# tamizdat-ios
 
-iOS client for the Samizdat proxy protocol.
+iOS client for the tamizdat proxy protocol.
 
 ```
 ┌─────────────────────────────────────┐
@@ -8,9 +8,9 @@ iOS client for the Samizdat proxy protocol.
 │  ├─ ContentView   status + button   │
 │  ├─ ConfigPaste   modal             │
 │  ├─ LogView       modal             │
-│  └─ SamizdatBridge → Go shim ───────┼──► SamizdatClient.xcframework
-│                                     │      (gomobile bind ./mobile/samizdat)
-│ samizdat-tunnel (extension, stub)   │
+│  └─ tamizdatBridge → Go shim ───────┼──► tamizdatClient.xcframework
+│                                     │      (gomobile bind ./mobile/tamizdat)
+│ tamizdat-tunnel (extension, stub)   │
 │  └─ PacketTunnelProvider            │
 └─────────────────────────────────────┘
 ```
@@ -19,11 +19,11 @@ iOS client for the Samizdat proxy protocol.
 
 **Iteration 1 (current).** End-to-end pipeline (Go → gomobile → xcframework
 → Xcode → IPA → Sideloadly → iPhone) is wired up. The Go shim parses real
-`samizdat://` config blobs but `Connect()` is a simulation — no real
+`tamizdat://` config blobs but `Connect()` is a simulation — no real
 network tunnel yet. Lets us validate UI + signing + extension target
-without the integration risk of the real samizdat client.
+without the integration risk of the real tamizdat client.
 
-**Iteration 2 (next).** Replace the simulation with `samizdat.NewClient`
+**Iteration 2 (next).** Replace the simulation with `tamizdat.NewClient`
 inside the PacketTunnelProvider extension, plus a tun2socks layer so all
 device traffic flows through the tunnel.
 
@@ -32,25 +32,25 @@ device traffic flows through the tunnel.
 ```
 mobile/                          # Go module — gomobile-friendly shim
   go.mod
-  samizdat/
-    samizdat.go                  # API: Connect, Disconnect, Status, Logs, …
-    samizdat_test.go
+  tamizdat/
+    tamizdat.go                  # API: Connect, Disconnect, Status, Logs, …
+    tamizdat_test.go
 
-samizdat-ios/                    # main app target (SwiftUI)
+tamizdat-ios/                    # main app target (SwiftUI)
   App.swift
   ContentView.swift
   ConfigPasteView.swift
   LogView.swift
   ConfigStore.swift              # Keychain-backed config persistence
-  SamizdatBridge.swift           # Swift wrapper around the Go shim
+  tamizdatBridge.swift           # Swift wrapper around the Go shim
   Info.plist
-  samizdat-ios.entitlements      # Network Extensions + App Group
+  tamizdat-ios.entitlements      # Network Extensions + App Group
   Assets.xcassets/
 
-samizdat-tunnel/                 # extension target (PacketTunnelProvider)
+tamizdat-tunnel/                 # extension target (PacketTunnelProvider)
   PacketTunnelProvider.swift     # iter1 stub
   Info.plist
-  samizdat-tunnel.entitlements
+  tamizdat-tunnel.entitlements
 
 project.yml                      # XcodeGen config — generates .xcodeproj
 ExportOptions.plist              # Ad-hoc export, both bundle IDs
@@ -65,9 +65,9 @@ Local Mac (optional):
 brew install xcodegen go
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-( cd mobile && gomobile bind -target=ios -o ../Frameworks/SamizdatClient.xcframework ./samizdat )
+( cd mobile && gomobile bind -target=ios -o ../Frameworks/tamizdatClient.xcframework ./tamizdat )
 xcodegen generate
-open samizdat-ios.xcodeproj
+open tamizdat-ios.xcodeproj
 ```
 
 Without a Mac (the actual deployment path):
@@ -82,11 +82,11 @@ download artifact         → Sideloadly → iPhone
 | Item | Value |
 |---|---|
 | Team ID | `DRMTP6V372` |
-| App bundle ID | `com.anarki.samizdat-test` |
-| Tunnel bundle ID | `com.anarki.samizdat-test.tunnel` |
-| App Group | `group.com.anarki.samizdat-test` |
-| App profile | `Samizdat Test AdHoc` (Ad Hoc) |
-| Tunnel profile | `Samizdat Tunnel AdHoc` (Ad Hoc) |
+| App bundle ID | `com.anarki.tamizdat-test` |
+| Tunnel bundle ID | `com.anarki.tamizdat-test.tunnel` |
+| App Group | `group.com.anarki.tamizdat-test` |
+| App profile | `tamizdat Test AdHoc` (Ad Hoc) |
+| Tunnel profile | `tamizdat Tunnel AdHoc` (Ad Hoc) |
 | Cert | Apple Distribution (1-year validity) |
 
 ## Required GitHub Secrets
@@ -95,6 +95,6 @@ download artifact         → Sideloadly → iPhone
 |---|---|
 | `BUILD_CERTIFICATE_BASE64` | base64 of the `.p12` |
 | `P12_PASSWORD` | password protecting the `.p12` |
-| `BUILD_PROVISION_PROFILE_BASE64` | base64 of `Samizdat Test AdHoc.mobileprovision` |
-| `BUILD_TUNNEL_PROVISION_PROFILE_BASE64` | base64 of `Samizdat Tunnel AdHoc.mobileprovision` |
+| `BUILD_PROVISION_PROFILE_BASE64` | base64 of `tamizdat Test AdHoc.mobileprovision` |
+| `BUILD_TUNNEL_PROVISION_PROFILE_BASE64` | base64 of `tamizdat Tunnel AdHoc.mobileprovision` |
 | `KEYCHAIN_PASSWORD` | any random string (temp keychain unlock) |
