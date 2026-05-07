@@ -237,17 +237,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // Debounce: iOS can fire 3-4 path updates in a flap (interface
-        // appears, gets DHCP, gets IPv6, becomes default, …). 3 s is
-        // longer than typical flap settle but well below user patience.
-        let now = Date()
-        if now.timeIntervalSince(lastReconnectAt) < 3.0 {
-            appendExtLog("info: path change \(prev ?? "?") → \(kind) — debounced")
+        // IPA-D17: removed 3-second blanket debounce. sing-box-for-apple
+        // (ExtensionPlatformInterface.swift:260-271) calls onUpdate
+        // DefaultInterface synchronously from the path callback with no
+        // debounce; the same-kind early return above already coalesces
+        // satisfied→satisfied churn for free. The 3-s blanket was the
+        // reason users felt the WiFi-off → cellular-on switch hang for
+        // ~30-60 seconds: dead flows kept running until their per-stream
+        // read-timeout while we sat on the debounce.
+        //
+        // Skip rewire on .unsatisfied transitions — there is no upstream
+        // to dial through, and rebuilding a samizdat.Client now would
+        // just fail and waste the warm-up TLS handshake. The next
+        // .satisfied callback with a fresh interface kind fires a real
+        // rewire.
+        if !satisfied {
+            appendExtLog("info: path change \(prev ?? "?") → \(kind) — unsatisfied, deferring rewire to next satisfied path")
             return
         }
-        lastReconnectAt = now
+        lastReconnectAt = Date()
 
-        appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream")
+        appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream + force-closing stale flows")
         rewireUpstream()
     }
 
@@ -290,9 +300,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
                 self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
-            } else {
-                self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+                return
             }
+            self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+
+            // IPA-D17: after the new client is in place, force-close
+            // every loopback SOCKS5 flow that hev opened over the OLD
+            // path. Apps see RST → reconnect immediately on the fresh
+            // client, instead of hanging on dead H/2 streams until
+            // per-stream read timeout (~30-60 s).
+            //
+            // Order matters: swap first, close flows second. Otherwise
+            // the close would race with retries that have nowhere to go.
+            //
+            // Reference patterns:
+            //   sing-box-for-apple: onUpdateDefaultInterface in libbox
+            //     causes the route NetworkManager to flush per-flow
+            //     DefaultMarker, propagating EOF to in-flight conns.
+            //   Shadowrocket: -[DLWPacketTunnelProvider closeAllTunnels]
+            //     (Ghidra @ 0x1000e43f4) walks 7 tunnel singletons.
+            //
+            // Our equivalent is the single SocksstubCloseAllFlows() over
+            // the unified flowRegistry — same effect, less ceremony.
+            let closed = SocksstubCloseAllFlows()
+            self.appendExtLog("info: rewire force-closed \(closed) stale flows")
         }
     }
 
