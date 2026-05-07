@@ -492,7 +492,14 @@ misc:
   task-stack-size: 24576
   log-level: 'info'
   connect-timeout: 2000
-  read-write-timeout: 60000
+  # IPA-D19: bump hev per-socket read/write idle from 60s to 5min.
+  # 60s killed AnyDesk after ~1 minute when the user paused typing on the
+  # HID side of its multi-TCP relay (only the video channel kept hev's read
+  # loop fed; HID went silent and tripped the deadline). 5 min matches sing-
+  # box's industry-standard UDPTimeout/TCPKeepAliveInitial constants
+  # (sing-box/constant/timeout.go:6,12). See diagnosis at
+  # /c/var-tmp/anydesk-diagnosis.md.
+  read-write-timeout: 300000
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
