@@ -217,10 +217,17 @@ func Start(addrSpec string) error {
 	// just sitting useless because Go won't touch it. 37 MB lets the
 	// heap actually breathe under speedtest fanout while still leaving
 	// 13 MB headroom for non-Go state (Swift, hev, NEPacketTunnel
-	// internals). GOGC=20 (steeper-than-default GC ramp) is kept —
-	// Go's pacer will start aggressive collection well before 37 MB.
+	// internals).
+	//
+	// IPA-D18: GOGC 20 → 100 (Go default). With 5-10 MB heap baseline
+	// observed in D14 and 25+ MB headroom under SetMemoryLimit, the
+	// aggressive 20% growth threshold caused ~5x more GC cycles than
+	// necessary at idle — each cycle wakes CPU and burns battery.
+	// SetMemoryLimit(37 MB) below remains as the emergency cap; if
+	// the heap actually approaches 37 MB the runtime biases GC harder
+	// regardless of GOGC.
 	debug.SetMemoryLimit(37 * 1024 * 1024)
-	debug.SetGCPercent(20)
+	debug.SetGCPercent(100)
 
 	network := "tcp"
 	addr := addrSpec
@@ -414,6 +421,38 @@ func SetSamizdatConfig(blob string) error {
 		//               coexist without per-stream queueing.
 		MaxStreamsPerConn: 500,
 		IdleTimeout:       30 * time.Second,
+		// IPA-D18: 5 min TCP keepalive (was Go default 15 s) to let
+		// cellular radio fall into IDLE between cover/H2-PING traffic.
+		// Huang et al. MobiSys 2012 measured LTE RRC tail at 11.6 s @
+		// 1060 mW; a 15 s keepalive cadence keeps the radio pinned in
+		// CONNECTED state, ~6-9% battery/hour overhead. sing-box default
+		// is 5 min initial / 75 s probe interval — we mirror.
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 5 * time.Minute,
+			}
+			return d.DialContext(ctx, network, addr)
+		},
+		// IPA-D18: Disable cover traffic on iOS. Per gpt-5.5 analyst:
+		// active H2 cover dials wake cellular radio every 30-90 s,
+		// costing 1.5-2.8% battery/hour with screen off. Tamizdat is
+		// unusual among proxies in actively dialing decoy targets;
+		// Hysteria2/TUIC/VLESS-XTLS/sing-box-trojan all rely on stream
+		// shape/padding only. We trade cover-DPI-camouflage for battery.
+		// If TSPU returns hard, can re-enable per-config.
+		//
+		// applyDefaults() forces CoverTrafficEnabled=true unless
+		// DisableDefaultSecurity=true; that flag also suppresses
+		// TCPFragmentation/RecordFragmentation auto-set, so we re-enable
+		// those manually below. V1+StrictSingleH2 still pins
+		// MinTransports=1/MaxTransports=1 inside applyDefaults() even
+		// with DisableDefaultSecurity=true, so no extra pool sizing
+		// needed here.
+		DisableDefaultSecurity: true,
+		TCPFragmentation:       true,
+		RecordFragmentation:    true,
+		CoverTrafficEnabled:    false,
 		// IPA-X: V1/V2/V3 user-selectable pool variant (was hardcoded to
 		// "v1" since IPA-G). applyDefaults() pins:
 		//   v1: MinTransports=1, MaxTransports=1, RotationOverlapAllowance=1

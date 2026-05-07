@@ -45,6 +45,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let socksPort: UInt16 = 18443
 
     private var swiftHeartbeatTimer: DispatchSourceTimer?
+    // IPA-D18: emit heartbeat log line only every 5 ticks (every ~150 s
+    // at the new 30 s cadence) to drop file-write rate from 3600/hour
+    // to ~24/hour. Pressure events are still logged immediately.
+    private var hbTick: Int = 0
     private var swiftLogHandle: FileHandle?
     private var memPressureSrc: DispatchSourceMemoryPressure?
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
@@ -748,11 +752,15 @@ misc:
     private func startSwiftHeartbeat() {
         let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        // IPA-Z6: bump cadence 2 s → 1 s for finer crash-correlation
-        // resolution. Per-flow log spam is gated behind
-        // SocksstubSetVerboseFlowLogs (default OFF), so this doesn't add
-        // log noise — heartbeat is the dominant line.
-        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+        // IPA-D18: 1 s → 30 s. The 1 Hz cadence kept the extension CPU
+        // pinned awake and ran runtime.GC() 3600x/hour — both major
+        // battery leaks per gpt-5.5 analyst. Memory leak from D12 is
+        // fixed; we no longer need fast crash-correlation. Pressure
+        // detection still fires via DispatchSource.makeMemoryPressure
+        // Source(.critical) which kernel-pushes (zero-cost when idle).
+        // sing-box-for-apple has no comparable extension heartbeat at
+        // all — we keep one for diagnostics but at human cadence.
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(30))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
             // iOS's apple-supplied "available before jetsam" gauge.
@@ -760,10 +768,12 @@ misc:
 
             // IPA-D7/D9: per-process memory backstop with heap dump.
             let availBytes = os_proc_available_memory()
+            var nuclearFired = false
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
                 self.dumpProfileBeforeNuclear(reason: "avail8mib")
                 let closed = SocksstubCloseAllFlows()
                 self.appendExtLog("warn: avail<8MiB heartbeat — nuclear close (\(closed) flows)")
+                nuclearFired = true
             }
 
             // Go heap detail — disambiguates "Go is bloating" from
@@ -777,9 +787,15 @@ misc:
             let goRelKB   = SocksstubMemHeapReleasedKB()
             let numGC     = SocksstubMemNumGC()
 
-            // Ask the Go runtime to return freed pages to iOS so they
-            // don't sit on our jetsam ledger between heartbeats.
-            SocksstubFreeOSMemory()
+            // IPA-D18: only force GC when actually approaching the
+            // jetsam ceiling. The unconditional 1 Hz call was running
+            // runtime.GC() 3600 times/hour, pinning CPU and burning
+            // battery. Go's pacer + GOGC handles the normal case;
+            // we only step in when avail-memory is genuinely tight
+            // (< 12 MiB headroom before iOS reaps us).
+            if availBytes > 0 && availBytes < 12 * 1024 * 1024 {
+                SocksstubFreeOSMemory()
+            }
 
             // IPA-A1: pps comes from hev's own tunnel-stats counters
             // (it now owns the data path again — no bridge counters
@@ -791,13 +807,21 @@ misc:
             self.lastHevTxPkts = Int64(tx_pkts)
             self.lastHevRxPkts = Int64(rx_pkts)
 
-            self.appendExtLog(String(
-                format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
-                availKB,
-                goInUseKB, goSysKB, goRelKB,
-                numGC,
-                inboundPPS, outboundPPS
-            ))
+            // IPA-D18: log only every 5 ticks (~150 s) for periodic
+            // health snapshot, OR immediately when nuclear close
+            // fired. Drops appendExtLog() rate from 3600/hour to
+            // ~24/hour, removing the per-tick file-write that pulled
+            // iOS out of idle state.
+            self.hbTick += 1
+            if nuclearFired || (self.hbTick % 5) == 0 {
+                self.appendExtLog(String(
+                    format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
+                    availKB,
+                    goInUseKB, goSysKB, goRelKB,
+                    numGC,
+                    inboundPPS, outboundPPS
+                ))
+            }
         }
         timer.resume()
         swiftHeartbeatTimer = timer
