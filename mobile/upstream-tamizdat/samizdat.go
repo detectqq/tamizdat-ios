@@ -106,6 +106,13 @@ type ClientConfig struct {
 
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
+
+	// OnNotification is invoked once per applied bundle when the server
+	// piggy-backed a NotificationEntry. Fires on a fresh Go goroutine so
+	// the bundle-apply path stays non-blocking; consumer MUST be thread-
+	// safe and MUST NOT panic (panics are recovered). Phase C iOS-notify
+	// pipeline — iOS NE bridges this to a local UNNotification.
+	OnNotification func(NotificationEntry)
 }
 
 func (c *ClientConfig) applyDefaults() {

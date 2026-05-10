@@ -155,6 +155,35 @@ func SetVerboseFlowLogs(enabled bool) {
 	}
 }
 
+// Phase C iOS-notify (2026-05-10): registry for server-pushed notifications.
+// Swift registers a sink once at startup; the sink is looked up per-call so
+// it survives rebuildClient / rewireUpstream which reconstructs samizdat.NewClient.
+var notificationSink atomic.Value // NotificationCallback
+
+// NotificationCallback is the gomobile-friendly callback shape (only scalar
+// string args; gomobile binds Go interfaces to Swift protocols cleanly,
+// whereas Go-struct args through ObjC closures are unreliable).
+type NotificationCallback interface {
+	OnNotification(code, title, body, locale string)
+}
+
+// SetNotificationCallback registers the Swift-side sink for server-pushed
+// CoverConfigBundle.Notification entries. Pass nil to detach.
+func SetNotificationCallback(cb NotificationCallback) {
+	if cb == nil {
+		notificationSink.Store((NotificationCallback)(nil))
+		rt.appendLog("info: notification sink cleared")
+		return
+	}
+	notificationSink.Store(cb)
+	rt.appendLog("info: notification sink registered")
+}
+
+func currentNotificationCallback() NotificationCallback {
+	v, _ := notificationSink.Load().(NotificationCallback)
+	return v
+}
+
 // flowLogf is a gated wrapper for per-flow info logs. Errors and
 // warnings should still use rt.appendLog directly so they're never
 // suppressed.
@@ -470,6 +499,15 @@ func SetSamizdatConfig(blob string) error {
 		// mode locks the pool to exactly 1 TCP/443 forever, no overlap,
 		// no rotation — even tighter than vanilla v1.
 		StrictSingleH2: variant == "v1",
+		// Phase C iOS-notify (2026-05-10): forward server-pushed bundle
+		// notifications to the Swift NotificationBridge. Look up the
+		// current sink per-call so SetNotificationCallback() works across
+		// client rebuilds (rewireUpstream → fresh samizdat.NewClient).
+		OnNotification: func(e samizdat.NotificationEntry) {
+			if cb := currentNotificationCallback(); cb != nil {
+				cb.OnNotification(e.Code, e.Title, e.Body, e.Locale)
+			}
+		},
 		// IPA-Y: Performance mode toggle removed. Plan B+'s realtime
 		// classifier auto-flips the bulk transport to ShapeLite (no
 		// cover, no fragmentation, no jitter) for the duration of any

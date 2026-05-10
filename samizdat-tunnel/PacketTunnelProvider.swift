@@ -173,6 +173,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // any realtime flow (cover/fragmentation suspended for that
         // window only), so no static kill switch is needed.
         SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
+        // Phase C iOS-notify (2026-05-10): register the bridge BEFORE the
+        // first samizdat client is built. The first bundle fetch happens
+        // immediately after SetSamizdatConfig, so a user who is already
+        // over-quota at connect time still gets the notification.
+        SocksstubSetNotificationCallback(NotificationBridge.shared)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {

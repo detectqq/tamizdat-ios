@@ -88,6 +88,11 @@ targets:
       # call before SocksstubSetSamizdatConfig builds the next
       # ClientConfig.
       - path: samizdat-ios/PoolVariantPreferences.swift
+      # IPA-D20 (Phase C iOS-notify, 2026-05-11): NotificationPayload
+      # shape + App Group / Darwin constants shared between app and
+      # extension. Extension encodes after a server callback, app
+      # decodes and binds to a SwiftUI alert.
+      - path: samizdat-ios/NotificationPayload.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

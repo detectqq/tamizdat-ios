@@ -30,6 +30,11 @@ struct ContentView: View {
     // calls, no HTTP).
     @StateObject private var lampStore = TamizdatStatusStore()
 
+    // Phase C iOS-notify (2026-05-11): reactive observer for server-pushed
+    // notifications that the extension persisted into App Group UserDefaults.
+    // Fires when the NE bridge posts the Darwin notification.
+    @StateObject private var serverNotif = ServerNotificationObserver()
+
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
@@ -198,6 +203,25 @@ struct ContentView: View {
             stopStatusPolling()
             lampStore.stop()
         }
+        // Phase C iOS-notify (2026-05-11): server-pushed message alert.
+        // Replaces (or coexists with) the OS notification banner — the OS
+        // notification only fires when the user has enabled notifications
+        // in NotificationPreferences, but this alert always shows when the
+        // app is foregrounded.
+        .alert(
+            serverNotif.latest?.title.isEmpty == false
+                ? (serverNotif.latest?.title ?? "Сообщение")
+                : "Сообщение",
+            isPresented: Binding(
+                get: { serverNotif.latest != nil },
+                set: { if !$0 { serverNotif.dismiss() } }
+            ),
+            presenting: serverNotif.latest
+        ) { _ in
+            Button("OK", role: .cancel) { serverNotif.dismiss() }
+        } message: { payload in
+            Text(payload.body)
+        }
     }
 
     // MARK: – derived
@@ -246,7 +270,7 @@ struct ContentView: View {
     /// Bump this when promoting a new milestone IPA so testers can tell
     /// at a glance which build is on the device. Source of truth:
     /// `ipa/milestones/<TAG>-...` directory name.
-    private static let milestoneTag = "D19"
+    private static let milestoneTag = "D20"
 
     /// "IPA-Z6 · v0.2.42-fab1f9e (build 42)" — milestone tag is
     /// hardcoded above; rest is pulled from Info.plist, which the CI
@@ -332,6 +356,66 @@ struct ContentView: View {
                 vpnProfileError = error.localizedDescription
             }
         }
+    }
+}
+
+// MARK: – Phase C iOS-notify server-message observer
+//
+// Sits on the app side; listens for a Darwin notification posted by the
+// NE-side `NotificationBridge` whenever a server-pushed
+// `CoverConfigBundle.Notification` has been persisted into App Group
+// UserDefaults. Re-reads the JSON and exposes the latest as
+// `@Published`. `ContentView` binds it to an `.alert(...)`.
+//
+// Notes:
+//   - On `init` we read the current value too, so a notification that
+//     was delivered while the app was killed still surfaces on next launch.
+//   - `dismiss()` clears the App Group entry, so a re-launch doesn't
+//     show the same message again. The OS-level UN notification still
+//     uses `code` as identifier and is replace-on-resend.
+final class ServerNotificationObserver: ObservableObject {
+    @Published var latest: NotificationPayload?
+
+    init() {
+        readFromGroup()
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        CFNotificationCenterAddObserver(
+            center, observer,
+            { _, observerPtr, _, _, _ in
+                guard let observerPtr = observerPtr else { return }
+                let me = Unmanaged<ServerNotificationObserver>
+                    .fromOpaque(observerPtr).takeUnretainedValue()
+                DispatchQueue.main.async { me.readFromGroup() }
+            },
+            ServerNotificationConstants.darwinNotificationName,
+            nil, .deliverImmediately
+        )
+    }
+
+    deinit {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        CFNotificationCenterRemoveEveryObserver(center, observer)
+    }
+
+    private func readFromGroup() {
+        guard
+            let defaults = UserDefaults(suiteName: ServerNotificationConstants.appGroupID),
+            let data = defaults.data(forKey: ServerNotificationConstants.userDefaultsKey),
+            let payload = try? JSONDecoder().decode(NotificationPayload.self, from: data)
+        else { return }
+        // Only republish when the payload is actually different — keeps
+        // the alert from re-popping on every Darwin tick.
+        if payload != latest {
+            latest = payload
+        }
+    }
+
+    func dismiss() {
+        UserDefaults(suiteName: ServerNotificationConstants.appGroupID)?
+            .removeObject(forKey: ServerNotificationConstants.userDefaultsKey)
+        latest = nil
     }
 }
 

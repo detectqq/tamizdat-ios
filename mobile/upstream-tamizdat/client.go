@@ -747,6 +747,24 @@ func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
 			c.cover.replaceGap(time.Duration(bundle.CoverGapMinMS)*time.Millisecond, time.Duration(bundle.CoverGapMaxMS)*time.Millisecond)
 		}
 	}
+	// Phase C iOS-notify: forward a one-shot user-facing notification to any
+	// registered consumer (iOS NE bridges this to a local notification).
+	// Fire on a goroutine to keep the bundle-apply path non-blocking; the
+	// callback may do I/O (UserDefaults write, sendProviderMessage) we don't
+	// want to serialize against transport rotation. Copy the entry by value
+	// before launching — the caller may reuse the bundle.
+	if bundle.Notification != nil && c.config.OnNotification != nil {
+		entry := *bundle.Notification
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Don't propagate consumer panics into the client pool.
+					_ = r
+				}
+			}()
+			c.config.OnNotification(entry)
+		}()
+	}
 }
 
 type tlsConnWrapper struct {
