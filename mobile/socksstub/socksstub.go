@@ -348,6 +348,11 @@ func SetSamizdatConfig(blob string) error {
 		rt.samizdatBlob = ""
 		rt.samizdatClient = nil
 		rt.mu.Unlock()
+		// IPA-D21: stop the ping prober when there is no samizdat client to
+		// probe through. Snapshot fields retain their last values so the
+		// UI can show "last good ping" briefly before the lamp goes
+		// "— offline —".
+		stopPingProber()
 		if oldClient != nil {
 			_ = oldClient.Close()
 		}
@@ -554,6 +559,11 @@ func SetSamizdatConfig(blob string) error {
 	if old != nil {
 		_ = old.Close()
 	}
+	// IPA-D21: (re)start the real-internet ping prober bound to the new
+	// samizdat client. startPingProber stops any prior prober first;
+	// in-flight HTTP probes against the closed `old` client just fail
+	// naturally and don't crash.
+	startPingProber(client)
 	rt.appendLog(fmt.Sprintf("info: dial mode = samizdat → %s:%d (sni=%s)", cfg.ServerHost, cfg.ServerPort, cfg.SNI))
 
 	// Warm-up dial: kick off the uTLS+H2 handshake in the background so

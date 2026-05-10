@@ -76,11 +76,13 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                // IPA-Z: shape + RTT lamp. Same single-line format the
-                // Windows GUI shows ("○ bulk • RTT 17ms"). Hidden while
-                // tunnel is offline — TamizdatStatusStore returns
-                // "— offline —" but we just suppress the line entirely
-                // for less visual noise on the main screen.
+                // IPA-D21: real-internet ping status (was bulk/lite RTT
+                // lamp in IPA-Z; bulk/lite was dead after D18 disabled
+                // cover traffic + the realtime detector). Format:
+                //   "Ping 42ms"     — healthy
+                //   "Ping failed"   — 2+ consecutive probe misses
+                //   "Ping —"        — connected but no successful probe yet
+                // Hidden while tunnel is offline.
                 if bridge.state == .connected && !lampStore.realShape.isEmpty {
                     Text(lampStore.lampLabel)
                         .font(.footnote.monospaced())
@@ -226,30 +228,47 @@ struct ContentView: View {
 
     // MARK: – derived
 
+    // IPA-D21: derived "failed" state — connected to the VPN but the
+    // real-internet ping prober reports 2+ consecutive misses. Sits
+    // between .connected (green) and .error (red): tunnel is up but
+    // can't reach the open internet.
+    private var isProxyUnreachable: Bool {
+        bridge.state == .connected && lampStore.snapshot.pingFailed
+    }
+
     private var stateIcon: String {
+        if isProxyUnreachable {
+            return "exclamationmark.shield"
+        }
         switch bridge.state {
-        case .disconnected: "shield.slash"
-        case .connecting:   "shield.lefthalf.filled"
-        case .connected:    "shield.lefthalf.filled.badge.checkmark"
-        case .error:        "exclamationmark.shield.fill"
+        case .disconnected: return "shield.slash"
+        case .connecting:   return "shield.lefthalf.filled"
+        case .connected:    return "shield.lefthalf.filled.badge.checkmark"
+        case .error:        return "exclamationmark.shield.fill"
         }
     }
 
     private var stateColor: Color {
+        if isProxyUnreachable {
+            return .yellow
+        }
         switch bridge.state {
-        case .disconnected: .secondary
-        case .connecting:   .yellow
-        case .connected:    .green
-        case .error:        .red
+        case .disconnected: return .secondary
+        case .connecting:   return .yellow
+        case .connected:    return .green
+        case .error:        return .red
         }
     }
 
     private var stateTitle: String {
+        if isProxyUnreachable {
+            return "Proxy unreachable"
+        }
         switch bridge.state {
-        case .disconnected: "Disconnected"
-        case .connecting:   "Connecting…"
-        case .connected:    "Connected"
-        case .error:        "Error"
+        case .disconnected: return "Disconnected"
+        case .connecting:   return "Connecting…"
+        case .connected:    return "Connected"
+        case .error:        return "Error"
         }
     }
 
@@ -270,7 +289,7 @@ struct ContentView: View {
     /// Bump this when promoting a new milestone IPA so testers can tell
     /// at a glance which build is on the device. Source of truth:
     /// `ipa/milestones/<TAG>-...` directory name.
-    private static let milestoneTag = "D20"
+    private static let milestoneTag = "D21"
 
     /// "IPA-Z6 · v0.2.42-fab1f9e (build 42)" — milestone tag is
     /// hardcoded above; rest is pulled from Info.plist, which the CI

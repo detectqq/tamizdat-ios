@@ -29,23 +29,80 @@ import SwiftUI
 /// Wire shape of the status RPC. Encoded as JSON on the extension
 /// side, decoded on the main-app side. Field names must stay in sync
 /// with the encoder in PacketTunnelProvider.swift.
+///
+/// IPA-D21: ping* fields added. Legacy realShape/lockedFlows/liteAlive/
+/// rttLiteMs/rttBulkMs are kept in the wire format (no harm; extension
+/// still emits them) but no longer drive UI rendering — the lamp now
+/// reads pingMs / pingFailed instead. Future cleanup commit will drop
+/// the dead fields once v0.2.D21 has rolled out and no skewed clients
+/// remain.
 struct TamizdatStatusSnapshot: Codable, Equatable {
     /// Ground-truth wire-shape: "ShapeFull" / "ShapeLite" / "" (offline).
+    /// IPA-D21: still used as the offline-detect flag (empty string =
+    /// extension disconnected / no client).
     let realShape: String
-    /// RTP-stickylocked realtime flow count (proven realtime).
+    /// RTP-stickylocked realtime flow count (proven realtime). LEGACY.
     let lockedFlows: Int
     /// V2/V3 only — dedicated lite-class transport up (1) or not (0).
-    /// Always 0 on V1.
+    /// Always 0 on V1. LEGACY.
     let liteAlive: Int
-    /// p50 RTT in ms during ShapeLite samples; -1 if none.
+    /// p50 RTT in ms during ShapeLite samples; -1 if none. LEGACY.
     let rttLiteMs: Int
-    /// p50 RTT in ms during ShapeFull samples; -1 if none.
+    /// p50 RTT in ms during ShapeFull samples; -1 if none. LEGACY.
     let rttBulkMs: Int
+
+    /// IPA-D21: last successful real-internet ping latency, in ms.
+    /// -1 if no successful probe yet.
+    let pingMs: Int
+    /// IPA-D21: most recent probe succeeded.
+    let pingOK: Bool
+    /// IPA-D21: 2+ consecutive probe failures — triggers the yellow
+    /// "Proxy unreachable" shield on the main screen.
+    let pingFailed: Bool
+    /// IPA-D21: echo-back of the currently-configured probe URL
+    /// (debugging aid; not rendered on the main screen).
+    let pingURL: String
 
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
-        rttLiteMs: -1, rttBulkMs: -1
+        rttLiteMs: -1, rttBulkMs: -1,
+        pingMs: -1, pingOK: false, pingFailed: false, pingURL: ""
     )
+
+    // IPA-D21: tolerate older extension JSON (pre-D21 lacks ping*
+    // fields). Once everyone's on D21+ this can be removed in the same
+    // cleanup commit that drops the legacy RTT fields.
+    private enum CodingKeys: String, CodingKey {
+        case realShape, lockedFlows, liteAlive, rttLiteMs, rttBulkMs
+        case pingMs, pingOK, pingFailed, pingURL
+    }
+
+    init(realShape: String, lockedFlows: Int, liteAlive: Int,
+         rttLiteMs: Int, rttBulkMs: Int,
+         pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String) {
+        self.realShape = realShape
+        self.lockedFlows = lockedFlows
+        self.liteAlive = liteAlive
+        self.rttLiteMs = rttLiteMs
+        self.rttBulkMs = rttBulkMs
+        self.pingMs = pingMs
+        self.pingOK = pingOK
+        self.pingFailed = pingFailed
+        self.pingURL = pingURL
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.realShape   = (try? c.decode(String.self, forKey: .realShape))   ?? ""
+        self.lockedFlows = (try? c.decode(Int.self,    forKey: .lockedFlows)) ?? 0
+        self.liteAlive   = (try? c.decode(Int.self,    forKey: .liteAlive))   ?? 0
+        self.rttLiteMs   = (try? c.decode(Int.self,    forKey: .rttLiteMs))   ?? -1
+        self.rttBulkMs   = (try? c.decode(Int.self,    forKey: .rttBulkMs))   ?? -1
+        self.pingMs      = (try? c.decode(Int.self,    forKey: .pingMs))      ?? -1
+        self.pingOK      = (try? c.decode(Bool.self,   forKey: .pingOK))      ?? false
+        self.pingFailed  = (try? c.decode(Bool.self,   forKey: .pingFailed))  ?? false
+        self.pingURL     = (try? c.decode(String.self, forKey: .pingURL))     ?? ""
+    }
 }
 
 @MainActor
@@ -64,30 +121,30 @@ final class TamizdatStatusStore: ObservableObject {
     /// `lampStore.realShape.isEmpty` without reaching into snapshot.
     var realShape: String { snapshot.realShape }
 
-    /// True when realtime-shape is active on the wire. Variant-
-    /// agnostic; matches the Win-GUI single-OR rule.
-    var isLit: Bool {
-        let s = snapshot
-        let isLite = (s.realShape == "ShapeLite" || s.realShape == "lite")
-        let hasLockedOnLite = s.liteAlive > 0 && s.lockedFlows > 0
-        return isLite || hasLockedOnLite
-    }
+    /// IPA-D21: true when the most-recent two ping probes failed. Drives
+    /// the yellow "Proxy unreachable" shield on the main screen.
+    var pingHealthy: Bool { !snapshot.pingFailed }
 
-    /// Compose the same single-line label the Windows GUI shows:
+    /// IPA-D21: single-line status under the shield.
     ///
-    ///   "● lite • RTT 17ms"
-    ///   "○ bulk • RTT 23ms"
-    ///   "○ bulk • RTT —"
-    ///   "— offline —"           (extension not connected / no client)
+    ///   "Ping 42ms"     — healthy, last probe ok
+    ///   "Ping failed"   — 2+ consecutive misses (shield flips yellow)
+    ///   "Ping —"        — connected, prober ran but no successful sample yet
+    ///   "— offline —"   — extension not connected / no client
+    ///
+    /// (Replaces the bulk/lite shape lamp from IPA-Z, which was dead
+    /// after D18 disabled cover traffic + the realtime detector.)
     var lampLabel: String {
         if snapshot.realShape.isEmpty {
             return "— offline —"
         }
-        let dot = isLit ? "●" : "○"
-        let modeText = isLit ? "lite" : "bulk"
-        let rttMs: Int = isLit ? snapshot.rttLiteMs : snapshot.rttBulkMs
-        let rttPart = rttMs >= 0 ? " • RTT \(rttMs)ms" : " • RTT —"
-        return "\(dot) \(modeText)\(rttPart)"
+        if snapshot.pingFailed {
+            return "Ping failed"
+        }
+        if snapshot.pingMs >= 0 {
+            return "Ping \(snapshot.pingMs)ms"
+        }
+        return "Ping —"
     }
 
     /// Begin polling. Idempotent. Safe from .onAppear.

@@ -173,6 +173,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // any realtime flow (cover/fragmentation suspended for that
         // window only), so no static kill switch is needed.
         SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
+        // IPA-D21: push the configured real-internet ping probe URL into
+        // Go-side before the first client is built, so the prober's first
+        // tick fires against the user's chosen target. App-side updates
+        // (via SettingsView) are pushed live through the
+        // "refreshPingURL" provider message handled below.
+        SocksstubSetPingProbeURL(PingURLPreferences.url)
         // Phase C iOS-notify (2026-05-10): register the bridge BEFORE the
         // first samizdat client is built. The first bundle fetch happens
         // immediately after SetSamizdatConfig, so a user who is already
@@ -434,18 +440,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetPoolVariant(variant)
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
+        case "refreshPingURL":
+            // IPA-D21: SettingsView's ping-probe URL field changed in the
+            // main app. Re-read from App Group UserDefaults and push into
+            // Go-side. Prober picks it up on the next tick — no need to
+            // rebuild the samizdat client.
+            let url = PingURLPreferences.url
+            appendExtLog("info: app requested ping URL refresh → \(url)")
+            SocksstubSetPingProbeURL(url)
+            completionHandler?("pingURLRefreshed".data(using: .utf8))
         case "status":
-            // IPA-Z: main-screen lamp polls this every 500 ms. Snapshot
-            // is built from in-process Socksstub*() getters which read
-            // tamizdat.Client atomic counters — no locks, no I/O.
-            // Field names must stay in sync with TamizdatStatusSnapshot
-            // in TamizdatStatusStore.swift.
+            // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
+            // Snapshot is built from in-process Socksstub*() getters which
+            // read tamizdat.Client + ping-prober atomic state — no locks,
+            // no I/O. Field names must stay in sync with
+            // TamizdatStatusSnapshot in TamizdatStatusStore.swift.
+            //
+            // D21: rttBulk/rttLite/liteAlive/lockedFlows kept in the JSON
+            // (no harm) but no longer read on the Swift side — the lamp
+            // now uses the ping snapshot fields. Old fields will be
+            // dropped in a future cleanup commit once the v0.2.D21 IPA is
+            // rolled out and no skewed clients remain in the wild.
+            let pingSnap = SocksstubPingProbeSnapshot()
             let payload: [String: Any] = [
                 "realShape":   SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
                 "liteAlive":   Int(SocksstubLiteAlive()),
                 "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),
                 "rttBulkMs":   Int(SocksstubRTTBulkP50Ms()),
+                // IPA-D21 ping-prober fields.
+                "pingMs":      Int(pingSnap?.lastMs ?? -1),
+                "pingOK":      pingSnap?.ok ?? false,
+                "pingFailed":  pingSnap?.failed ?? false,
+                "pingURL":     pingSnap?.url ?? "",
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

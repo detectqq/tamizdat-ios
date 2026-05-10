@@ -126,6 +126,15 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshSamizdatClient")
     }
 
+    /// IPA-D21: poke the extension to re-read PingURLPreferences.url
+    /// from App Group UserDefaults and push it into the Go-side ping
+    /// prober (SocksstubSetPingProbeURL). Lightweight — does not
+    /// rebuild the samizdat client; the prober picks up the new URL
+    /// on its next 10 s tick.
+    func refreshPingURL() async {
+        _ = try? await sendProviderMessage("refreshPingURL")
+    }
+
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.
     /// Returns `.offline` on any failure (extension not running, RPC

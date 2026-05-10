@@ -93,6 +93,11 @@ targets:
       # extension. Extension encodes after a server callback, app
       # decodes and binds to a SwiftUI alert.
       - path: samizdat-ios/NotificationPayload.swift
+      # IPA-D21: PingURLPreferences shared so the extension can read
+      # the user-set ping probe URL from App Group UserDefaults at
+      # startTunnel and on the live "refreshPingURL" provider
+      # message. Default points at gstatic.com/generate_204.
+      - path: samizdat-ios/PingURLPreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

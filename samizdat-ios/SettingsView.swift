@@ -12,6 +12,12 @@ struct SettingsView: View {
 
     @State private var poolVariant: PoolVariant = PoolVariantPreferences.current
 
+    // IPA-D21: user-configurable target for the real-internet ping
+    // prober. Bound to a TextField; persisted to App Group UserDefaults
+    // on commit. A live "refreshPingURL" provider message wakes the
+    // extension to pick up the new value without disconnect.
+    @State private var pingURL: String = PingURLPreferences.url
+
     @State private var showConfig = false
     @State private var showTelegram = false
 
@@ -103,6 +109,41 @@ struct SettingsView: View {
                     Text("How many simultaneous TCP/443 connections the client opens to the server. V1 = one (stealth, slow), V2 = up to two (balanced), V3 = adaptive 2..4 (fastest, taller TLS fingerprint per ISP). V1 also engages strict-single-H2 mode. Plan B+ realtime auto-shape (voice / games stay on the lite transport) runs identically across all three.")
                 }
 
+                // ── Ping probe ───────────────────────────────────────────
+                // IPA-D21: target URL for the real-internet ping prober.
+                // Every 10 s the Go side opens an HTTP HEAD via the
+                // samizdat tunnel; the latency feeds the shield status.
+                // 2+ consecutive misses → "Proxy unreachable" yellow shield.
+                Section {
+                    Label {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Ping probe URL")
+                            TextField("https://example.com/probe", text: $pingURL)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .keyboardType(.URL)
+                                .font(.callout.monospaced())
+                                .onSubmit { savePingURL() }
+                        }
+                    } icon: {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                    }
+                    HStack {
+                        Button("Save") { savePingURL() }
+                            .buttonStyle(.borderedProminent)
+                        Spacer()
+                        Button("Reset to default") {
+                            pingURL = PingURLPreferences.defaultURL
+                            savePingURL()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                } header: {
+                    Text("Ping probe")
+                } footer: {
+                    Text("Every 10 seconds the client opens an HTTP HEAD request through the tunnel to this URL. Latency appears under the shield as “Ping XXms”. Two consecutive failures flip the shield to yellow (“Proxy unreachable”). Default: http://www.gstatic.com/generate_204 (Google connectivity probe — 204 No Content). Use cp.cloudflare.com/generate_204 for a Cloudflare alternative.")
+                }
+
                 // ── Diagnostics ──────────────────────────────────────────
                 Section {
                     Button {
@@ -184,5 +225,21 @@ struct SettingsView: View {
     private func openSystemSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
+    }
+
+    /// IPA-D21: persist the typed ping URL and poke the extension to
+    /// pick it up live. Trims whitespace; an empty string falls back to
+    /// the default in PingURLPreferences. Sending the provider message
+    /// is a no-op when the tunnel is not running — next startTunnel
+    /// will read the new value from App Group UserDefaults itself.
+    private func savePingURL() {
+        let trimmed = pingURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        PingURLPreferences.url = trimmed
+        // Re-read so the field reflects what's actually stored (e.g.
+        // empty -> default URL).
+        pingURL = PingURLPreferences.url
+        Task {
+            await VPNProfileStore.shared.refreshPingURL()
+        }
     }
 }
