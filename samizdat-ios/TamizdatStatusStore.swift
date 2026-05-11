@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import SamizdatClient   // IPA-D25 fix7: for SocksstubNoteForegroundPoll()
 
 /// IPA-Z: live tunnel-shape + RTT view-model for the main-screen lamp.
 ///
