@@ -38,6 +38,17 @@ struct ContentView: View {
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
+    /// IPA-D25 fix6: optimistic "we just asked for a switch" flag.
+    /// Set immediately when the user taps the manual segment or flips
+    /// the auto toggle, so the shield flips to amber "Reconnecting…"
+    /// without waiting for the 500 ms status-poll cycle to pick up the
+    /// extension's isRewiring flag. Auto-clears after 3 s (long enough
+    /// for the real rewire to complete on most networks; the status
+    /// poll then takes over). Operator: "должен быть моментальный
+    /// рестарт".
+    @State private var pendingSwitch: Bool = false
+    @State private var pendingSwitchClearTask: Task<Void, Never>?
+
     private static func checkBackupConfigured() -> Bool {
         guard let blob = ConfigStore.shared.load() else { return false }
         return SamizdatURLCodec.split(blob).backup != nil
@@ -109,6 +120,9 @@ struct ContentView: View {
         case .connecting:
             return .connecting
         case .connected:
+            // Optimistic flip first — gives instant feedback on a tap
+            // while the extension's rewire is still in-flight.
+            if pendingSwitch { return .reconnecting }
             if lampStore.isReconnecting { return .reconnecting }
             if lampStore.snapshot.pingFailed { return .failed }
             return .connected
@@ -136,11 +150,13 @@ struct ContentView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 4)
 
-                if hasBackupConfigured {
-                    autoDetectRow
-                        .padding(.horizontal, 16)
-                        .padding(.top, 12)
-                }
+                // IPA-D25 fix5: row is always visible. The picker
+                // inside the row is gated on hasBackupConfigured —
+                // when no Whitelist endpoint configured, we show a
+                // hint instead of hiding the entire control.
+                autoDetectRow
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
 
                 connectButton
                     .padding(.horizontal, 16)
@@ -365,6 +381,7 @@ struct ContentView: View {
                             .labelsHidden()
                             .tint(theme.mint)
                             .onChange(of: isAutoMode) { _, newAuto in
+                                noteSwitchPending()
                                 let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
                                 Task {
                                     await VPNProfileStore.shared.switchEndpoint(to: newMode)
@@ -426,8 +443,26 @@ struct ContentView: View {
     private func selectManual(_ ep: EndpointMode) {
         guard !isAutoMode else { return }
         manualEndpoint = ep
+        noteSwitchPending()
         Task {
             await VPNProfileStore.shared.switchEndpoint(to: ep)
+        }
+    }
+
+    /// IPA-D25 fix6: flip the optimistic "reconnecting" flag instantly
+    /// so the shield turns amber the moment the user taps. The flag
+    /// auto-clears after 3 s — by then the extension's isRewiring
+    /// has propagated via the 500 ms status poll, so `homeState`
+    /// keeps showing `.reconnecting` from the real signal until the
+    /// new client finishes warming.
+    private func noteSwitchPending() {
+        pendingSwitchClearTask?.cancel()
+        pendingSwitch = true
+        pendingSwitchClearTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            if !Task.isCancelled {
+                pendingSwitch = false
+            }
         }
     }
 
