@@ -33,6 +33,10 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
 
+    // IPA-D23: whitelist-detection probe targets.
+    @State private var testHostDraft: String = WhitelistProbePreferences.testHost
+    @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
+
     @State private var showEndpoints = false
     @State private var showLogs = false
     @State private var showTelegram = false
@@ -82,6 +86,12 @@ struct SettingsView: View {
                         SectionLabel(text: "Ping probe")
                             .padding(.top, 22)
                         pingProbeCard
+                            .padding(.horizontal, 16)
+
+                        // ── Whitelist detection ──────────────────
+                        SectionLabel(text: "Whitelist detection")
+                            .padding(.top, 22)
+                        whitelistProbeCard
                             .padding(.horizontal, 16)
 
                         // ── Appearance ───────────────────────────
@@ -240,6 +250,83 @@ struct SettingsView: View {
         }
     }
 
+    private var whitelistProbeCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "shield.lefthalf.filled",
+                             bg: theme.amberDim, fg: theme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Probe targets")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("ICMP ping every 30 s outside the tunnel")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                Text("Test host")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("8.8.8.8", text: $testHostDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveWhitelistProbes() }
+
+                Text("Whitelist host")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("77.88.8.8", text: $whitelistHostDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveWhitelistProbes() }
+
+                HStack(spacing: 8) {
+                    Button(action: saveWhitelistProbes) {
+                        Text("Save")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: resetWhitelistProbes) {
+                        Text("Reset")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Text("Apply requires reconnect to refresh routing.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
     private var appearanceCard: some View {
         CardContainer(padding: 16) {
             HStack(spacing: 12) {
@@ -360,7 +447,7 @@ struct SettingsView: View {
         let info = Bundle.main.infoDictionary
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(marketing) (\(build)) · IPA-D22"
+        return "\(marketing) (\(build)) · IPA-D23"
     }
 
     private var configSubtitle: String {
@@ -390,6 +477,22 @@ struct SettingsView: View {
         pingURL = PingURLPreferences.url
         pingURLDraft = pingURL
         Task { await VPNProfileStore.shared.refreshPingURL() }
+    }
+
+    private func saveWhitelistProbes() {
+        WhitelistProbePreferences.testHost = testHostDraft
+        WhitelistProbePreferences.whitelistHost = whitelistHostDraft
+        // Re-sync drafts so blank-saves snap back to the resolved default.
+        testHostDraft = WhitelistProbePreferences.testHost
+        whitelistHostDraft = WhitelistProbePreferences.whitelistHost
+        Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
+    }
+
+    private func resetWhitelistProbes() {
+        WhitelistProbePreferences.reset()
+        testHostDraft = WhitelistProbePreferences.testHost
+        whitelistHostDraft = WhitelistProbePreferences.whitelistHost
+        Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
     }
 
     private func handleEnableNotifications() async {

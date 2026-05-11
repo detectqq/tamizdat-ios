@@ -477,6 +477,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested ping URL refresh → \(url)")
             SocksstubSetPingProbeURL(url)
             completionHandler?("pingURLRefreshed".data(using: .utf8))
+        case "refreshWhitelistProbes":
+            // IPA-D23: SettingsView's whitelist probe targets changed.
+            // Re-read prefs and tell the detector to adopt them. The
+            // excludedRoutes change requires a tunnel reconnect to take
+            // effect (we don't currently rebuild network settings live);
+            // the UI shows a disclaimer about that.
+            appendExtLog("info: app requested whitelist probes refresh → testHost=\(WhitelistProbePreferences.testHost) whitelistHost=\(WhitelistProbePreferences.whitelistHost)")
+            whitelistDetector?.applyConfig()
+            completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which
@@ -690,6 +699,53 @@ misc:
         return best >= 0 ? best : nil
     }
 
+    /// IPA-D23: turn a user-entered probe target ("8.8.8.8" or "google.com")
+    /// into an IPv4 literal suitable for an NEIPv4Route /32 exclusion.
+    /// IP literals pass through unchanged. Hostnames are resolved via the
+    /// system resolver with a 2 s budget; failure returns nil and the
+    /// caller skips the route (the detector will then surface that probe
+    /// as a failure until the tunnel reconnects). IPv6 literals also
+    /// return nil — we don't currently expose IPv6 excludedRoutes (the
+    /// tunnel is v4-only by Phase 2.5 design).
+    private static func resolveProbeTargetIPv4(_ target: String, log: (String) -> Void) -> String? {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        // Already an IPv4 literal?
+        var v4 = in_addr()
+        if inet_pton(AF_INET, trimmed, &v4) == 1 {
+            return trimmed
+        }
+        // IPv6 literal — explicitly skip (v4-only tunnel, no v6 routes).
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, trimmed, &v6) == 1 {
+            log("info: probe target \(trimmed) is IPv6 literal — skipping v4 exclusion")
+            return nil
+        }
+        // Hostname — synchronous resolve with 2 s budget.
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        let sem = DispatchSemaphore(value: 0)
+        var found: String?
+        DispatchQueue.global(qos: .utility).async {
+            var res: UnsafeMutablePointer<addrinfo>?
+            defer { if let res = res { freeaddrinfo(res) } }
+            if getaddrinfo(trimmed, nil, &hints, &res) != 0 {
+                sem.signal(); return
+            }
+            if let head = res {
+                var addr = head.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    found = String(cString: buf)
+                }
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 2.0)
+        return found
+    }
+
     /// Best-effort TCP probe to see if the main app's SOCKS5 listener is up
     /// before we hand packets to hev. Avoids a 60-second hev timeout for
     /// each early flow when the app isn't running.
@@ -744,17 +800,35 @@ misc:
         // Critically: exclude 127.0.0.1/8 from the tunnel so hev's SOCKS5
         // dial to the main app's listener does NOT loop back through us.
         // (iOS may special-case loopback here but explicit is safer.)
-        ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
+        var excluded: [NEIPv4Route] = (ipv4.excludedRoutes ?? []) + [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
-            // IPA-Q: WhitelistDetector probe targets must reach the
-            // underlying interface, not loop through our own utun.
-            // 1.1.1.1 + 8.8.8.8 are the global "is internet up" canaries;
-            // 77.88.8.0/24 covers all Yandex DNS variants used as the
-            // RU-whitelisted canary.
-            NEIPv4Route(destinationAddress: "1.1.1.1", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "8.8.8.8", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "77.88.8.0", subnetMask: "255.255.255.0"),
         ]
+        // IPA-D23: dynamic WhitelistDetector probe-target exclusions.
+        // Pull the two configured hosts (testHost + whitelistHost) from
+        // App Group UserDefaults. If a value is an IPv4 literal, add it
+        // as /32. If it's a hostname, resolve once now (synchronous, 2 s
+        // budget). On resolution failure, skip — the detector will
+        // simply report fail on that probe until the user reconnects
+        // with a working value.
+        let probeTargets = [
+            WhitelistProbePreferences.testHost,
+            WhitelistProbePreferences.whitelistHost,
+        ]
+        var addedProbeIPs = Set<String>()
+        for target in probeTargets {
+            guard let ip = Self.resolveProbeTargetIPv4(target, log: appendExtLog) else {
+                appendExtLog("warn: probe target \(target) — could not resolve to IPv4, route skipped")
+                continue
+            }
+            if addedProbeIPs.contains(ip) {
+                appendExtLog("info: probe target \(target) → \(ip) already excluded (deduped)")
+                continue
+            }
+            addedProbeIPs.insert(ip)
+            appendExtLog("info: probe target \(target) → excludedRoute \(ip)/32")
+            excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
+        }
+        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 
         // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.

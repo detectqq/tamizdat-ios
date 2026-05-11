@@ -135,6 +135,17 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshPingURL")
     }
 
+    /// IPA-D23: poke the extension to re-read the two
+    /// WhitelistProbePreferences (testHost + whitelistHost) and
+    /// rebuild the WhitelistDetector's probe targets. Detector picks
+    /// them up on the next cycle (≤30 s). NOTE: the excludedRoutes
+    /// in NEPacketTunnelNetworkSettings are NOT updated live by this
+    /// call — those changes require a tunnel reconnect. The UI shows
+    /// a disclaimer about that.
+    func refreshWhitelistProbes() async {
+        _ = try? await sendProviderMessage("refreshWhitelistProbes")
+    }
+
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.
     /// Returns `.offline` on any failure (extension not running, RPC

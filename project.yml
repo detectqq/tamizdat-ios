@@ -96,6 +96,12 @@ targets:
       # startTunnel and on the live "refreshPingURL" provider
       # message. Default points at gstatic.com/generate_204.
       - path: samizdat-ios/PingURLPreferences.swift
+      # IPA-D23: WhitelistProbePreferences shared so the extension can
+      # read the user-configured testHost + whitelistHost values for
+      # the new ICMP-based WhitelistDetector. App Group UserDefaults
+      # source of truth; live updates land via the
+      # "refreshWhitelistProbes" provider message.
+      - path: samizdat-ios/WhitelistProbePreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true
