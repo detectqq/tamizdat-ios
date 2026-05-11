@@ -62,14 +62,40 @@ final class ExitIPStore: ObservableObject {
     }
 
     private func fetchOnce(viaTunnel: Bool) async {
+        // IPA-D25 fix4: per-fetch ephemeral URLSession.
+        //
+        // URLSession.shared keeps a long-lived TCP connection pool. When
+        // the user toggles VPN, iOS does NOT invalidate already-open
+        // sockets — they keep using the physical interface they were
+        // opened on. Result: bridge.state flips to .connected, ping
+        // prober (extension/Go side, dials via samizdat.Client) reports
+        // success through tunnel, but URLSession.shared reuses an old
+        // socket from BEFORE connect → ExitIP probe goes through
+        // physical Wi-Fi → returns LTE/router IP for many minutes.
+        //
+        // Operator: "пару минут висел с роутерным/lte айпи, показывал
+        // пинг, показывал коннектед". Ephemeral config + invalidate
+        // after each fetch forces a fresh socket every probe, so the
+        // socket honors whatever the system default route is RIGHT NOW.
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 5
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpShouldUsePipelining = false
+        config.httpMaximumConnectionsPerHost = 1
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
         for urlStr in Self.probeURLs {
             guard let url = URL(string: urlStr) else { continue }
             var req = URLRequest(url: url, timeoutInterval: 5)
             req.httpMethod = "GET"
             req.cachePolicy = .reloadIgnoringLocalCacheData
             req.setValue("tamizdat-ios/exitip", forHTTPHeaderField: "User-Agent")
+            req.setValue("close", forHTTPHeaderField: "Connection")
             do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await session.data(for: req)
                 guard let http = resp as? HTTPURLResponse,
                       http.statusCode == 200 else { continue }
                 let text = String(data: data, encoding: .utf8)?
