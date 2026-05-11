@@ -17,10 +17,15 @@ final class ExitIPStore: ObservableObject {
 
     private var task: Task<Void, Never>?
     private static let refreshInterval: TimeInterval = 60
+    // IPA-D24 fix: IPv4-only subdomains so the chip never overflows
+    // with a long IPv6 address. iOS prefers IPv6 by default when the
+    // network has it (most modern Wi-Fi), which made the displayed IP
+    // unreadable. ipify/icanhazip/ifconfig.me all provide v4-only
+    // forks at these hostnames.
     private static let probeURLs = [
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-        "https://ifconfig.me/ip"
+        "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com",
+        "https://ipv4.ifconfig.me/ip"
     ]
 
     func start(isConnected: Bool) {
