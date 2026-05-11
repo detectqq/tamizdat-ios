@@ -44,7 +44,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D24"
+    private static let milestoneTag = "D25"
 
     // MARK: – Derived state
 
@@ -274,8 +274,7 @@ struct ContentView: View {
 
                 if homeState.showsPingChip {
                     PingChip(
-                        pingMs: lampStore.snapshot.pingMs >= 0 ? lampStore.snapshot.pingMs : nil,
-                        dataRateText: lampStore.dataRateText == "—" ? nil : lampStore.dataRateText
+                        pingMs: lampStore.snapshot.pingMs >= 0 ? lampStore.snapshot.pingMs : nil
                     )
                 }
 

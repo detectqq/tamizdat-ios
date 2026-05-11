@@ -149,13 +149,12 @@ final class TamizdatStatusStore: ObservableObject {
     /// only swaps the upstream endpoint, the tunnel itself stays up.
     @Published private(set) var tunnelStartedAt: Date?
 
-    /// IPA-D22: exponential-moving average of the data rate
-    /// (KB/s) — smoothed so the ping chip readout doesn't flicker.
-    @Published private(set) var smoothedRateKBps: Double = 0
-
-    private var lastRxBytes: Int64 = 0
-    private var lastTxBytes: Int64 = 0
-    private var lastSampleAt: Date?
+    // IPA-D25: removed `smoothedRateKBps` + `dataRateText` (and the
+    // per-sample EMA bookkeeping that fed them). The ping chip no
+    // longer renders a bandwidth indicator — operator wanted it gone
+    // from the code, not just the UI. Total bytes since connect
+    // remain on the Data stat tile via `rxBytes` / `txBytes` /
+    // `dataText`.
 
     private var timer: Timer?
 
@@ -252,42 +251,14 @@ final class TamizdatStatusStore: ObservableObject {
             if tunnelStartedAt != nil { tunnelStartedAt = nil }
         }
 
-        // Cumulative bytes — straight pass-through.
+        // Cumulative bytes — straight pass-through. Feeds the Data
+        // stat tile via `dataText`.
         if rxBytes != snap.rxBytes { rxBytes = snap.rxBytes }
         if txBytes != snap.txBytes { txBytes = snap.txBytes }
-
-        // Data rate — EMA on (rx+tx) delta over wall-clock delta.
-        if online {
-            if let last = lastSampleAt {
-                let dt = now.timeIntervalSince(last)
-                if dt >= 0.2 {
-                    let dRx = max(0, snap.rxBytes - lastRxBytes)
-                    let dTx = max(0, snap.txBytes - lastTxBytes)
-                    let bytesPerSec = Double(dRx + dTx) / dt
-                    let kbps = bytesPerSec / 1024.0
-                    // Alpha 0.30: balances responsiveness vs flicker.
-                    let alpha = 0.30
-                    let next = (smoothedRateKBps * (1 - alpha)) + (kbps * alpha)
-                    // Only republish on a meaningful change (>= 5%).
-                    if abs(next - smoothedRateKBps) >= max(2.0, smoothedRateKBps * 0.05) {
-                        smoothedRateKBps = next
-                    }
-                    lastSampleAt = now
-                    lastRxBytes = snap.rxBytes
-                    lastTxBytes = snap.txBytes
-                }
-            } else {
-                lastSampleAt = now
-                lastRxBytes = snap.rxBytes
-                lastTxBytes = snap.txBytes
-                if smoothedRateKBps != 0 { smoothedRateKBps = 0 }
-            }
-        } else {
-            if smoothedRateKBps != 0 { smoothedRateKBps = 0 }
-            lastSampleAt = nil
-            lastRxBytes = 0
-            lastTxBytes = 0
-        }
+        // IPA-D25: per-sample rate computation removed with the
+        // bandwidth chip; `now` is no longer used here, but kept on
+        // the signature for the uptime block above.
+        _ = now
     }
 
     // MARK: – Formatted strings (IPA-D22)

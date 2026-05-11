@@ -199,13 +199,13 @@ struct CodeBlock<Content: View>: View {
 // MARK: – Ping chip (mint pill under the hero status label)
 
 /// Mint pill rendered under the status label when connected. Format:
-///   • Ping NN ms · ↓ X.X MB/s
-/// Falls back gracefully when no ping sample yet (renders `Ping —`) or
-/// no data sample yet (drops the rate segment).
+///   • Ping NN ms
+/// IPA-D25: removed the bandwidth indicator (`· ↓ X KB/s`) per operator.
+/// The Data stat tile (total bytes since connect) is the surface for
+/// data accounting now — rate readout retired entirely.
 struct PingChip: View {
     @Environment(\.themeTokens) private var theme
     let pingMs: Int?
-    let dataRateText: String?  // e.g. "1.2 MB/s" or "850 KB/s"; nil = hide
 
     var body: some View {
         HStack(spacing: 8) {
@@ -218,14 +218,6 @@ struct PingChip: View {
             Text(pingDisplay)
                 .font(.geistMono(.semibold, size: 12.5))
                 .foregroundStyle(theme.text.opacity(theme.isDark ? 0.95 : 0.85))
-            if let rate = dataRateText, !rate.isEmpty {
-                Text("·")
-                    .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(theme.mint.opacity(0.5))
-                Text("↓ \(rate)")
-                    .font(.geistMono(.semibold, size: 12.5))
-                    .foregroundStyle(theme.mint)
-            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

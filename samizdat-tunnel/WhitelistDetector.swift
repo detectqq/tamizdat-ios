@@ -47,6 +47,10 @@ final class WhitelistDetector {
     private let queue = DispatchQueue(label: "com.anarki.samizdat-test.detector", qos: .utility)
     private var timer: DispatchSourceTimer?
     private var activePingers: [ICMPPinger] = []
+    // IPA-D25: TCP-fallback connections held during in-flight probe
+    // so we can cancel them on stop().
+    private var activeTCPConns: [NWConnection] = []
+    private static let tcpFallbackTimeout: TimeInterval = 3
 
     // Targets (re-read on applyConfig). Stored on the detector's queue.
     private var testHost: String = WhitelistProbePreferences.defaultTestHost
@@ -83,6 +87,8 @@ final class WhitelistDetector {
             self.timer?.cancel(); self.timer = nil
             for p in self.activePingers { p.cancel() }
             self.activePingers.removeAll()
+            for c in self.activeTCPConns { c.cancel() }
+            self.activeTCPConns.removeAll()
             WhitelistStatusStore.current = .unknown
             self.log("info: WhitelistDetector stopped")
         }
@@ -121,6 +127,20 @@ final class WhitelistDetector {
                     WhitelistStatusStore.current = .noNetwork
                     self.log("info: detector paused (path unsatisfied)")
                 } else {
+                    // IPA-D25 BUG FIX: when path recovers, transition
+                    // status to `.unknown` ("Monitoring…") so the UI
+                    // doesn't stay stuck on stale "Paused — no network"
+                    // for the 30 s until the next probe cycle completes.
+                    //
+                    // Root cause we hit on D24: NEPacketTunnelProvider
+                    // sees a brief NWPath.unsatisfied window while the
+                    // tunnel routes are being plumbed at startTunnel
+                    // (this writes .noNetwork), then immediately a
+                    // .satisfied event when settings install completes.
+                    // The recovery branch used to ONLY log and not reset
+                    // the store → UI stayed on noNetwork for ~30 s while
+                    // tunnel was already fully functional.
+                    WhitelistStatusStore.current = .unknown
                     self.log("info: detector resumed (path satisfied)")
                 }
             }
@@ -161,12 +181,34 @@ final class WhitelistDetector {
 
         parallelProbe { [weak self] testOK, whitelistOK in
             guard let self else { return }
+            // IPA-D25: if BOTH ICMP probes failed, try a TCP-connect
+            // fallback to port 443 against the same two targets via
+            // the same physical-interface pinning. Russian ISPs,
+            // corporate Wi-Fi, hotel/cafe networks commonly block
+            // ICMP echo replies — TCP 443 is the universally-
+            // permitted outbound port. If TCP also fails, the
+            // network is genuinely unreachable.
+            if !testOK && !whitelistOK {
+                self.tcpFallbackProbe { [weak self] tcpTestOK, tcpWhitelistOK in
+                    guard let self else { return }
+                    let outcome: Outcome
+                    switch (tcpTestOK, tcpWhitelistOK) {
+                    case (true,  true):  outcome = .clearAll
+                    case (false, true):  outcome = .whitelistOn
+                    case (true,  false): outcome = .whitelistMisconfigured
+                    case (false, false): outcome = .noNetwork
+                    }
+                    self.handleOutcome(outcome)
+                    self.scheduleNextProbe(after: cadence)
+                }
+                return
+            }
             let outcome: Outcome
             switch (testOK, whitelistOK) {
             case (true,  true):  outcome = .clearAll
             case (false, true):  outcome = .whitelistOn
             case (true,  false): outcome = .whitelistMisconfigured
-            case (false, false): outcome = .noNetwork
+            case (false, false): outcome = .noNetwork // unreachable; guarded above
             }
             self.handleOutcome(outcome)
             self.scheduleNextProbe(after: cadence)
@@ -219,6 +261,121 @@ final class WhitelistDetector {
             guard let self else { return }
             self.activePingers.removeAll()
             completion(testRes ?? false, whitelistRes ?? false)
+        }
+    }
+
+    /// IPA-D25: TCP-connect probe at port 443 against testHost and
+    /// whitelistHost in parallel, with the same physical-interface
+    /// pinning as ICMP. Used as a fallback only when both ICMP
+    /// probes have already failed. A successful TCP handshake is
+    /// treated as "ok via TCP fallback" — overwrites the failed
+    /// ICMP result before the outcome matrix is evaluated.
+    ///
+    /// The probes ride excludedRoutes that the PacketTunnelProvider
+    /// already adds for the same hosts (D23 wiring), and
+    /// `requiredInterfaceType` pins the socket to wifi/cellular so
+    /// the connection bypasses our own utun. Completion delivered
+    /// on `queue`.
+    private func tcpFallbackProbe(completion: @escaping (_ testOK: Bool, _ whitelistOK: Bool) -> Void) {
+        // Pick physical interface preference from current path.
+        var pinned: NWInterface.InterfaceType? = nil
+        var pinnedName: String = "<default>"
+        if let path = pathProvider() {
+            if path.usesInterfaceType(.wifi) {
+                pinned = .wifi; pinnedName = "wifi"
+            } else if path.usesInterfaceType(.cellular) {
+                pinned = .cellular; pinnedName = "cellular"
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                pinned = .wiredEthernet; pinnedName = "wired"
+            }
+        }
+
+        var testRes: Bool?
+        var whitelistRes: Bool?
+        let group = DispatchGroup()
+        group.enter()
+        group.enter()
+
+        let tHost = self.testHost
+        let wHost = self.whitelistHost
+
+        self.runTCPProbe(host: tHost, pinned: pinned, pinnedName: pinnedName) { [weak self] ok in
+            self?.queue.async {
+                self?.log("info: detector probe testHost=\(tHost) → ICMP fail, TCP fallback \(ok ? "ok" : "fail")")
+                testRes = ok
+                group.leave()
+            }
+        }
+        self.runTCPProbe(host: wHost, pinned: pinned, pinnedName: pinnedName) { [weak self] ok in
+            self?.queue.async {
+                self?.log("info: detector probe whitelistHost=\(wHost) → ICMP fail, TCP fallback \(ok ? "ok" : "fail")")
+                whitelistRes = ok
+                group.leave()
+            }
+        }
+
+        group.notify(queue: queue) {
+            completion(testRes ?? false, whitelistRes ?? false)
+        }
+    }
+
+    /// Single TCP-connect probe to `host:443`. Settles exactly once.
+    /// Cancels the connection as soon as it reaches .ready — we only
+    /// need SYN/SYN-ACK to confirm reachability. On timeout, cancel
+    /// and report fail.
+    private func runTCPProbe(host: String,
+                             pinned: NWInterface.InterfaceType?,
+                             pinnedName: String,
+                             completion: @escaping (_ ok: Bool) -> Void) {
+        let params: NWParameters = .tcp
+        if let p = pinned {
+            params.requiredInterfaceType = p
+        }
+        // Disable IPv6 (Happy Eyeballs) — our excludedRoutes are v4
+        // only and we want a deterministic v4 path.
+        if let ipOptions = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ipOptions.version = .v4
+        }
+
+        let endpointHost = NWEndpoint.Host(host)
+        let conn = NWConnection(host: endpointHost, port: 443, using: params)
+        activeTCPConns.append(conn)
+        log("info: detector TCP fallback \(host):443 starting (pinned=\(pinnedName))")
+
+        var didSettle = false
+        let settle: (Bool, String) -> Void = { [weak self] ok, reason in
+            guard let self else { return }
+            if didSettle { return }
+            didSettle = true
+            // Remove from active list + cancel underlying.
+            if let idx = self.activeTCPConns.firstIndex(where: { $0 === conn }) {
+                self.activeTCPConns.remove(at: idx)
+            }
+            conn.cancel()
+            self.log("info: detector TCP fallback \(host):443 settled \(ok ? "ok" : "fail") (\(reason))")
+            completion(ok)
+        }
+
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                settle(true, "ready")
+            case .failed(let err):
+                settle(false, "failed: \(err)")
+            case .cancelled:
+                settle(false, "cancelled")
+            case .waiting(let err):
+                // Let timeout decide; log the reason.
+                self.log("info: detector TCP fallback \(host):443 waiting: \(err)")
+            default:
+                break
+            }
+        }
+        conn.start(queue: queue)
+
+        // Timeout — same 3 s budget as ICMP.
+        queue.asyncAfter(deadline: .now() + Self.tcpFallbackTimeout) {
+            settle(false, "timeout")
         }
     }
 
