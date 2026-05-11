@@ -786,14 +786,42 @@ misc:
         // via tunnel → exit Finland → server saw Finland IP for an
         // RU-edge destination → mismatch → ChatGPT/CDN refusals.
         //
-        // Now: use Cloudflare/Google SECONDARY IPs (1.0.0.1, 8.8.4.4) for
+        // Use Cloudflare/Google SECONDARY IPs (1.0.0.1, 8.8.4.4) for
         // DNS-via-tunnel. They are anycast and unrelated to canary IPs
         // in excludedRoutes, so they resolve cleanly through the tunnel
         // and the upstream-server (Finland exit) is the query source.
         // GeoDNS therefore returns Finland-close edges; subsequent TCP
         // is consistent with the tunnel exit IP.
+        //
+        // IPA-DNS-LEAK-FIX (2026-05-11): the previous fix3 set
+        // `matchDomains = [""]` but did NOT set `matchDomainsNoSearch =
+        // true`. On iOS 17/18 with split-DNS semantics this is the
+        // documented difference between "every query goes to our DNS"
+        // vs "iOS still consults the system resolver in parallel /
+        // first for FQDNs". Production iOS proxy clients (sing-box-
+        // for-apple ExtensionProvider.swift, Hiddify, Streisand) all
+        // set BOTH flags together — empty matchDomain alone is not a
+        // reliable catch-all on iOS. The leak manifested as ChatGPT
+        // and Roblox refusing the iPhone: app got a Russia-biased CDN
+        // IP from the leaked system DNS query (RU ISP resolver
+        // returning RU-edge), then opened TCP to that RU-edge IP via
+        // tunnel → exit IP Finland but destination is RU-edge of CDN
+        // → CDN sees geo-mismatch → block. Setting
+        // matchDomainsNoSearch=true forces ALL DNS through the tunnel
+        // so the IPs the app receives are Finland-edge from the start.
+        //
+        // Refs:
+        //   https://sing-box.sagernet.org/configuration/dns/  (catch-all pattern)
+        //   sing-box-for-apple/ExtensionProvider/include/ExtensionProvider.swift
+        //   Apple NEDNSSettings docs:
+        //     matchDomainsNoSearch=true means "treat matchDomains as a
+        //     pure resolver-selection filter, do NOT also add them to
+        //     the system search list" — which is exactly what we want
+        //     for [""] catch-all (otherwise iOS treats "" as a search
+        //     suffix and bypass FQDNs).
         let dns = NEDNSSettings(servers: ["1.0.0.1", "8.8.4.4"])
         dns.matchDomains = [""]
+        dns.matchDomainsNoSearch = true
         settings.dnsSettings = dns
 
         return settings
