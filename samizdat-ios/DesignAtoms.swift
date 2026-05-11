@@ -68,10 +68,14 @@ struct StatTile: View {
                     .font(.geistMono(.semibold, size: 20))
                     .tracking(-0.4)
                     .foregroundStyle(accent ?? theme.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
                 if let unit {
                     Text(unit)
                         .font(.geistMono(.regular, size: 11))
                         .foregroundStyle(theme.textDim)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
                 }
             }
         }

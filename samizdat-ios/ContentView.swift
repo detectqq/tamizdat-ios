@@ -17,9 +17,11 @@ struct ContentView: View {
     @StateObject private var bridge = SamizdatBridge()
     @StateObject private var lampStore = TamizdatStatusStore()
     @StateObject private var serverNotif = ServerNotificationObserver()
+    @StateObject private var exitIP = ExitIPStore()
 
     @State private var showSettings = false
     @State private var showLogs = false
+    @State private var showEndpoints = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
 
@@ -42,7 +44,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D23"
+    private static let milestoneTag = "D24"
 
     // MARK: – Derived state
 
@@ -60,7 +62,7 @@ struct ContentView: View {
             switch self {
             case .off:          return "Off"
             case .connecting:   return "Connecting…"
-            case .connected:    return "Protected"
+            case .connected:    return "Connected"
             case .reconnecting: return "Reconnecting…"
             case .failed:       return "Proxy unreachable"
             case .error:        return "Error"
@@ -167,13 +169,34 @@ struct ContentView: View {
             LogView(injectedBridge: bridge)
                 .environment(\.themeTokens, theme)
         }
+        .sheet(isPresented: $showEndpoints) {
+            EndpointsView { saved in
+                hasConfig = saved
+                hasBackupConfigured = ContentView.checkBackupConfigured()
+                if !hasBackupConfigured {
+                    if manualEndpoint == .backup { manualEndpoint = .primary }
+                    if EndpointModeStore.current == .backup {
+                        EndpointModeStore.current = .primary
+                    }
+                }
+            }
+            .environment(\.themeTokens, theme)
+        }
         .onAppear {
             startStatusPolling()
             lampStore.start()
+            exitIP.start(isConnected: bridge.state == .connected)
         }
         .onDisappear {
             stopStatusPolling()
             lampStore.stop()
+            exitIP.stop()
+        }
+        .onChange(of: bridge.state) { _, newState in
+            // Refetch exit IP immediately on connect/disconnect so the
+            // surface flips without waiting up to 60s for the next tick.
+            let isUp = (newState == .connected)
+            exitIP.refreshSoon(isConnected: isUp)
         }
         // Phase C iOS-notify (preserved from D20): server-pushed alert.
         .alert(
@@ -256,6 +279,24 @@ struct ContentView: View {
                     )
                 }
 
+                // IPA-D24: exit IP under the Ping chip. URLSession.shared
+                // follows the system default route — through the tunnel
+                // when on, real ISP when off. Quiet failure: line hides.
+                if let ip = exitIP.ip {
+                    HStack(spacing: 4) {
+                        Text(exitIP.isFromTunnel ? "Exit" : "Network")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textMuted)
+                        Text("·")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textMuted)
+                        Text(ip)
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    .padding(.top, 2)
+                }
+
                 if !bridge.lastError.isEmpty && bridge.state == .error {
                     Text(bridge.lastError)
                         .font(.geist(.regular, size: 13))
@@ -271,7 +312,7 @@ struct ContentView: View {
                         .padding(.horizontal, 24)
                 }
                 if !hasConfig {
-                    Text("Paste a tamizdat:// link in Settings → Endpoints to begin.")
+                    Text("Paste a tamizdat:// link in Settings → Proxies to begin.")
                         .font(.geist(.regular, size: 13))
                         .foregroundStyle(theme.textDim)
                         .multilineTextAlignment(.center)
@@ -320,16 +361,30 @@ struct ContentView: View {
                     sub: whitelistSub,
                     isLast: isAutoMode    // last only when picker is hidden
                 ) {
-                    Toggle("", isOn: $isAutoMode)
-                        .labelsHidden()
-                        .tint(theme.mint)
-                        .onChange(of: isAutoMode) { _, newAuto in
-                            let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
-                            Task {
-                                await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                    HStack(spacing: 8) {
+                        Toggle("", isOn: $isAutoMode)
+                            .labelsHidden()
+                            .tint(theme.mint)
+                            .onChange(of: isAutoMode) { _, newAuto in
+                                let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
+                                Task {
+                                    await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                                }
                             }
-                        }
+                        // IPA-D24: chevron signals the card itself is
+                        // tappable — opens the Proxies sheet so the
+                        // user can jump straight to URL edit.
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(theme.textMuted)
+                    }
                 }
+                // IPA-D24: card-level tap opens Proxies. SwiftUI gesture
+                // priority lets the inner Toggle / segmented picker
+                // intercept their own taps; the surrounding tap on
+                // icon / title / sub area lands here.
+                .contentShape(Rectangle())
+                .onTapGesture { showEndpoints = true }
 
                 // IPA-D22 fix: when auto-detect is off, expose the manual
                 // Main/Whitelist picker inline below the toggle — port of
@@ -378,15 +433,14 @@ struct ContentView: View {
     }
 
     private var whitelistSub: String {
-        if !isAutoMode {
-            return "Manual"
-        }
+        // Detector status takes precedence — it's the live signal user wants
+        // to see ("Paused — no network" matters in elevator/metro).
         switch whitelistStatus {
-        case .off:        return "using Main · detector ok"
-        case .detected:   return "ON · using Whitelist endpoint"
-        case .frozen:     return "frozen · captive portal suspected"
-        case .noNetwork:  return "paused · no network"
-        case .unknown:    return "monitoring…"
+        case .noNetwork:  return "Paused — no network"
+        case .frozen:     return "Frozen — captive portal?"
+        case .detected:   return "Whitelist active"
+        case .off:        return isAutoMode ? "Free internet" : "Manual"
+        case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
         }
     }
 

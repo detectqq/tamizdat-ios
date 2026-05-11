@@ -26,6 +26,13 @@ struct EndpointsView: View {
     @State private var scanning: ScanTarget? = nil
     @State private var pasteError: String?
 
+    // IPA-D24: per-card inline edit state. `editing` toggles the
+    // CodeBlock into a TextEditor; `editBufferMain/Backup` hold the
+    // mutable draft so Cancel can revert.
+    @State private var editing: ConfirmingCard? = nil
+    @State private var editBufferMain: String = ""
+    @State private var editBufferBackup: String = ""
+
     private enum ConfirmingCard { case main, backup }
     private enum ScanTarget: Identifiable {
         case main, backup
@@ -54,7 +61,7 @@ struct EndpointsView: View {
                 HStack {
                     Chip(label: "Done") { closeAndPersist() }
                     Spacer()
-                    Text("Endpoints")
+                    Text("Proxies")
                         .font(.geist(.semibold, size: 16))
                         .foregroundStyle(theme.text)
                     Spacer()
@@ -66,7 +73,7 @@ struct EndpointsView: View {
                 .padding(.bottom, 6)
 
                 // ── Large title ───────────────────────────────────
-                Text("Endpoints")
+                Text("Proxies")
                     .font(.geist(.bold, size: 32))
                     .tracking(-0.96)
                     .foregroundStyle(theme.text)
@@ -84,11 +91,20 @@ struct EndpointsView: View {
                             accent: theme.mint,
                             url: primaryURL,
                             isConfirming: confirming == .main,
+                            isEditing: editing == .main,
+                            editBuffer: $editBufferMain,
                             onPaste: pasteMain,
                             onScan: { scanning = .main },
                             onClearRequest: { confirming = .main },
                             onClearCancel:  { confirming = nil },
-                            onClearConfirm: clearMain
+                            onClearConfirm: clearMain,
+                            onEditStart: {
+                                editBufferMain = primaryURL
+                                editing = .main
+                                pasteError = nil
+                            },
+                            onEditCancel: { editing = nil; pasteError = nil },
+                            onEditSave: { saveEditedMain() }
                         )
 
                         EndpointCard(
@@ -98,11 +114,20 @@ struct EndpointsView: View {
                             accent: theme.blue,
                             url: backupURL,
                             isConfirming: confirming == .backup,
+                            isEditing: editing == .backup,
+                            editBuffer: $editBufferBackup,
                             onPaste: pasteBackup,
                             onScan: { scanning = .backup },
                             onClearRequest: { confirming = .backup },
                             onClearCancel:  { confirming = nil },
-                            onClearConfirm: clearBackup
+                            onClearConfirm: clearBackup,
+                            onEditStart: {
+                                editBufferBackup = backupURL
+                                editing = .backup
+                                pasteError = nil
+                            },
+                            onEditCancel: { editing = nil; pasteError = nil },
+                            onEditSave: { saveEditedBackup() }
                         )
 
                         if let err = pasteError {
@@ -176,6 +201,41 @@ struct EndpointsView: View {
         return true
     }
 
+    /// IPA-D24: commit the inline-edited Main URL. Empty buffer is treated
+    /// as "clear" (skip URL validation, just persist the empty state).
+    private func saveEditedMain() {
+        let s = editBufferMain.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty {
+            primaryURL = ""
+            editing = nil
+            pasteError = nil
+            persistImmediately()
+            return
+        }
+        if validateAndApply(s, toBackup: false) {
+            editing = nil
+            pasteError = nil
+            persistImmediately()
+        }
+    }
+
+    /// IPA-D24: commit the inline-edited Whitelist URL.
+    private func saveEditedBackup() {
+        let s = editBufferBackup.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty {
+            backupURL = ""
+            editing = nil
+            pasteError = nil
+            persistImmediately()
+            return
+        }
+        if validateAndApply(s, toBackup: true) {
+            editing = nil
+            pasteError = nil
+            persistImmediately()
+        }
+    }
+
     private func clearMain() {
         primaryURL = ""
         confirming = nil
@@ -222,11 +282,18 @@ private struct EndpointCard: View {
     let url: String
 
     let isConfirming: Bool
+    // IPA-D24: inline edit state, owned by the parent EndpointsView.
+    let isEditing: Bool
+    @Binding var editBuffer: String
+
     let onPaste: () -> Void
     let onScan: () -> Void
     let onClearRequest: () -> Void
     let onClearCancel: () -> Void
     let onClearConfirm: () -> Void
+    let onEditStart: () -> Void
+    let onEditCancel: () -> Void
+    let onEditSave: () -> Void
 
     var body: some View {
         CardContainer(padding: 16) {
@@ -248,10 +315,25 @@ private struct EndpointCard: View {
                     }
                 }
 
-                if url.isEmpty {
+                if isEditing {
+                    // IPA-D24: TextEditor for manual URL editing. Mono
+                    // font matches the read-only CodeBlock style.
+                    TextEditor(text: $editBuffer)
+                        .font(.geistMono(.regular, size: 12))
+                        .foregroundStyle(theme.text)
+                        .scrollContentBackground(.hidden)
+                        .frame(minHeight: 100, maxHeight: 220)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(theme.chip)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                } else if url.isEmpty {
                     // Empty state — same code-block frame, dim placeholder
                     CodeBlock {
-                        Text("Not configured — paste or scan a tamizdat:// link to set up the \(label.lowercased()) endpoint.")
+                        Text("Not configured — paste, scan or edit a tamizdat:// link to set up the \(label.lowercased()) endpoint.")
                             .foregroundStyle(theme.textMuted)
                     }
                 } else {
@@ -260,8 +342,20 @@ private struct EndpointCard: View {
                     }
                 }
 
-                // Actions row OR inline confirmation strip
-                if isConfirming {
+                // Actions row OR inline confirmation strip OR edit Save/Cancel
+                if isEditing {
+                    HStack(spacing: 6) {
+                        ActionChip(systemName: "xmark",
+                                   label: "Cancel",
+                                   tint: theme.textDim,
+                                   action: onEditCancel)
+                        ActionChip(systemName: "checkmark",
+                                   label: "Done",
+                                   tint: theme.mint,
+                                   labelColor: theme.mint,
+                                   action: onEditSave)
+                    }
+                } else if isConfirming {
                     HStack(spacing: 10) {
                         Text("Clear this endpoint?")
                             .font(.geist(.medium, size: 12.5))
@@ -294,6 +388,10 @@ private struct EndpointCard: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 } else {
                     HStack(spacing: 6) {
+                        ActionChip(systemName: "pencil",
+                                   label: "Edit",
+                                   tint: theme.blue,
+                                   action: onEditStart)
                         ActionChip(systemName: "doc.on.clipboard",
                                    label: "Paste",
                                    tint: theme.blue,
