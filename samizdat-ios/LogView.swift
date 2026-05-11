@@ -25,6 +25,7 @@ struct LogView: View {
     @State private var showClearConfirm: Bool = false
     @State private var copiedFlash: Bool = false
     @State private var critFlash: SendStatus = .idle
+    @State private var shareFlash: SendStatus = .idle
     @State private var showShareSheet: Bool = false
     @State private var shareText: String = ""
 
@@ -260,11 +261,10 @@ struct LogView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedFlash = false }
             }
             ActionTile(icon: "paperplane",
-                       label: "Share",
+                       label: shareFlashLabel,
                        tint: theme.textDim,
                        isActive: false) {
-                shareText = filteredLines.map { $0.raw }.joined(separator: "\n")
-                showShareSheet = true
+                shareLogs()
             }
             ActionTile(icon: "exclamationmark.triangle",
                        label: critFlashLabel,
@@ -302,6 +302,48 @@ struct LogView: View {
         case .sending: return "Sending…"
         case .sent: return "Sent"
         case .failed: return "Failed"
+        }
+    }
+
+    private var shareFlashLabel: String {
+        switch shareFlash {
+        case .idle: return "Share"
+        case .sending: return "Sending…"
+        case .sent: return "Sent"
+        case .failed: return "Failed"
+        }
+    }
+
+    /// IPA-D25 fix3: tap "Share" → send the visible logs directly to the
+    /// configured Telegram bot, bypassing the iOS share sheet (which is
+    /// flaky for large text payloads / Telegram in particular). If the
+    /// bot isn't configured yet, fall back to the iOS share sheet so the
+    /// button still works.
+    private func shareLogs() {
+        let text = filteredLines.map { $0.raw }.joined(separator: "\n")
+        guard TelegramReporter.isConfigured else {
+            // No bot — keep the legacy iOS share-sheet path so the
+            // button isn't dead. User can configure bot in Settings →
+            // Telegram for one-tap sending.
+            shareText = text
+            showShareSheet = true
+            return
+        }
+        let caption = TelegramReporter.defaultCaption(extra: "logs (\(filteredLines.count) lines)")
+        shareFlash = .sending
+        TelegramReporter.sendLog(text: text, caption: caption) { result in
+            switch result {
+            case .success:
+                shareFlash = .sent
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    if case .sent = shareFlash { shareFlash = .idle }
+                }
+            case .failure(let err):
+                shareFlash = .failed(err.errorDescription ?? "unknown")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+                    if case .failed = shareFlash { shareFlash = .idle }
+                }
+            }
         }
     }
 
