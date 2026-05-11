@@ -206,7 +206,7 @@ private struct QRScannerRepresentable: UIViewControllerRepresentable {
     }
 }
 
-final class QRScannerVC: UIViewController {
+fileprivate final class QRScannerVC: UIViewController {
     weak var coordinator: QRScannerRepresentable.Coordinator?
     private let session = AVCaptureSession()
     private var previewLayer: AVCaptureVideoPreviewLayer?
