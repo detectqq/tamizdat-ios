@@ -314,18 +314,6 @@ final class TamizdatStatusStore: ObservableObject {
         return (String(total), "B")
     }
 
-    /// Smoothed data-rate as a short display string, e.g. "1.2 MB/s",
-    /// "850 KB/s", "—" if no sample yet.
-    var dataRateText: String {
-        let kbps = smoothedRateKBps
-        if kbps <= 1.0 { return "—" }
-        let mbps = kbps / 1024.0
-        if mbps >= 1.0 {
-            return String(format: "%.1f MB/s", mbps)
-        }
-        return String(format: "%.0f KB/s", kbps)
-    }
-
     /// IPA-D22: true when the extension is currently in a rewireUpstream
     /// rebuild. Drives the "Reconnecting…" shield state.
     var isReconnecting: Bool { snapshot.isRewiring != 0 && !snapshot.realShape.isEmpty }
