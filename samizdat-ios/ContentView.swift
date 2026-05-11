@@ -311,30 +311,75 @@ struct ContentView: View {
 
     private var autoDetectRow: some View {
         CardContainer(padding: 0) {
-            DesignRow(
-                icon: IconCard(systemName: "dot.radiowaves.up.forward",
-                               bg: theme.blueDim,
-                               fg: theme.blue),
-                title: "Auto-detect Whitelist",
-                sub: whitelistSub,
-                isLast: true
-            ) {
-                Toggle("", isOn: $isAutoMode)
-                    .labelsHidden()
-                    .tint(theme.mint)
-                    .onChange(of: isAutoMode) { _, newAuto in
-                        let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
-                        Task {
-                            await VPNProfileStore.shared.switchEndpoint(to: newMode)
+            VStack(spacing: 0) {
+                DesignRow(
+                    icon: IconCard(systemName: "dot.radiowaves.up.forward",
+                                   bg: theme.blueDim,
+                                   fg: theme.blue),
+                    title: "Auto-detect Whitelist",
+                    sub: whitelistSub,
+                    isLast: isAutoMode    // last only when picker is hidden
+                ) {
+                    Toggle("", isOn: $isAutoMode)
+                        .labelsHidden()
+                        .tint(theme.mint)
+                        .onChange(of: isAutoMode) { _, newAuto in
+                            let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
+                            Task {
+                                await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                            }
                         }
+                }
+
+                // IPA-D22 fix: when auto-detect is off, expose the manual
+                // Main/Whitelist picker inline below the toggle — port of
+                // the pre-D22 segmented control that was lost in the rewrite.
+                if !isAutoMode {
+                    HStack(spacing: 0) {
+                        manualPickerSegment(label: "Main",
+                                            isSelected: manualEndpoint == .primary,
+                                            tap: { selectManual(.primary) })
+                        manualPickerSegment(label: "Whitelist",
+                                            isSelected: manualEndpoint == .backup,
+                                            tap: { selectManual(.backup) })
                     }
+                    .padding(4)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+                }
             }
+        }
+    }
+
+    private func manualPickerSegment(label: String,
+                                     isSelected: Bool,
+                                     tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            Text(label)
+                .font(.geist(.semibold, size: 13))
+                .tracking(-0.13)
+                .foregroundStyle(isSelected ? theme.chipActiveText : theme.text)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(isSelected ? theme.chipActive : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func selectManual(_ ep: EndpointMode) {
+        guard !isAutoMode else { return }
+        manualEndpoint = ep
+        Task {
+            await VPNProfileStore.shared.switchEndpoint(to: ep)
         }
     }
 
     private var whitelistSub: String {
         if !isAutoMode {
-            return "Manual · using \(manualEndpoint == .backup ? "Whitelist" : "Main")"
+            return "Manual"
         }
         switch whitelistStatus {
         case .off:        return "using Main · detector ok"
