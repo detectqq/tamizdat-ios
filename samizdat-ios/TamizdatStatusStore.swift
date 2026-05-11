@@ -214,6 +214,15 @@ final class TamizdatStatusStore: ObservableObject {
     }
 
     private func poll() async {
+        // IPA-D25 fix7: foreground heartbeat to the Go-side ping
+        // prober. Every status poll tells the extension "user is
+        // watching" so the prober speeds up to 3s cadence. After
+        // the heartbeat goes stale (>5s), prober slows to 30s.
+        // This poll only runs while the view is visible (.onAppear /
+        // .onDisappear lifecycle), so backgrounding the app stops
+        // the heartbeat naturally.
+        SocksstubNoteForegroundPoll()
+
         let result = await VPNProfileStore.shared.fetchTamizdatStatus()
         // Avoid re-publishing identical snapshots — saves SwiftUI
         // re-render work when nothing changed.

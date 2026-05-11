@@ -455,9 +455,23 @@ struct ContentView: View {
     /// has propagated via the 500 ms status poll, so `homeState`
     /// keeps showing `.reconnecting` from the real signal until the
     /// new client finishes warming.
+    ///
+    /// IPA-D25 fix7: also kick the ExitIP store to refetch immediately
+    /// (otherwise the IP chip stays on the OLD exit IP for up to 5s
+    /// until the next regular poll lands).
     private func noteSwitchPending() {
         pendingSwitchClearTask?.cancel()
         pendingSwitch = true
+        // The actual TLS handshake to the new upstream takes some
+        // time; refetch the exit IP a moment later (1.5 s gives the
+        // new samizdat client a chance to be fully ready). ExitIPStore
+        // itself also polls every 5 s now, so this is just a fast-path
+        // bump.
+        exitIP.refreshSoon(isConnected: bridge.state == .connected)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            exitIP.refreshSoon(isConnected: bridge.state == .connected)
+        }
         pendingSwitchClearTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             if !Task.isCancelled {

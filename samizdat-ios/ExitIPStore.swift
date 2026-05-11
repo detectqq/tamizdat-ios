@@ -24,7 +24,11 @@ final class ExitIPStore: ObservableObject {
     @Published private(set) var isFromTunnel: Bool = false
 
     private var task: Task<Void, Never>?
-    private static let refreshInterval: TimeInterval = 60
+    // IPA-D25 fix7: 5s while foreground (only place this store ever
+    // runs anyway — .onDisappear stops the task, so battery doesn't
+    // pay for the bumped cadence). Operator: while screen is open
+    // values should be live, when phone is backgrounded much less.
+    private static let refreshInterval: TimeInterval = 5
 
     /// Order matters — `ipv4.icanhazip.com` first because it's the
     /// strictest v4-only (no AAAA record at all, so URLSession is

@@ -45,10 +45,45 @@ import (
 
 const (
 	defaultPingProbeURL = "http://www.gstatic.com/generate_204"
-	pingProbeInterval   = 10 * time.Second
+	// IPA-D25 fix7: dynamic cadence. When the iOS main app is in the
+	// foreground (signalled by its 500ms status-RPC heartbeat), probe
+	// every 3s so the UI feels live. When backgrounded (no heartbeat
+	// for >5s), drop to 30s for battery — user can't see it anyway.
+	pingProbeIntervalFG = 3 * time.Second
+	pingProbeIntervalBG = 30 * time.Second
+	foregroundStaleAfter = 5 * time.Second
 	pingProbeTimeout    = 5 * time.Second
 	pingFailedThreshold = 2 // consecutive misses to enter Failed state
 )
+
+// lastForegroundPollAtNanos is bumped to time.Now().UnixNano() every
+// time Swift calls NoteForegroundPoll (= every status-RPC tick while
+// the user is watching the screen). The prober loop checks this to
+// decide its cadence.
+var lastForegroundPollAtNanos atomic.Int64
+
+// NoteForegroundPoll is the foreground heartbeat from Swift. Called
+// once per 500ms status RPC fetch in TamizdatStatusStore.poll(). The
+// ping prober uses this to switch between fast (foreground) and slow
+// (background) cadence.
+//
+// Exported for gomobile binding as SocksstubNoteForegroundPoll().
+func NoteForegroundPoll() {
+	lastForegroundPollAtNanos.Store(time.Now().UnixNano())
+}
+
+// currentPingCadence returns the cadence appropriate for the current
+// foreground/background state.
+func currentPingCadence() time.Duration {
+	last := lastForegroundPollAtNanos.Load()
+	if last == 0 {
+		return pingProbeIntervalBG
+	}
+	if time.Since(time.Unix(0, last)) > foregroundStaleAfter {
+		return pingProbeIntervalBG
+	}
+	return pingProbeIntervalFG
+}
 
 // pingProberState holds the live counters for the ping prober. Lives in
 // the package-global rt area; accessed via the proberMu mutex around
@@ -168,23 +203,26 @@ func stopPingProber() {
 	}
 }
 
-// runPingProbeLoop is the goroutine body. Ticks every pingProbeInterval
-// until ctx is cancelled. Each tick re-reads the configured URL so
-// live URL changes via SetPingProbeURL take effect on the next probe
-// without restarting.
+// runPingProbeLoop is the goroutine body. Cadence is dynamic — 3 s
+// while the main app is in the foreground (Swift hits NoteForegroundPoll
+// every 500 ms status RPC), 30 s when backgrounded. Each tick re-reads
+// the configured URL so live URL changes via SetPingProbeURL take effect
+// on the next probe without restarting.
 func runPingProbeLoop(ctx context.Context, client *samizdat.Client) {
 	// Fire one probe immediately so the first sample shows up on the
-	// shield within a few seconds of connect instead of waiting a full
-	// 10 s.
+	// shield within a few seconds of connect.
 	probeOnce(ctx, client)
 
-	tick := time.NewTicker(pingProbeInterval)
-	defer tick.Stop()
+	// Dynamic cadence: use time.Timer instead of Ticker so we can
+	// re-arm with the current cadence each cycle (3s FG / 30s BG).
 	for {
+		next := currentPingCadence()
+		timer := time.NewTimer(next)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-tick.C:
+		case <-timer.C:
 			probeOnce(ctx, client)
 		}
 	}
