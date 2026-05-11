@@ -1,47 +1,146 @@
 import SwiftUI
 import UserNotifications
 
-/// Standard "Settings" screen. Houses notification preferences,
-/// shortcuts to existing config sheets, and an About section.
+/// IPA-D22: redesigned Settings sheet — grouped inset cards over the
+/// theme background gradient. Sections (top → bottom):
+///   1. Notifications  (Whitelist alerts toggle)
+///   2. Configuration  (Endpoints → push to EndpointsView)
+///   3. Ping probe     (URL code-block + Save / Reset)
+///   4. Appearance     (Cream / Dark segmented control)
+///   5. Diagnostics    (View logs + About)
+///
+/// Pool variant section deleted in D22 (V1 hardcoded in Go). Telegram
+/// uploader stays reachable but as a row in Diagnostics rather than
+/// its own section — it's a debug aid, not a primary config knob.
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.themeTokens) private var theme
+
+    /// Called whenever the user changes endpoints. The parent uses this
+    /// to refresh `hasConfig` and `hasBackupConfigured`.
+    var onConfigChanged: (Bool) -> Void = { _ in }
+
+    /// Theme picker is rendered here but the *root* view (App.swift /
+    /// ContentView) reads `ThemePreferences.current` to compute the
+    /// environment value. To make the picker change propagate live, we
+    /// post a Notification on change; the root listens and re-renders.
+    @State private var selectedTheme: AppTheme = ThemePreferences.current
 
     @State private var notificationsEnabled: Bool = NotificationPreferences.enabled
     @State private var permissionStatus: UNAuthorizationStatus = .notDetermined
     @State private var permissionDeniedAlert: Bool = false
 
-    @State private var poolVariant: PoolVariant = PoolVariantPreferences.current
-
-    // IPA-D21: user-configurable target for the real-internet ping
-    // prober. Bound to a TextField; persisted to App Group UserDefaults
-    // on commit. A live "refreshPingURL" provider message wakes the
-    // extension to pick up the new value without disconnect.
     @State private var pingURL: String = PingURLPreferences.url
+    @State private var pingURLDraft: String = PingURLPreferences.url
 
-    @State private var showConfig = false
+    @State private var showEndpoints = false
+    @State private var showLogs = false
     @State private var showTelegram = false
 
-    /// Callback so the parent can react to config changes (e.g.,
-    /// re-check whether a backup endpoint is now configured).
-    var onConfigChanged: (Bool) -> Void = { _ in }
-
     var body: some View {
-        NavigationStack {
-            Form {
-                // ── Notifications ────────────────────────────────────────
-                Section {
-                    Toggle(isOn: $notificationsEnabled) {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Whitelist alerts")
-                                Text("Notify when whitelist mode toggles on/off")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "bell.badge")
-                        }
+        ZStack {
+            ThemeBackground(theme: theme)
+
+            VStack(spacing: 0) {
+                // ── Header ───────────────────────────────────────
+                HStack {
+                    Chip(label: "Done") { dismiss() }
+                    Spacer()
+                    Text("Settings")
+                        .font(.geist(.semibold, size: 16))
+                        .foregroundStyle(theme.text)
+                    Spacer()
+                    Color.clear.frame(width: 56, height: 1)
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
+
+                // ── Large title ──────────────────────────────────
+                Text("Settings")
+                    .font(.geist(.bold, size: 32))
+                    .tracking(-0.96)
+                    .foregroundStyle(theme.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 14)
+
+                ScrollView {
+                    VStack(spacing: 0) {
+                        // ── Notifications ────────────────────────
+                        SectionLabel(text: "Notifications")
+                        notificationsCard
+                            .padding(.horizontal, 16)
+
+                        // ── Configuration ────────────────────────
+                        SectionLabel(text: "Configuration")
+                            .padding(.top, 22)
+                        configurationCard
+                            .padding(.horizontal, 16)
+
+                        // ── Ping probe ───────────────────────────
+                        SectionLabel(text: "Ping probe")
+                            .padding(.top, 22)
+                        pingProbeCard
+                            .padding(.horizontal, 16)
+
+                        // ── Appearance ───────────────────────────
+                        SectionLabel(text: "Appearance")
+                            .padding(.top, 22)
+                        appearanceCard
+                            .padding(.horizontal, 16)
+
+                        // ── Diagnostics ──────────────────────────
+                        SectionLabel(text: "Diagnostics")
+                            .padding(.top, 22)
+                        diagnosticsCard
+                            .padding(.horizontal, 16)
+
+                        // ── About ────────────────────────────────
+                        SectionLabel(text: "About")
+                            .padding(.top, 22)
+                        aboutCard
+                            .padding(.horizontal, 16)
+
+                        Color.clear.frame(height: 28)
                     }
+                }
+            }
+        }
+        .preferredColorScheme(theme.isDark ? .dark : .light)
+        .task {
+            permissionStatus = await NotificationPreferences.currentSystemAuthorization()
+        }
+        .alert("Notifications were not granted", isPresented: $permissionDeniedAlert) {
+            Button("Open iOS Settings") { openSystemSettings() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Enable notifications for Tamizdat in iOS Settings to receive whitelist-detection alerts.")
+        }
+        .sheet(isPresented: $showEndpoints) {
+            EndpointsView { saved in
+                onConfigChanged(saved)
+            }
+            .environment(\.themeTokens, theme)
+        }
+        .sheet(isPresented: $showTelegram) {
+            TelegramSettingsView()
+        }
+    }
+
+    // MARK: – Section cards
+
+    private var notificationsCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "bell.badge", bg: theme.blueDim, fg: theme.blue),
+                title: "Whitelist alerts",
+                sub: "Local push when auto-detector flips between Main and Whitelist.",
+                isLast: permissionStatus != .denied || !notificationsEnabled
+            ) {
+                Toggle("", isOn: $notificationsEnabled)
+                    .labelsHidden()
+                    .tint(theme.mint)
                     .onChange(of: notificationsEnabled) { _, newValue in
                         if newValue {
                             Task { await handleEnableNotifications() }
@@ -49,164 +148,248 @@ struct SettingsView: View {
                             NotificationPreferences.enabled = false
                         }
                     }
-                    if permissionStatus == .denied && notificationsEnabled {
-                        Label {
-                            Text("Notifications are blocked in iOS Settings. Tap to open Settings.")
-                                .font(.caption)
-                        } icon: {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                        }
-                        .onTapGesture { openSystemSettings() }
-                    }
-                } header: {
-                    Text("Notifications")
-                } footer: {
-                    Text("Local push when the auto-detector switches between Main and Whitelist endpoints. No remote push, no server-side telemetry — strictly on-device.")
-                }
-
-                // ── Endpoints ────────────────────────────────────────────
-                Section {
-                    Button {
-                        showConfig = true
-                    } label: {
-                        Label("Endpoints (Main + Whitelist)", systemImage: "key.fill")
-                    }
-                } header: {
-                    Text("Configuration")
-                } footer: {
-                    Text("Paste tamizdat:// URLs for Main and (optionally) Whitelist server.")
-                }
-
-                // ── Pool variant ─────────────────────────────────────────
-                Section {
-                    Picker(selection: $poolVariant) {
-                        ForEach(PoolVariant.allCases) { variant in
-                            Text(variant.displayName).tag(variant)
-                        }
-                    } label: {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Pool variant")
-                                Text(poolVariant.caption)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "rectangle.connected.to.line.below")
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: poolVariant) { _, newValue in
-                        PoolVariantPreferences.current = newValue
-                        Task {
-                            await VPNProfileStore.shared.refreshSamizdatClient()
-                        }
-                    }
-                } header: {
-                    Text("Connection pool")
-                } footer: {
-                    Text("How many simultaneous TCP/443 connections the client opens to the server. V1 = one (stealth, slow), V2 = up to two (balanced), V3 = adaptive 2..4 (fastest, taller TLS fingerprint per ISP). V1 also engages strict-single-H2 mode. Plan B+ realtime auto-shape (voice / games stay on the lite transport) runs identically across all three.")
-                }
-
-                // ── Ping probe ───────────────────────────────────────────
-                // IPA-D21: target URL for the real-internet ping prober.
-                // Every 10 s the Go side opens an HTTP HEAD via the
-                // samizdat tunnel; the latency feeds the shield status.
-                // 2+ consecutive misses → "Proxy unreachable" yellow shield.
-                Section {
-                    Label {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Ping probe URL")
-                            TextField("https://example.com/probe", text: $pingURL)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
-                                .keyboardType(.URL)
-                                .font(.callout.monospaced())
-                                .onSubmit { savePingURL() }
-                        }
-                    } icon: {
-                        Image(systemName: "dot.radiowaves.left.and.right")
-                    }
-                    HStack {
-                        Button("Save") { savePingURL() }
-                            .buttonStyle(.borderedProminent)
-                        Spacer()
-                        Button("Reset to default") {
-                            pingURL = PingURLPreferences.defaultURL
-                            savePingURL()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                } header: {
-                    Text("Ping probe")
-                } footer: {
-                    Text("Every 10 seconds the client opens an HTTP HEAD request through the tunnel to this URL. Latency appears under the shield as “Ping XXms”. Two consecutive failures flip the shield to yellow (“Proxy unreachable”). Default: http://www.gstatic.com/generate_204 (Google connectivity probe — 204 No Content). Use cp.cloudflare.com/generate_204 for a Cloudflare alternative.")
-                }
-
-                // ── Diagnostics ──────────────────────────────────────────
-                Section {
-                    Button {
-                        showTelegram = true
-                    } label: {
-                        Label("Telegram log uploader", systemImage: "paperplane.fill")
-                    }
-                } header: {
-                    Text("Diagnostics")
-                } footer: {
-                    Text("Bot token + chat ID for sending the in-app log to a Telegram chat. Used for debugging.")
-                }
-
-                // ── About ────────────────────────────────────────────────
-                Section {
-                    HStack {
-                        Text("Version")
-                        Spacer()
-                        Text(versionLabel)
-                            .foregroundStyle(.secondary)
-                            .font(.body.monospaced())
-                    }
-                    Link(destination: URL(string: "https://github.com/detectqq/tamizdat")!) {
-                        Label("Project on GitHub", systemImage: "arrow.up.right.square")
-                    }
-                } header: {
-                    Text("About")
-                } footer: {
-                    Text("Tamizdat — anti-censorship tunnel client. Renamed from samizdat 2026-05-01.")
-                }
             }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+            if permissionStatus == .denied && notificationsEnabled {
+                DesignRow(
+                    icon: IconCard(systemName: "exclamationmark.triangle.fill",
+                                   bg: theme.amberDim, fg: theme.amber),
+                    title: "Notifications are blocked",
+                    sub: "Tap to open iOS Settings and re-enable.",
+                    isLast: true
+                ) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.textMuted)
                 }
-            }
-            .task {
-                permissionStatus = await NotificationPreferences.currentSystemAuthorization()
-            }
-            .alert("Notifications were not granted", isPresented: $permissionDeniedAlert) {
-                Button("Open iOS Settings") { openSystemSettings() }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("Enable notifications for Tamizdat in iOS Settings to receive whitelist-detection alerts.")
-            }
-            .sheet(isPresented: $showConfig) {
-                ConfigPasteView { saved in
-                    onConfigChanged(saved)
-                }
-            }
-            .sheet(isPresented: $showTelegram) {
-                TelegramSettingsView()
+                .contentShape(Rectangle())
+                .onTapGesture { openSystemSettings() }
             }
         }
     }
+
+    private var configurationCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "key.fill", bg: theme.mintDim, fg: theme.mint),
+                title: "Endpoints",
+                sub: configSubtitle,
+                isLast: true
+            ) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textMuted)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { showEndpoints = true }
+        }
+    }
+
+    private var pingProbeCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "waveform.path.ecg",
+                             bg: theme.mintDim, fg: theme.mint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Probe URL")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("HEAD every 10s through the tunnel")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                // Inline TextField for editing
+                TextField("https://example.com/probe", text: $pingURLDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveURL() }
+
+                HStack(spacing: 8) {
+                    Button(action: saveURL) {
+                        Text("Save")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: resetURL) {
+                        Text("Reset to default")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var appearanceCard: some View {
+        CardContainer(padding: 16) {
+            HStack(spacing: 12) {
+                IconCard(systemName: "paintpalette.fill",
+                         bg: theme.chip, fg: theme.text)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Theme")
+                        .font(.geist(.medium, size: 16))
+                        .foregroundStyle(theme.text)
+                    Text("Cream is the default. Dark suits OLED.")
+                        .font(.geist(.regular, size: 12.5))
+                        .foregroundStyle(theme.textDim)
+                }
+                Spacer()
+                // Custom segmented control matching the chip design
+                HStack(spacing: 2) {
+                    themeSegment(.cream)
+                    themeSegment(.dark)
+                }
+                .padding(3)
+                .background(theme.chip)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        }
+    }
+
+    private func themeSegment(_ option: AppTheme) -> some View {
+        let active = selectedTheme == option
+        return Button {
+            selectedTheme = option
+            ThemePreferences.current = option
+            // Propagate to root immediately
+            NotificationCenter.default.post(name: .tamizdatThemeChanged, object: nil)
+        } label: {
+            Text(option.label)
+                .font(.geist(.semibold, size: 13))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(active ? theme.chipActive : Color.clear)
+                .foregroundStyle(active ? theme.chipActiveText : theme.textDim)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var diagnosticsCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "doc.text",
+                               bg: theme.chip, fg: theme.textDim),
+                title: "View logs",
+                sub: "Live stream + filters",
+                isLast: false
+            ) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textMuted)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { showLogs = true }
+
+            DesignRow(
+                icon: IconCard(systemName: "paperplane.fill",
+                               bg: theme.chip, fg: theme.textDim),
+                title: "Telegram log uploader",
+                sub: "Bot token + chat id for debugging",
+                isLast: true
+            ) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textMuted)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { showTelegram = true }
+        }
+        .sheet(isPresented: $showLogs) {
+            // Pull bridge from environment-free reach — Logs reads from
+            // App Group log file directly, no shared SamizdatBridge needed.
+            LogView()
+                .environment(\.themeTokens, theme)
+        }
+    }
+
+    private var aboutCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "info.circle",
+                               bg: theme.chip, fg: theme.textDim),
+                title: "Version",
+                sub: versionLabel,
+                isLast: false
+            ) {
+                EmptyView()
+            }
+            DesignRow(
+                icon: IconCard(systemName: "arrow.up.right.square",
+                               bg: theme.chip, fg: theme.textDim),
+                title: "Project on GitHub",
+                sub: "github.com/detectqq/tamizdat",
+                isLast: true
+            ) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textMuted)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if let url = URL(string: "https://github.com/detectqq/tamizdat") {
+                    UIApplication.shared.open(url)
+                }
+            }
+        }
+    }
+
+    // MARK: – Helpers
 
     private var versionLabel: String {
         let info = Bundle.main.infoDictionary
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(marketing) (\(build))"
+        return "\(marketing) (\(build)) · IPA-D22"
+    }
+
+    private var configSubtitle: String {
+        let blob = ConfigStore.shared.load() ?? ""
+        if blob.isEmpty { return "Not configured" }
+        let split = SamizdatURLCodec.split(blob)
+        let mainConfigured = !split.primary.isEmpty
+        let backupConfigured = (split.backup != nil)
+        switch (mainConfigured, backupConfigured) {
+        case (true, true):   return "Main + Whitelist · 2 configured"
+        case (true, false):  return "Main only"
+        case (false, true):  return "Whitelist only (Main missing)"
+        case (false, false): return "Not configured"
+        }
+    }
+
+    private func saveURL() {
+        let trimmed = pingURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        PingURLPreferences.url = trimmed
+        pingURL = PingURLPreferences.url
+        pingURLDraft = pingURL
+        Task { await VPNProfileStore.shared.refreshPingURL() }
+    }
+
+    private func resetURL() {
+        PingURLPreferences.resetToDefault()
+        pingURL = PingURLPreferences.url
+        pingURLDraft = pingURL
+        Task { await VPNProfileStore.shared.refreshPingURL() }
     }
 
     private func handleEnableNotifications() async {
@@ -215,7 +398,6 @@ struct SettingsView: View {
         if granted {
             NotificationPreferences.enabled = true
         } else {
-            // Bounce toggle back; surface alert directing to iOS Settings.
             NotificationPreferences.enabled = false
             notificationsEnabled = false
             permissionDeniedAlert = true
@@ -226,20 +408,11 @@ struct SettingsView: View {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
     }
+}
 
-    /// IPA-D21: persist the typed ping URL and poke the extension to
-    /// pick it up live. Trims whitespace; an empty string falls back to
-    /// the default in PingURLPreferences. Sending the provider message
-    /// is a no-op when the tunnel is not running — next startTunnel
-    /// will read the new value from App Group UserDefaults itself.
-    private func savePingURL() {
-        let trimmed = pingURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        PingURLPreferences.url = trimmed
-        // Re-read so the field reflects what's actually stored (e.g.
-        // empty -> default URL).
-        pingURL = PingURLPreferences.url
-        Task {
-            await VPNProfileStore.shared.refreshPingURL()
-        }
-    }
+/// Notification name used to flip the theme live without dismissing the
+/// Settings sheet. App.swift / ContentView listens and re-reads
+/// `ThemePreferences.current` to update the environment.
+extension Notification.Name {
+    static let tamizdatThemeChanged = Notification.Name("tamizdat.themeChanged")
 }

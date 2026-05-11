@@ -63,23 +63,43 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// (debugging aid; not rendered on the main screen).
     let pingURL: String
 
+    /// IPA-D22: cumulative hev rx_bytes since extension start.
+    /// Sourced from `hev_socks5_tunnel_stats()` in PacketTunnelProvider.
+    /// 0 when offline. The wire field is named `rxBytes`.
+    let rxBytes: Int64
+    /// IPA-D22: cumulative hev tx_bytes since extension start.
+    /// 0 when offline. The wire field is named `txBytes`.
+    let txBytes: Int64
+    /// IPA-D22: monotonic seconds since the extension's startTunnel call
+    /// completed. 0 when offline. Surfaced as the Uptime stat tile.
+    let uptimeSec: Int64
+    /// IPA-D22: 1 while `rewireUpstream` is mid-flight (samizdat client
+    /// being torn down + rebuilt after a path change). The shield flips
+    /// to amber "Reconnecting…" during this window. 0 otherwise.
+    let isRewiring: Int
+
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
         rttLiteMs: -1, rttBulkMs: -1,
-        pingMs: -1, pingOK: false, pingFailed: false, pingURL: ""
+        pingMs: -1, pingOK: false, pingFailed: false, pingURL: "",
+        rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0
     )
 
     // IPA-D21: tolerate older extension JSON (pre-D21 lacks ping*
     // fields). Once everyone's on D21+ this can be removed in the same
     // cleanup commit that drops the legacy RTT fields.
+    // IPA-D22: rxBytes / txBytes / uptimeSec / isRewiring added; same
+    // default-tolerant decode pattern.
     private enum CodingKeys: String, CodingKey {
         case realShape, lockedFlows, liteAlive, rttLiteMs, rttBulkMs
         case pingMs, pingOK, pingFailed, pingURL
+        case rxBytes, txBytes, uptimeSec, isRewiring
     }
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
          rttLiteMs: Int, rttBulkMs: Int,
-         pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String) {
+         pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String,
+         rxBytes: Int64, txBytes: Int64, uptimeSec: Int64, isRewiring: Int) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
         self.liteAlive = liteAlive
@@ -89,6 +109,10 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.pingOK = pingOK
         self.pingFailed = pingFailed
         self.pingURL = pingURL
+        self.rxBytes = rxBytes
+        self.txBytes = txBytes
+        self.uptimeSec = uptimeSec
+        self.isRewiring = isRewiring
     }
 
     init(from decoder: Decoder) throws {
@@ -102,12 +126,36 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.pingOK      = (try? c.decode(Bool.self,   forKey: .pingOK))      ?? false
         self.pingFailed  = (try? c.decode(Bool.self,   forKey: .pingFailed))  ?? false
         self.pingURL     = (try? c.decode(String.self, forKey: .pingURL))     ?? ""
+        self.rxBytes     = (try? c.decode(Int64.self,  forKey: .rxBytes))     ?? 0
+        self.txBytes     = (try? c.decode(Int64.self,  forKey: .txBytes))     ?? 0
+        self.uptimeSec   = (try? c.decode(Int64.self,  forKey: .uptimeSec))   ?? 0
+        self.isRewiring  = (try? c.decode(Int.self,    forKey: .isRewiring))  ?? 0
     }
 }
 
 @MainActor
 final class TamizdatStatusStore: ObservableObject {
     @Published private(set) var snapshot: TamizdatStatusSnapshot = .offline
+
+    /// IPA-D22: total tunnel rx/tx bytes (from hev counters via the
+    /// "status" RPC, published whenever we get a non-offline reply).
+    /// Used by the Data stat tile + ping chip data-rate readout.
+    @Published private(set) var rxBytes: Int64 = 0
+    @Published private(set) var txBytes: Int64 = 0
+
+    /// IPA-D22: monotonic timestamp when the snapshot first transitioned
+    /// from offline → online. Cleared on the next offline tick. Drives
+    /// the "Uptime" stat tile. We do NOT reset on rewireUpstream — that
+    /// only swaps the upstream endpoint, the tunnel itself stays up.
+    @Published private(set) var tunnelStartedAt: Date?
+
+    /// IPA-D22: exponential-moving average of the data rate
+    /// (KB/s) — smoothed so the ping chip readout doesn't flicker.
+    @Published private(set) var smoothedRateKBps: Double = 0
+
+    private var lastRxBytes: Int64 = 0
+    private var lastTxBytes: Int64 = 0
+    private var lastSampleAt: Date?
 
     private var timer: Timer?
 
@@ -173,5 +221,141 @@ final class TamizdatStatusStore: ObservableObject {
         if result != snapshot {
             snapshot = result
         }
+        applyDerivedState(snap: result)
     }
+
+    // MARK: – Derived state (IPA-D22)
+
+    /// Re-derive uptime / data / rate from the latest snapshot. Called
+    /// on every poll. Updates the @Published mirror properties only when
+    /// they actually change, to keep SwiftUI re-renders minimal.
+    private func applyDerivedState(snap: TamizdatStatusSnapshot) {
+        let online = !snap.realShape.isEmpty
+        let now = Date()
+
+        // Uptime: derived directly from snap.uptimeSec (extension-side
+        // anchor). We don't rely on a Swift-side timestamp because the
+        // app may have been launched after the tunnel was already up
+        // (background restore), and we'd start counting at 0 then.
+        if online && snap.uptimeSec > 0 {
+            let inferredStart = now.addingTimeInterval(-TimeInterval(snap.uptimeSec))
+            // Only re-assign if the new value drifts meaningfully (>2 s)
+            // to avoid republishing every poll.
+            if let cur = tunnelStartedAt {
+                if abs(cur.timeIntervalSince(inferredStart)) > 2 {
+                    tunnelStartedAt = inferredStart
+                }
+            } else {
+                tunnelStartedAt = inferredStart
+            }
+        } else {
+            if tunnelStartedAt != nil { tunnelStartedAt = nil }
+        }
+
+        // Cumulative bytes — straight pass-through.
+        if rxBytes != snap.rxBytes { rxBytes = snap.rxBytes }
+        if txBytes != snap.txBytes { txBytes = snap.txBytes }
+
+        // Data rate — EMA on (rx+tx) delta over wall-clock delta.
+        if online {
+            if let last = lastSampleAt {
+                let dt = now.timeIntervalSince(last)
+                if dt >= 0.2 {
+                    let dRx = max(0, snap.rxBytes - lastRxBytes)
+                    let dTx = max(0, snap.txBytes - lastTxBytes)
+                    let bytesPerSec = Double(dRx + dTx) / dt
+                    let kbps = bytesPerSec / 1024.0
+                    // Alpha 0.30: balances responsiveness vs flicker.
+                    let alpha = 0.30
+                    let next = (smoothedRateKBps * (1 - alpha)) + (kbps * alpha)
+                    // Only republish on a meaningful change (>= 5%).
+                    if abs(next - smoothedRateKBps) >= max(2.0, smoothedRateKBps * 0.05) {
+                        smoothedRateKBps = next
+                    }
+                    lastSampleAt = now
+                    lastRxBytes = snap.rxBytes
+                    lastTxBytes = snap.txBytes
+                }
+            } else {
+                lastSampleAt = now
+                lastRxBytes = snap.rxBytes
+                lastTxBytes = snap.txBytes
+                if smoothedRateKBps != 0 { smoothedRateKBps = 0 }
+            }
+        } else {
+            if smoothedRateKBps != 0 { smoothedRateKBps = 0 }
+            lastSampleAt = nil
+            lastRxBytes = 0
+            lastTxBytes = 0
+        }
+    }
+
+    // MARK: – Formatted strings (IPA-D22)
+
+    /// "Main" / "Whitelist" — synced from `EndpointModeStore.current`.
+    /// The store doesn't know which mode is selected — caller passes
+    /// the resolved label in. Kept as a free helper for symmetry.
+    static func modeLabel(active: EndpointMode) -> String {
+        switch active {
+        case .primary: return "Main"
+        case .backup:  return "Whitelist"
+        case .auto:    return "Auto"
+        }
+    }
+
+    /// "14:32" for under 1 hour, "1:14" for hours+min. "—" if offline.
+    var uptimeText: String {
+        guard let started = tunnelStartedAt else { return "—" }
+        let elapsed = Int(Date().timeIntervalSince(started))
+        if elapsed < 0 { return "—" }
+        if elapsed < 3600 {
+            let m = elapsed / 60
+            let s = elapsed % 60
+            return String(format: "%d:%02d", m, s)
+        }
+        let h = elapsed / 3600
+        let m = (elapsed % 3600) / 60
+        return String(format: "%d:%02d", h, m)
+    }
+
+    /// Unit for the Uptime stat tile: "min" if <1h else "h".
+    var uptimeUnit: String {
+        guard let started = tunnelStartedAt else { return "" }
+        return Date().timeIntervalSince(started) < 3600 ? "min" : "h"
+    }
+
+    /// Auto-scaled total data text + unit, e.g. ("284", "MB").
+    var dataText: (value: String, unit: String) {
+        let total = rxBytes + txBytes
+        if total <= 0 { return ("0", "B") }
+        let kb = Double(total) / 1024.0
+        let mb = kb / 1024.0
+        let gb = mb / 1024.0
+        if gb >= 1.0 {
+            return (String(format: gb >= 10 ? "%.0f" : "%.1f", gb), "GB")
+        }
+        if mb >= 1.0 {
+            return (String(format: mb >= 10 ? "%.0f" : "%.1f", mb), "MB")
+        }
+        if kb >= 1.0 {
+            return (String(format: "%.0f", kb), "KB")
+        }
+        return (String(total), "B")
+    }
+
+    /// Smoothed data-rate as a short display string, e.g. "1.2 MB/s",
+    /// "850 KB/s", "—" if no sample yet.
+    var dataRateText: String {
+        let kbps = smoothedRateKBps
+        if kbps <= 1.0 { return "—" }
+        let mbps = kbps / 1024.0
+        if mbps >= 1.0 {
+            return String(format: "%.1f MB/s", mbps)
+        }
+        return String(format: "%.0f KB/s", kbps)
+    }
+
+    /// IPA-D22: true when the extension is currently in a rewireUpstream
+    /// rebuild. Drives the "Reconnecting…" shield state.
+    var isReconnecting: Bool { snapshot.isRewiring != 0 && !snapshot.realShape.isEmpty }
 }

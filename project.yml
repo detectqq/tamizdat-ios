@@ -81,13 +81,11 @@ targets:
       # check the user-set enabled flag before posting a local
       # notification on whitelist on/off transitions.
       - path: samizdat-ios/NotificationPreferences.swift
-      # IPA-X: PoolVariantPreferences shared so the SocksStub can
-      # read the V1/V2/V3 picker value at startTunnel and on
-      # refreshSamizdatClient (live UI flip). App Group UserDefaults
-      # entry that gets converted into a SocksstubSetPoolVariant
-      # call before SocksstubSetSamizdatConfig builds the next
-      # ClientConfig.
-      - path: samizdat-ios/PoolVariantPreferences.swift
+      # IPA-D22: PoolVariantPreferences deleted — V1 is hardcoded in Go
+      # (mobile/socksstub) and never exposed in the iOS UI. The
+      # extension still calls `SocksstubSetPoolVariant("v1")` directly
+      # to keep the Go bridge wired with the same value, but no Swift
+      # storage is involved any more.
       # IPA-D20 (Phase C iOS-notify, 2026-05-11): NotificationPayload
       # shape + App Group / Darwin constants shared between app and
       # extension. Extension encodes after a server callback, app

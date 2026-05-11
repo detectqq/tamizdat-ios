@@ -1,39 +1,37 @@
 import SwiftUI
 
+/// IPA-D22: Home screen — full SwiftUI rewrite per the 2026 design
+/// handoff at `C:\var-tmp\ios-redesign\design_handoff_samizdat_vpn_2026\`.
+///
+/// Top bar (SZ-mark + Tamizdat wordmark + Logs/Settings buttons),
+/// large 220px ShieldMark hero, status label + mint Ping chip,
+/// 3 stat tiles (Mode/Uptime/Data), Auto-detect whitelist row when
+/// backup configured, big 60pt Connect/Disconnect button, mono caption.
+///
+/// State machine: 6 states `off / connecting / connected /
+/// reconnecting / failed / error`. Phase C iOS-notify observer
+/// preserved from D20 — server alerts still render via `.alert(...)`.
 struct ContentView: View {
+    @Environment(\.themeTokens) private var theme
+
     @StateObject private var bridge = SamizdatBridge()
+    @StateObject private var lampStore = TamizdatStatusStore()
+    @StateObject private var serverNotif = ServerNotificationObserver()
+
     @State private var showSettings = false
     @State private var showLogs = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
 
-    // IPA-P.1: split the 3-way segmented picker into a clearer
-    // "Auto detection on/off" toggle + a manual endpoint picker that
-    // is only shown when auto is off. The persistent EndpointMode in
-    // App Group UserDefaults still has three values (primary/backup/
-    // auto) — this UI just maps them to two controls.
     @State private var isAutoMode: Bool = (EndpointModeStore.current == .auto)
     @State private var manualEndpoint: EndpointMode = {
         let cur = EndpointModeStore.current
         return cur == .auto ? .primary : cur
     }()
 
-    // IPA-Q: live whitelist-detection status, polled from App Group
-    // UserDefaults every 2 s while the view is visible.
     @State private var whitelistStatus: WhitelistStatus = .unknown
     @State private var whitelistActiveEndpoint: EndpointMode = .primary
     @State private var statusPollTimer: Timer?
-
-    // IPA-Z: live shape/RTT lamp identical to the Windows-GUI line
-    // ("○ bulk • RTT 17ms" / "● lite • RTT 23ms"). Polled at 500 ms
-    // via a Timer owned by TamizdatStatusStore (in-process gomobile
-    // calls, no HTTP).
-    @StateObject private var lampStore = TamizdatStatusStore()
-
-    // Phase C iOS-notify (2026-05-11): reactive observer for server-pushed
-    // notifications that the extension persisted into App Group UserDefaults.
-    // Fires when the NE bridge posts the Darwin notification.
-    @StateObject private var serverNotif = ServerNotificationObserver()
 
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
@@ -43,159 +41,131 @@ struct ContentView: View {
         return SamizdatURLCodec.split(blob).backup != nil
     }
 
-    var body: some View {
-        VStack(spacing: 28) {
-            // ── Status ─────────────────────────────────────────────────────
-            VStack(spacing: 12) {
-                Image(systemName: stateIcon)
-                    .font(.system(size: 88))
-                    .foregroundStyle(stateColor)
-                    .symbolEffect(.pulse, isActive: bridge.state == .connecting)
+    /// IPA milestone tag rendered in the build caption.
+    private static let milestoneTag = "D22"
 
-                Text(stateTitle)
-                    .font(.title)
-                    .bold()
+    // MARK: – Derived state
 
-                if !bridge.lastError.isEmpty && bridge.state == .error {
-                    Text(bridge.lastError)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
-                if let vpnProfileError {
-                    Text(vpnProfileError)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
-                if !bridge.socksAddr.isEmpty && bridge.state == .connected {
-                    Text("SOCKS5: \(bridge.socksAddr)")
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
+    /// 6-state derivation. Order of precedence:
+    ///   1. `.error`         (bridge.state == .error)
+    ///   2. `.reconnecting`  (lampStore.isReconnecting && was connected)
+    ///   3. `.connecting`    (bridge.state == .connecting)
+    ///   4. `.failed`        (connected but ping prober says failed)
+    ///   5. `.connected`     (bridge.state == .connected)
+    ///   6. `.off`           (otherwise)
+    private enum HomeState {
+        case off, connecting, connected, reconnecting, failed, error
 
-                // IPA-D21: real-internet ping status (was bulk/lite RTT
-                // lamp in IPA-Z; bulk/lite was dead after D18 disabled
-                // cover traffic + the realtime detector). Format:
-                //   "Ping 42ms"     — healthy
-                //   "Ping failed"   — 2+ consecutive probe misses
-                //   "Ping —"        — connected but no successful probe yet
-                // Hidden while tunnel is offline.
-                if bridge.state == .connected && !lampStore.realShape.isEmpty {
-                    Text(lampStore.lampLabel)
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
+        var statusLabel: String {
+            switch self {
+            case .off:          return "Off"
+            case .connecting:   return "Connecting…"
+            case .connected:    return "Protected"
+            case .reconnecting: return "Reconnecting…"
+            case .failed:       return "Proxy unreachable"
+            case .error:        return "Error"
             }
-
-            Spacer()
-
-            // ── Connect/Disconnect ─────────────────────────────────────────
-            Button(action: toggleConnection) {
-                Text(buttonTitle)
-                    .font(.title2.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(buttonTint)
-            .disabled(bridge.state == .connecting || isPreparingVPN || !hasConfig)
-
-            if !hasConfig {
-                Text("Paste a samizdat:// config first")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            // ── Endpoint controls (only when backup configured) ────────────
-            if hasBackupConfigured {
-                VStack(alignment: .leading, spacing: 10) {
-                    Toggle(isOn: $isAutoMode) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "antenna.radiowaves.left.and.right")
-                            Text("Auto-detect whitelist")
-                                .font(.subheadline.weight(.medium))
-                        }
-                    }
-                    .onChange(of: isAutoMode) { _, newAuto in
-                        let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
-                        Task {
-                            await VPNProfileStore.shared.switchEndpoint(to: newMode)
-                        }
-                    }
-
-                    if isAutoMode {
-                        // IPA-Q: live status from WhitelistDetector via
-                        // WhitelistStatusStore (App Group UserDefaults).
-                        HStack(spacing: 6) {
-                            Image(systemName: "circle.fill")
-                                .foregroundStyle(statusColor)
-                                .font(.caption)
-                            Text(statusText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Picker("Endpoint", selection: $manualEndpoint) {
-                            Text(EndpointMode.primary.label).tag(EndpointMode.primary)
-                            Text(EndpointMode.backup.label).tag(EndpointMode.backup)
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: manualEndpoint) { _, newEndpoint in
-                            guard !isAutoMode else { return }
-                            Task {
-                                await VPNProfileStore.shared.switchEndpoint(to: newEndpoint)
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 4)
-            }
-
-            // ── Sub-buttons ────────────────────────────────────────────────
-            HStack(spacing: 12) {
-                Button {
-                    showLogs = true
-                } label: {
-                    Label("Logs", systemImage: "doc.text.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    showSettings = true
-                } label: {
-                    Label("Settings", systemImage: "gearshape.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.bordered)
-            }
-
-            Text(buildLabel)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
-        .padding(24)
+
+        func accent(theme: ThemeTokens) -> Color {
+            switch self {
+            case .off:          return theme.red
+            case .connecting:   return theme.amber
+            case .connected:    return theme.mint
+            case .reconnecting: return theme.amber
+            case .failed:       return theme.amber
+            case .error:        return theme.red
+            }
+        }
+
+        var connectButtonLabel: String {
+            switch self {
+            case .connected:    return "Disconnect"
+            case .reconnecting: return "Disconnect"
+            case .failed:       return "Disconnect"
+            case .connecting:   return "Connecting…"
+            default:            return "Connect"
+            }
+        }
+
+        var isConnectButtonRed: Bool {
+            switch self {
+            case .connected, .reconnecting, .failed: return true
+            default: return false
+            }
+        }
+
+        var showsPingChip: Bool {
+            self == .connected || self == .failed
+        }
+    }
+
+    private var homeState: HomeState {
+        switch bridge.state {
+        case .error:
+            return .error
+        case .connecting:
+            return .connecting
+        case .connected:
+            if lampStore.isReconnecting { return .reconnecting }
+            if lampStore.snapshot.pingFailed { return .failed }
+            return .connected
+        case .disconnected:
+            return .off
+        }
+    }
+
+    // MARK: – Body
+
+    var body: some View {
+        ZStack {
+            ThemeBackground(theme: theme)
+
+            VStack(spacing: 0) {
+                topBar
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .padding(.bottom, 6)
+
+                hero
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                statTiles
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+
+                if hasBackupConfigured {
+                    autoDetectRow
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                }
+
+                connectButton
+                    .padding(.horizontal, 16)
+                    .padding(.top, 14)
+
+                buildCaption
+                    .padding(.top, 10)
+                    .padding(.bottom, 18)
+            }
+        }
+        .preferredColorScheme(theme.isDark ? .dark : .light)
         .sheet(isPresented: $showSettings) {
             SettingsView(onConfigChanged: { saved in
                 hasConfig = saved
                 hasBackupConfigured = ContentView.checkBackupConfigured()
                 if !hasBackupConfigured {
-                    if manualEndpoint == .backup {
-                        manualEndpoint = .primary
-                    }
+                    if manualEndpoint == .backup { manualEndpoint = .primary }
                     if EndpointModeStore.current == .backup {
                         EndpointModeStore.current = .primary
                     }
                 }
             })
+            .environment(\.themeTokens, theme)
         }
         .sheet(isPresented: $showLogs) {
-            LogView(bridge: bridge)
+            LogView(injectedBridge: bridge)
+                .environment(\.themeTokens, theme)
         }
         .onAppear {
             startStatusPolling()
@@ -205,11 +175,7 @@ struct ContentView: View {
             stopStatusPolling()
             lampStore.stop()
         }
-        // Phase C iOS-notify (2026-05-11): server-pushed message alert.
-        // Replaces (or coexists with) the OS notification banner — the OS
-        // notification only fires when the user has enabled notifications
-        // in NotificationPreferences, but this alert always shows when the
-        // app is foregrounded.
+        // Phase C iOS-notify (preserved from D20): server-pushed alert.
         .alert(
             serverNotif.latest?.title.isEmpty == false
                 ? (serverNotif.latest?.title ?? "Сообщение")
@@ -226,116 +192,229 @@ struct ContentView: View {
         }
     }
 
-    // MARK: – derived
+    // MARK: – Top bar
 
-    // IPA-D21: derived "failed" state — connected to the VPN but the
-    // real-internet ping prober reports 2+ consecutive misses. Sits
-    // between .connected (green) and .error (red): tunnel is up but
-    // can't reach the open internet.
-    private var isProxyUnreachable: Bool {
-        bridge.state == .connected && lampStore.snapshot.pingFailed
-    }
-
-    private var stateIcon: String {
-        if isProxyUnreachable {
-            return "exclamationmark.shield"
-        }
-        switch bridge.state {
-        case .disconnected: return "shield.slash"
-        case .connecting:   return "shield.lefthalf.filled"
-        case .connected:    return "shield.lefthalf.filled.badge.checkmark"
-        case .error:        return "exclamationmark.shield.fill"
-        }
-    }
-
-    private var stateColor: Color {
-        if isProxyUnreachable {
-            return .yellow
-        }
-        switch bridge.state {
-        case .disconnected: return .secondary
-        case .connecting:   return .yellow
-        case .connected:    return .green
-        case .error:        return .red
+    private var topBar: some View {
+        HStack {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(theme.mintDim)
+                        .frame(width: 28, height: 28)
+                    Text("SZ")
+                        .font(.geist(.bold, size: 13))
+                        .tracking(-0.52)
+                        .foregroundStyle(theme.mint)
+                }
+                Text("Tamizdat")
+                    .font(.geist(.semibold, size: 15))
+                    .tracking(-0.15)
+                    .foregroundStyle(theme.text)
+            }
+            Spacer()
+            HStack(spacing: 8) {
+                circleIconButton(systemName: "doc.text") { showLogs = true }
+                circleIconButton(systemName: "gearshape") { showSettings = true }
+            }
         }
     }
 
-    private var stateTitle: String {
-        if isProxyUnreachable {
-            return "Proxy unreachable"
+    private func circleIconButton(systemName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(theme.chip).frame(width: 34, height: 34)
+                Image(systemName: systemName)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.textDim)
+            }
         }
-        switch bridge.state {
-        case .disconnected: return "Disconnected"
-        case .connecting:   return "Connecting…"
-        case .connected:    return "Connected"
-        case .error:        return "Error"
+        .buttonStyle(.plain)
+    }
+
+    // MARK: – Hero
+
+    private var hero: some View {
+        VStack(spacing: 18) {
+            ShieldMark(
+                size: 220,
+                color: homeState.accent(theme: theme),
+                dim: theme.isDark ? theme.mintInk : Color.black.opacity(0.18)
+            )
+
+            VStack(spacing: 12) {
+                Text(homeState.statusLabel)
+                    .font(.geist(.bold, size: 38))
+                    .tracking(-1.14)
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+
+                if homeState.showsPingChip {
+                    PingChip(
+                        pingMs: lampStore.snapshot.pingMs >= 0 ? lampStore.snapshot.pingMs : nil,
+                        dataRateText: lampStore.dataRateText == "—" ? nil : lampStore.dataRateText
+                    )
+                }
+
+                if !bridge.lastError.isEmpty && bridge.state == .error {
+                    Text(bridge.lastError)
+                        .font(.geist(.regular, size: 13))
+                        .foregroundStyle(theme.textDim)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+                if let vpnProfileError {
+                    Text(vpnProfileError)
+                        .font(.geist(.regular, size: 13))
+                        .foregroundStyle(theme.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+                if !hasConfig {
+                    Text("Paste a tamizdat:// link in Settings → Endpoints to begin.")
+                        .font(.geist(.regular, size: 13))
+                        .foregroundStyle(theme.textDim)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+            }
         }
     }
 
-    private var buttonTitle: String {
-        if isPreparingVPN { return "Preparing VPN..." }
-        switch bridge.state {
-        case .connected:  return "Disconnect"
-        case .connecting: return "Connecting…"
-        default:          return "Connect"
+    // MARK: – Stat tiles
+
+    private var statTiles: some View {
+        HStack(spacing: 8) {
+            StatTile(label: "Mode",
+                     value: TamizdatStatusStore.modeLabel(active: effectiveEndpoint),
+                     unit: nil)
+            StatTile(label: "Uptime",
+                     value: lampStore.uptimeText,
+                     unit: lampStore.uptimeUnit.isEmpty ? nil : lampStore.uptimeUnit)
+            StatTile(label: "Data",
+                     value: lampStore.dataText.value,
+                     unit: lampStore.dataText.unit)
         }
     }
 
-    private var buttonTint: Color {
-        bridge.state == .connected ? .red : .blue
+    /// "Effective" endpoint for label purposes:
+    ///   - manual primary/backup → the picked one
+    ///   - auto                 → WhitelistStatusStore.activeEndpoint
+    private var effectiveEndpoint: EndpointMode {
+        if EndpointModeStore.current == .auto {
+            return whitelistActiveEndpoint
+        }
+        return EndpointModeStore.current
     }
 
-    /// IPA milestone tag rendered next to the version in the footer.
-    /// Bump this when promoting a new milestone IPA so testers can tell
-    /// at a glance which build is on the device. Source of truth:
-    /// `ipa/milestones/<TAG>-...` directory name.
-    private static let milestoneTag = "D21"
+    // MARK: – Auto-detect Whitelist row
 
-    /// "IPA-Z6 · v0.2.42-fab1f9e (build 42)" — milestone tag is
-    /// hardcoded above; rest is pulled from Info.plist, which the CI
-    /// workflow stamps with MARKETING_VERSION = 0.2.<run>-<git-sha> and
-    /// CURRENT_PROJECT_VERSION = <run>. Updates on every build.
+    private var autoDetectRow: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "dot.radiowaves.up.forward",
+                               bg: theme.blueDim,
+                               fg: theme.blue),
+                title: "Auto-detect Whitelist",
+                sub: whitelistSub,
+                isLast: true
+            ) {
+                Toggle("", isOn: $isAutoMode)
+                    .labelsHidden()
+                    .tint(theme.mint)
+                    .onChange(of: isAutoMode) { _, newAuto in
+                        let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
+                        Task {
+                            await VPNProfileStore.shared.switchEndpoint(to: newMode)
+                        }
+                    }
+            }
+        }
+    }
+
+    private var whitelistSub: String {
+        if !isAutoMode {
+            return "Manual · using \(manualEndpoint == .backup ? "Whitelist" : "Main")"
+        }
+        switch whitelistStatus {
+        case .off:        return "using Main · detector ok"
+        case .detected:   return "ON · using Whitelist endpoint"
+        case .frozen:     return "frozen · captive portal suspected"
+        case .noNetwork:  return "paused · no network"
+        case .unknown:    return "monitoring…"
+        }
+    }
+
+    // MARK: – Connect button
+
+    private var connectButton: some View {
+        Button(action: toggleConnection) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(homeState.isConnectButtonRed ? Color.white : theme.mintInk)
+                    .frame(width: 8, height: 8)
+                Text(homeState.connectButtonLabel)
+                    .font(.geist(.bold, size: 18))
+                    .tracking(-0.18)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 60)
+            .background(homeState.isConnectButtonRed ? theme.red : theme.mint)
+            .foregroundStyle(homeState.isConnectButtonRed ? Color.white : theme.mintInk)
+            .clipShape(RoundedRectangle(cornerRadius: 20))
+            .shadow(
+                color: homeState.isConnectButtonRed
+                    ? Color.red.opacity(0.32)
+                    : theme.mint.opacity(0.28),
+                radius: 12, x: 0, y: 6
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(bridge.state == .connecting || isPreparingVPN || !hasConfig)
+        .opacity((bridge.state == .connecting || isPreparingVPN || !hasConfig) ? 0.6 : 1.0)
+    }
+
+    // MARK: – Build caption
+
+    private var buildCaption: some View {
+        Text(buildLabel.uppercased())
+            .font(.geistMono(.semibold, size: 10.5))
+            .tracking(0.42)
+            .foregroundStyle(theme.textMuted)
+    }
+
     private var buildLabel: String {
         let info = Bundle.main.infoDictionary
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "IPA-\(Self.milestoneTag) · v\(marketing) (build \(build))"
+        return "Tamizdat · v\(marketing) (build \(build)) · IPA-\(Self.milestoneTag)"
     }
 
-    // IPA-Q: status badge colour + text driven by WhitelistDetector.
-    private var statusColor: Color {
-        switch whitelistStatus {
-        case .off:        return .green
-        case .detected:   return .red
-        case .frozen:     return .yellow
-        case .noNetwork:  return .gray
-        case .unknown:    return .gray
+    // MARK: – Actions
+
+    private func toggleConnection() {
+        if bridge.state == .connected {
+            bridge.disconnect()
+            return
+        }
+        guard let blob = ConfigStore.shared.load() else { return }
+        isPreparingVPN = true
+        vpnProfileError = nil
+        Task { @MainActor in
+            defer { isPreparingVPN = false }
+            do {
+                try await bridge.connect(blob)
+            } catch {
+                vpnProfileError = error.localizedDescription
+            }
         }
     }
 
-    private var statusText: String {
-        switch whitelistStatus {
-        case .off:
-            return "Whitelist: off (using main)"
-        case .detected:
-            let ep = whitelistActiveEndpoint == .backup ? "whitelist server" : "main"
-            return "Whitelist: ON — using \(ep)"
-        case .frozen:
-            return "Frozen: captive portal suspected"
-        case .noNetwork:
-            return "Whitelist: no network (paused)"
-        case .unknown:
-            return "Whitelist: monitoring…"
-        }
-    }
+    // MARK: – Status polling
 
     private func refreshWhitelistStatus() {
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
-        // The detector cycle cadence is 30 s normal / 60 s on-backup
-        // / up to 180 s in Low Power Mode. Stale-out at 3× the longest
-        // expected cadence so we don't misreport detector death on
-        // perfectly-healthy LPM devices. 200 s = generous.
         if isAutoMode && bridge.state == .connected
             && WhitelistStatusStore.ageSeconds > 200 {
             whitelistStatus = .unknown
@@ -349,49 +428,21 @@ struct ContentView: View {
         }
         RunLoop.main.add(timer, forMode: .common)
         statusPollTimer = timer
-        refreshWhitelistStatus() // immediate
+        refreshWhitelistStatus()
     }
 
     private func stopStatusPolling() {
         statusPollTimer?.invalidate()
         statusPollTimer = nil
     }
-
-    private func toggleConnection() {
-        if bridge.state == .connected {
-            bridge.disconnect()
-            return
-        }
-        guard let blob = ConfigStore.shared.load() else { return }
-
-        isPreparingVPN = true
-        vpnProfileError = nil
-
-        Task { @MainActor in
-            defer { isPreparingVPN = false }
-            do {
-                try await bridge.connect(blob)
-            } catch {
-                vpnProfileError = error.localizedDescription
-            }
-        }
-    }
 }
 
-// MARK: – Phase C iOS-notify server-message observer
+// MARK: – Phase C iOS-notify server-message observer (preserved verbatim from D20)
 //
 // Sits on the app side; listens for a Darwin notification posted by the
 // NE-side `NotificationBridge` whenever a server-pushed
 // `CoverConfigBundle.Notification` has been persisted into App Group
-// UserDefaults. Re-reads the JSON and exposes the latest as
-// `@Published`. `ContentView` binds it to an `.alert(...)`.
-//
-// Notes:
-//   - On `init` we read the current value too, so a notification that
-//     was delivered while the app was killed still surfaces on next launch.
-//   - `dismiss()` clears the App Group entry, so a re-launch doesn't
-//     show the same message again. The OS-level UN notification still
-//     uses `code` as identifier and is replace-on-resend.
+// UserDefaults.
 final class ServerNotificationObserver: ObservableObject {
     @Published var latest: NotificationPayload?
 
@@ -424,8 +475,6 @@ final class ServerNotificationObserver: ObservableObject {
             let data = defaults.data(forKey: ServerNotificationConstants.userDefaultsKey),
             let payload = try? JSONDecoder().decode(NotificationPayload.self, from: data)
         else { return }
-        // Only republish when the payload is actually different — keeps
-        // the alert from re-popping on every Darwin tick.
         if payload != latest {
             latest = payload
         }
@@ -440,4 +489,5 @@ final class ServerNotificationObserver: ObservableObject {
 
 #Preview {
     ContentView()
+        .environment(\.themeTokens, ThemeTokens.cream)
 }

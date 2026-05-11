@@ -65,6 +65,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
     private var lastReconnectAt = Date.distantPast
 
+    // IPA-D22: timestamp when startTunnel completed (the SOCKS5 listener
+    // is up and we handed packets to hev). Surfaced in the "status" RPC
+    // as uptimeSec so the main-app Uptime stat tile can render m:ss /
+    // h:mm without keeping its own anchor.
+    private let tunnelStartedAtLock = OSAllocatedUnfairLock<Date?>(initialState: nil)
+    private var tunnelStartedAt: Date? {
+        get { tunnelStartedAtLock.withLock { $0 } }
+        set { tunnelStartedAtLock.withLock { $0 = newValue } }
+    }
+
+    // IPA-D22: 1 while rewireUpstream is mid-flight (SetSamizdatConfig
+    // call running on a background queue). Surfaced as `isRewiring` in
+    // the status RPC so the main-app shield can flip to amber
+    // "Reconnecting…" instantly without waiting for path-monitor
+    // settling. Read+written under runningState's same unfair lock for
+    // cheapness — concurrency model: one rewire at a time.
+    private let rewiringFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private var isRewiring: Bool {
+        get { rewiringFlag.withLock { $0 } }
+        set { rewiringFlag.withLock { $0 = newValue } }
+    }
+
     // IPA-P: dual-endpoint storage. The combined blob arrives in
     // providerConfiguration; we split it into primary + optional backup
     // and pick which one to dial based on EndpointModeStore.current
@@ -165,14 +187,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return false
             }
         }
-        // IPA-X: seed Go-side with the persisted V1/V2/V3 picker before
-        // building the client. The setter just stores the bit;
-        // SetSamizdatConfig below reads it when constructing ClientConfig.
-        // IPA-Y: Performance-mode toggle removed — Plan B+ realtime
-        // detector auto-flips the bulk transport to ShapeLite during
-        // any realtime flow (cover/fragmentation suspended for that
-        // window only), so no static kill switch is needed.
-        SocksstubSetPoolVariant(PoolVariantPreferences.current.rawValue)
+        // IPA-D22: pool variant picker deleted from the UI. V1 is the
+        // hardcoded shipping choice (matches what mobile/socksstub
+        // ships with). Setter is still called so the Go bridge has a
+        // consistent value if anything reads it back; semantically a
+        // no-op against the default.
+        SocksstubSetPoolVariant("v1")
         // IPA-D21: push the configured real-internet ping probe URL into
         // Go-side before the first client is built, so the prober's first
         // tick fires against the user's chosen target. App-side updates
@@ -197,6 +217,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        // IPA-D22: clear so the main-app Uptime tile flips to "—".
+        tunnelStartedAt = nil
+        isRewiring = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
         whitelistDetector?.stop()
         whitelistDetector = nil
@@ -307,10 +330,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
+        // IPA-D22: flip the isRewiring flag so the main-app shield can
+        // render "Reconnecting…" instantly. Cleared in `defer` below.
+        isRewiring = true
         // Run off the path monitor queue to avoid serializing further
         // updates while we sit inside Go-side teardown.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            defer { self.isRewiring = false }
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
@@ -433,11 +460,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         case "refreshSamizdatClient":
-            // IPA-X: V1/V2/V3 picker changed in main-app UI. Push the
-            // new variant into Go-side then rebuild the client.
-            let variant = PoolVariantPreferences.current.rawValue
-            appendExtLog("info: app requested samizdat refresh (pool variant = \(variant))")
-            SocksstubSetPoolVariant(variant)
+            // IPA-D22: pool-variant UI deleted. Path retained for
+            // future cases where the app wants to force a samizdat
+            // client rebuild; pool variant is now hardcoded V1 in the
+            // setInProcessSocks bootstrap.
+            appendExtLog("info: app requested samizdat refresh")
+            SocksstubSetPoolVariant("v1")
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
         case "refreshPingURL":
@@ -462,6 +490,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // dropped in a future cleanup commit once the v0.2.D21 IPA is
             // rolled out and no skewed clients remain in the wild.
             let pingSnap = SocksstubPingProbeSnapshot()
+            // IPA-D22: include hev cumulative byte counters + uptime so
+            // the main-app Data + Uptime stat tiles can render without
+            // any extra RPC. `hev_socks5_tunnel_stats` semantics on the
+            // iOS side: tx = packets/bytes from utun (app→remote), rx
+            // = packets/bytes back. We expose both as "rxBytes" and
+            // "txBytes"; the main app sums them for the Data tile and
+            // diffs them for the rate readout.
+            var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
+            hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            let uptime: Int64
+            if let started = self.tunnelStartedAt {
+                uptime = Int64(Date().timeIntervalSince(started))
+            } else {
+                uptime = 0
+            }
             let payload: [String: Any] = [
                 "realShape":   SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
@@ -473,6 +516,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "pingOK":      pingSnap?.ok ?? false,
                 "pingFailed":  pingSnap?.failed ?? false,
                 "pingURL":     pingSnap?.url ?? "",
+                // IPA-D22 stat-tile + reconnecting fields.
+                "rxBytes":     Int64(rx_bytes),
+                "txBytes":     Int64(tx_bytes),
+                "uptimeSec":   uptime,
+                "isRewiring":  self.isRewiring ? 1 : 0,
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)
@@ -574,6 +622,8 @@ misc:
         startPathMonitor()
         startWhitelistDetectorIfNeeded()
         isRunning = true
+        // IPA-D22: anchor uptime for the main-app Uptime stat tile.
+        tunnelStartedAt = Date()
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
         // dedicated background queue.
