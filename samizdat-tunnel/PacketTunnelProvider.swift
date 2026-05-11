@@ -774,10 +774,25 @@ misc:
         // Now that IPA-I added cmd=0x05 / FWD_UDP support in SocksStub
         // backed by samizdat.Client.DialUDP, we can safely force DNS
         // (UDP/53) through the tunnel: hev wraps it as cmd=0x05, our
-        // SocksStub opens a samizdat UDP tunnel to 1.1.1.1:53 / 8.8.8.8:53,
-        // and the response comes back the same way. matchDomains=[""]
-        // catches every domain (the empty-string match-all sentinel).
-        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
+        // SocksStub opens a samizdat UDP tunnel to the configured
+        // resolver, and the response comes back the same way.
+        //
+        // IPA-D22 fix3 (DNS leak): the resolver IPs were 1.1.1.1 + 8.8.8.8
+        // — the SAME IPs we exclude above for WhitelistDetector canary.
+        // Result: iOS sent DNS queries to 1.1.1.1, routing matched
+        // excludedRoutes, packets went OUT VIA PHYSICAL Wi-Fi/cellular
+        // (RU ISP), Cloudflare anycast saw RU client and returned
+        // RU-close CDN edges. App then opened TCP to that RU-close IP
+        // via tunnel → exit Finland → server saw Finland IP for an
+        // RU-edge destination → mismatch → ChatGPT/CDN refusals.
+        //
+        // Now: use Cloudflare/Google SECONDARY IPs (1.0.0.1, 8.8.4.4) for
+        // DNS-via-tunnel. They are anycast and unrelated to canary IPs
+        // in excludedRoutes, so they resolve cleanly through the tunnel
+        // and the upstream-server (Finland exit) is the query source.
+        // GeoDNS therefore returns Finland-close edges; subsequent TCP
+        // is consistent with the tunnel exit IP.
+        let dns = NEDNSSettings(servers: ["1.0.0.1", "8.8.4.4"])
         dns.matchDomains = [""]
         settings.dnsSettings = dns
 
