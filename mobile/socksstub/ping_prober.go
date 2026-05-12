@@ -52,11 +52,14 @@ const (
 	pingProbeIntervalFG = 3 * time.Second
 	pingProbeIntervalBG = 30 * time.Second
 	foregroundStaleAfter = 5 * time.Second
-	// IPA-D27: 5s → 3s. Faster failure detection so the shield can
-	// flip to red ("Proxy unreachable") within ~6-8s of connecting
-	// when the proxy is unreachable, instead of operator seeing a
-	// fake green for ~20s.
-	pingProbeTimeout = 3 * time.Second
+	// IPA-D27 rev: 3s was too tight — first probe needs TLS handshake
+	// to upstream + new H/2 stream + TCP from upstream to probe target
+	// + HTTP HEAD response, which legitimately takes 1-4s on cold start
+	// with a 100ms+ upstream RTT. Operator saw stuck "Connecting…"
+	// because every probe timed out at 3s. Back to 5s for steady-state;
+	// first probe of a fresh client session gets pingProbeTimeoutFirst.
+	pingProbeTimeout      = 5 * time.Second
+	pingProbeTimeoutFirst = 10 * time.Second
 	pingFailedThreshold = 2 // consecutive misses to enter Failed state
 )
 
@@ -228,8 +231,11 @@ func stopPingProber() {
 // on the next probe without restarting.
 func runPingProbeLoop(ctx context.Context, client *samizdat.Client) {
 	// Fire one probe immediately so the first sample shows up on the
-	// shield within a few seconds of connect.
-	probeOnce(ctx, client)
+	// shield within a few seconds of connect. First probe gets a
+	// longer timeout because cold-start includes TLS handshake to the
+	// upstream tamizdat server + first H/2 stream open — easily 1-4s
+	// on its own.
+	probeOnceWithTimeout(ctx, client, pingProbeTimeoutFirst)
 
 	// Dynamic cadence: use time.Timer instead of Ticker so we can
 	// re-arm with the current cadence each cycle (3s FG / 30s BG).
@@ -248,8 +254,15 @@ func runPingProbeLoop(ctx context.Context, client *samizdat.Client) {
 
 // probeOnce performs one HTTP HEAD through the samizdat tunnel and
 // updates the shared snapshot. Errors and non-2xx/3xx responses both
-// count as "miss".
+// count as "miss". Uses the steady-state timeout.
 func probeOnce(ctx context.Context, client *samizdat.Client) {
+	probeOnceWithTimeout(ctx, client, pingProbeTimeout)
+}
+
+// probeOnceWithTimeout is the actual probe implementation with a
+// caller-supplied timeout. First-probe-of-session uses a longer
+// timeout to absorb cold-start TLS handshake to upstream.
+func probeOnceWithTimeout(ctx context.Context, client *samizdat.Client, timeout time.Duration) {
 	target := currentPingProbeURL()
 	u, err := url.Parse(target)
 	if err != nil {
@@ -304,7 +317,7 @@ func probeOnce(ctx context.Context, client *samizdat.Client) {
 	}
 	hc := &http.Client{
 		Transport: transport,
-		Timeout:   pingProbeTimeout,
+		Timeout:   timeout,
 		// Don't follow redirects — gstatic.com/generate_204 is intentionally
 		// a 204; any redirect would inflate the timing and possibly leak
 		// through our tunnel a destination the user didn't pick.
@@ -312,7 +325,7 @@ func probeOnce(ctx context.Context, client *samizdat.Client) {
 			return http.ErrUseLastResponse
 		},
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodHead, target, nil)
 	if err != nil {
