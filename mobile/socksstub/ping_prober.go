@@ -52,7 +52,11 @@ const (
 	pingProbeIntervalFG = 3 * time.Second
 	pingProbeIntervalBG = 30 * time.Second
 	foregroundStaleAfter = 5 * time.Second
-	pingProbeTimeout    = 5 * time.Second
+	// IPA-D27: 5s → 3s. Faster failure detection so the shield can
+	// flip to red ("Proxy unreachable") within ~6-8s of connecting
+	// when the proxy is unreachable, instead of operator seeing a
+	// fake green for ~20s.
+	pingProbeTimeout = 3 * time.Second
 	pingFailedThreshold = 2 // consecutive misses to enter Failed state
 )
 
@@ -183,10 +187,24 @@ func startPingProber(client *samizdat.Client) {
 		return
 	}
 
+	// IPA-D27: reset session state so a fresh client starts as
+	// "unvalidated" — Swift UI uses lastMs < 0 to mean "no successful
+	// probe yet this session" and shows "Connecting…" until the first
+	// real probe lands. Without this reset, stale ping value from the
+	// previous client would briefly paint the shield green before the
+	// new client has actually validated.
+	proberState.lastMs.Store(-1)
+	proberState.ok.Store(false)
+	proberState.consecutiveFails.Store(0)
+	proberState.lastProbedAt.Store(0)
+	// Also reset the auto-rewire throttle so the next miss-cascade can
+	// fire immediately if the new client also can't reach the probe.
+	lastRewireRequestedNanos.Store(0)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	proberCancel = cancel
 	go runPingProbeLoop(ctx, client)
-	rt.appendLog("info: ping prober started")
+	rt.appendLog("info: ping prober started (state reset)")
 }
 
 // stopPingProber cancels the running prober (if any). Called on

@@ -55,7 +55,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D25"
+    private static let milestoneTag = "D27"
 
     // MARK: – Derived state
 
@@ -125,6 +125,15 @@ struct ContentView: View {
             if pendingSwitch { return .reconnecting }
             if lampStore.isReconnecting { return .reconnecting }
             if lampStore.snapshot.pingFailed { return .failed }
+            // IPA-D27: green "Connected" only after ping has actually
+            // validated through the tunnel. Until the first successful
+            // probe of this session lands (pingMs >= 0), stay in
+            // .connecting ("Connecting…" amber). Otherwise iOS marks
+            // bridge.state = .connected the moment NETunnelProvider
+            // session is up, which is BEFORE the samizdat client has
+            // dialed the upstream — UI would falsely glow green for
+            // 1-5s.
+            if lampStore.snapshot.pingMs < 0 { return .connecting }
             return .connected
         case .disconnected:
             return .off
