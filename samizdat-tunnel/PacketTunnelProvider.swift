@@ -103,6 +103,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var whitelistDetector: WhitelistDetector?
     private var lastPathSatisfied: Bool = true
 
+    // IPA-D26: bridge object retained while the tunnel is up so the
+    // Go-side rewire requester atomic.Value holds a valid pointer.
+    private var autoRewireBridge: AutoRewireBridge?
+
     // IPA-A1: PacketBridge removed. We're back on the original
     // "Path 3" architecture (Pattern 1 in the iOS proxy taxonomy):
     // hev gets the raw utun file descriptor via KVO and reads/writes
@@ -149,6 +153,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
+
+        // IPA-D26: register the auto-rewire bridge so the Go-side ping
+        // prober can request a fresh client when it sees consecutive
+        // misses. Catches the case where wifi is dying but iOS hasn't
+        // yet failed over to LTE — system NWPath stays satisfied (or
+        // takes 15-30 s to flip), but the prober knows the upstream
+        // is unreachable RIGHT NOW. Throttled in Go to once per 15 s.
+        let rewireBridge = AutoRewireBridge { [weak self] in
+            guard let self else { return }
+            self.appendExtLog("info: auto-rewire fired by ping prober (consecutive fails)")
+            self.rewireUpstream()
+        }
+        // Stash a strong ref so the bridge isn't deallocated while Go
+        // holds it via atomic.Value.
+        self.autoRewireBridge = rewireBridge
+        SocksstubSetRewireRequester(rewireBridge)
 
         let settings = makeNetworkSettings(serverIP: serverIP)
         appendExtLog("info: applying packet tunnel network settings")
@@ -221,6 +241,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         tunnelStartedAt = nil
         isRewiring = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
+        // IPA-D26: drop the auto-rewire bridge so it doesn't keep a
+        // strong reference to self after the tunnel is torn down.
+        autoRewireBridge = nil
         whitelistDetector?.stop()
         whitelistDetector = nil
         WhitelistStatusStore.reset()
@@ -1063,5 +1086,29 @@ misc:
             code: -1,
             userInfo: [NSLocalizedDescriptionKey: message]
         )
+    }
+}
+
+/// IPA-D26: gomobile-bound bridge for the ping prober's auto-rewire
+/// signal. Go calls `requestRewire()` when it has detected 2+
+/// consecutive HTTP HEAD failures through the tunnel — likely the
+/// upstream is unreachable on the current path (wifi dying without
+/// NWPath having flipped yet, or upstream node blip). We respond by
+/// rebuilding the samizdat client over the current default route.
+/// Throttled in Go to once per 15 s.
+final class AutoRewireBridge: NSObject, SocksstubRewireRequesterProtocol {
+    private let onRequest: () -> Void
+
+    init(onRequest: @escaping () -> Void) {
+        self.onRequest = onRequest
+        super.init()
+    }
+
+    /// Called from a Go goroutine — bounce off Go's stack before
+    /// touching extension state.
+    func requestRewire() {
+        DispatchQueue.global(qos: .userInitiated).async { [onRequest] in
+            onRequest()
+        }
     }
 }

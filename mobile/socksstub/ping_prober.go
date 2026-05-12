@@ -341,10 +341,59 @@ func recordSuccess(latency time.Duration) {
 
 func recordMiss() {
 	proberState.ok.Store(false)
-	proberState.consecutiveFails.Add(1)
+	fails := proberState.consecutiveFails.Add(1)
 	proberState.lastProbedAt.Store(time.Now().UnixNano())
 	// Keep lastMs at its last successful value so the UI can show "last
 	// good latency" even while the shield turns yellow. If you'd rather
 	// blank it on miss, set proberState.lastMs.Store(-1) here.
+
+	// IPA-D26: when failures pile up (>= 2 consecutive), request a
+	// rewireUpstream from Swift side even though NWPathMonitor hasn't
+	// fired. Catches the case where wifi is dying but iOS hasn't yet
+	// failed over to LTE — the prober sees upstream is unreachable and
+	// tells Swift to rebuild the client over whatever the current
+	// system default route is. Throttled to once per 15 s to avoid
+	// thrashing during real outage.
+	if fails >= 2 {
+		maybeRequestRewire()
+	}
+}
+
+// RewireRequester is the gomobile-bound interface Swift implements to
+// receive auto-rewire requests from the ping prober.
+type RewireRequester interface {
+	RequestRewire()
+}
+
+var (
+	rewireRequester          atomic.Value // RewireRequester
+	lastRewireRequestedNanos atomic.Int64
+)
+
+// SetRewireRequester registers Swift's rewire callback. Called once
+// from PacketTunnelProvider during startTunnel.
+//
+// Exported for gomobile binding as SocksstubSetRewireRequester(r).
+func SetRewireRequester(r RewireRequester) {
+	rewireRequester.Store(r)
+}
+
+func maybeRequestRewire() {
+	const minInterval = 15 * time.Second
+	last := lastRewireRequestedNanos.Load()
+	if last != 0 && time.Since(time.Unix(0, last)) < minInterval {
+		return
+	}
+	v := rewireRequester.Load()
+	if v == nil {
+		return
+	}
+	cb, ok := v.(RewireRequester)
+	if !ok || cb == nil {
+		return
+	}
+	lastRewireRequestedNanos.Store(time.Now().UnixNano())
+	rt.appendLog("info: ping prober → auto-rewire requested (consecutive fails)")
+	go cb.RequestRewire()
 }
 
