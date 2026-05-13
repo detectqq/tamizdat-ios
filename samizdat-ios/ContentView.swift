@@ -18,6 +18,10 @@ struct ContentView: View {
     @StateObject private var lampStore = TamizdatStatusStore()
     @StateObject private var serverNotif = ServerNotificationObserver()
     @StateObject private var exitIP = ExitIPStore()
+    // IPA-D28: main-app WhitelistMonitor — runs while VPN is OFF +
+    // auto mode + foreground, so WhitelistStatusStore.activeEndpoint
+    // is already correct by the time the user taps Connect.
+    @StateObject private var whitelistMonitor = WhitelistMonitor()
 
     @State private var showSettings = false
     @State private var showLogs = false
@@ -55,7 +59,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D27"
+    private static let milestoneTag = "D28"
 
     // MARK: – Derived state
 
@@ -211,17 +215,31 @@ struct ContentView: View {
             startStatusPolling()
             lampStore.start()
             exitIP.start(isConnected: bridge.state == .connected)
+            // IPA-D28: only run the main-app monitor while VPN is off
+            // and auto-mode is selected. Once the extension is up,
+            // its own WhitelistDetector takes over (it has actual
+            // physical-iface binding + ICMP probes; we'd just be
+            // writing conflicting values).
+            updateWhitelistMonitorState()
         }
         .onDisappear {
             stopStatusPolling()
             lampStore.stop()
             exitIP.stop()
+            whitelistMonitor.stop()
         }
         .onChange(of: bridge.state) { _, newState in
             // Refetch exit IP immediately on connect/disconnect so the
             // surface flips without waiting up to 60s for the next tick.
             let isUp = (newState == .connected)
             exitIP.refreshSoon(isConnected: isUp)
+            // Stop monitor when extension takes over; resume when
+            // tunnel drops back to disconnected.
+            updateWhitelistMonitorState()
+        }
+        .onChange(of: isAutoMode) { _, _ in
+            // Toggle auto-mode → maybe start/stop monitor accordingly.
+            updateWhitelistMonitorState()
         }
         // Phase C iOS-notify (preserved from D20): server-pushed alert.
         .alert(
@@ -455,6 +473,21 @@ struct ContentView: View {
         noteSwitchPending()
         Task {
             await VPNProfileStore.shared.switchEndpoint(to: ep)
+        }
+    }
+
+    /// IPA-D28: start/stop the main-app WhitelistMonitor based on the
+    /// current VPN state + auto-mode toggle. Runs ONLY when
+    ///   - bridge.state == .disconnected (extension's own detector
+    ///     would conflict otherwise)
+    ///   - isAutoMode == true (no point monitoring if user picked
+    ///     manual endpoint)
+    private func updateWhitelistMonitorState() {
+        let shouldRun = bridge.state == .disconnected && isAutoMode
+        if shouldRun {
+            whitelistMonitor.start()
+        } else {
+            whitelistMonitor.stop()
         }
     }
 
