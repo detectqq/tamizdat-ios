@@ -33,9 +33,13 @@ final class WhitelistDetector {
 
     // Tunables (kept compatible with IPA-Q timings so battery profile
     // is unchanged for users running auto-mode).
+    // IPA-D28 fix: 30s → 5s for near-instant detection. Detector runs
+    // inside the extension only when VPN is up, so battery is bounded
+    // by tunnel-active time. Hold-down (60s) still prevents endpoint
+    // thrashing on flapping networks.
     private static let probeTimeout: TimeInterval = 3
-    private static let normalCadence: TimeInterval = 30
-    private static let onBackupCadence: TimeInterval = 60
+    private static let normalCadence: TimeInterval = 5
+    private static let onBackupCadence: TimeInterval = 10
     private static let holdDownSeconds: TimeInterval = 60
     private static let failbackSuccessesNeeded: Int = 2
 

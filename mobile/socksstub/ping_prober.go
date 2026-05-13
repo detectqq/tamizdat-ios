@@ -52,14 +52,13 @@ const (
 	pingProbeIntervalFG = 3 * time.Second
 	pingProbeIntervalBG = 30 * time.Second
 	foregroundStaleAfter = 5 * time.Second
-	// IPA-D27 rev: 3s was too tight — first probe needs TLS handshake
-	// to upstream + new H/2 stream + TCP from upstream to probe target
-	// + HTTP HEAD response, which legitimately takes 1-4s on cold start
-	// with a 100ms+ upstream RTT. Operator saw stuck "Connecting…"
-	// because every probe timed out at 3s. Back to 5s for steady-state;
-	// first probe of a fresh client session gets pingProbeTimeoutFirst.
-	pingProbeTimeout      = 5 * time.Second
-	pingProbeTimeoutFirst = 10 * time.Second
+	// IPA-D28 fix: steady-state back to 3s per operator request — TLS
+	// to upstream is already established at this point, so probes only
+	// pay H/2 stream + TCP-to-target + HTTP HEAD, all sub-second on
+	// healthy paths. First probe of a fresh client session keeps 5s
+	// to absorb cold TLS handshake to upstream.
+	pingProbeTimeout      = 3 * time.Second
+	pingProbeTimeoutFirst = 5 * time.Second
 	pingFailedThreshold = 2 // consecutive misses to enter Failed state
 )
 

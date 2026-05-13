@@ -27,9 +27,13 @@ import Network
 @MainActor
 final class WhitelistMonitor: ObservableObject {
 
+    // IPA-D28 fix: 30s → 5s cycle for near-instant whitelist detection.
+    // Monitor only runs when VPN is off AND main app is foregrounded,
+    // so battery cost of bumped cadence is bounded (user can only stare
+    // at the app for so long before backgrounding).
     private static let probeTimeout: TimeInterval = 3
-    private static let cycleInterval: TimeInterval = 30
-    private static let firstCycleDelay: TimeInterval = 2
+    private static let cycleInterval: TimeInterval = 5
+    private static let firstCycleDelay: TimeInterval = 0
 
     private var task: Task<Void, Never>?
     private var pendingConns: [NWConnection] = []
