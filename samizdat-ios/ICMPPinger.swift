@@ -190,17 +190,43 @@ final class ICMPPinger {
         }
         if n <= 0 { return }
 
-        // For SOCK_DGRAM ICMP the kernel strips the IP header and gives
-        // us the ICMP payload starting from the type byte.
-        // Echo reply: type 0 (v4) / 129 (v6), then code, checksum, id, seq.
-        // We match by sequence number, since identifier is rewritten by
-        // kernel.
-        if n < 8 { return }
-        let type = buf[0]
+        // IPA-D31 fix (per hermes analysis 2026-05-13): Darwin's
+        // SOCK_DGRAM IPv4 ICMP socket does NOT strip the IPv4 header
+        // — replies arrive as a full IPv4 packet starting with 0x45...
+        // (version 4, IHL 5). Old parser assumed buf[0] was the ICMP
+        // type byte (offset 0) and silently rejected every reply
+        // because buf[0] == 0x45 != 0 (echo-reply). For IPv6 the
+        // kernel DOES strip the header (SimplePing comment), so v6
+        // path stays at offset 0.
+        //
+        // Reference: Apple SimplePing.m validatePing4ResponsePacket;
+        // XNU bsd/netinet/ip_icmp.c (IP_STRIPHDR not set by default).
+        let icmpOffset: Int
+        if isV6 {
+            if n < 8 { return }
+            icmpOffset = 0
+        } else {
+            if n < 20 + 8 { return }
+            let firstByte = buf[0]
+            let version = firstByte >> 4
+            let ihl = Int(firstByte & 0x0f) * 4
+            if version != 4 { return }
+            if ihl < 20 { return }
+            if n < ihl + 8 { return }
+            // buf[9] is the IPv4 protocol field — must be ICMP (1).
+            if buf[9] != UInt8(IPPROTO_ICMP) { return }
+            icmpOffset = ihl
+        }
+
+        let type = buf[icmpOffset]
+        let code = buf[icmpOffset + 1]
         let expectReply: UInt8 = isV6 ? 129 : 0
         if type != expectReply { return }
-        // Bytes 6-7 are the sequence number (big-endian).
-        let seq = (UInt16(buf[6]) << 8) | UInt16(buf[7])
+        if code != 0 { return }
+        // Bytes 6-7 (relative to ICMP header) are the sequence number,
+        // big-endian. Match against ours; identifier (bytes 4-5) may
+        // be rewritten by kernel on Darwin too so we don't match it.
+        let seq = (UInt16(buf[icmpOffset + 6]) << 8) | UInt16(buf[icmpOffset + 7])
         if seq != sequence { return }
 
         settle(success: true)
