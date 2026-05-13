@@ -102,6 +102,13 @@ targets:
       # source of truth; live updates land via the
       # "refreshWhitelistProbes" provider message.
       - path: samizdat-ios/WhitelistProbePreferences.swift
+      # IPA-D30: ICMPPinger relocated from samizdat-tunnel/ to
+      # samizdat-ios/ so the main app's WhitelistMonitor can use the
+      # same unprivileged SOCK_DGRAM ICMP echo as the extension's
+      # WhitelistDetector — semantics now match operator's native
+      # ping tool (TCP-connect probes were too permissive and missed
+      # real ICMP-level whitelist mode).
+      - path: samizdat-ios/ICMPPinger.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

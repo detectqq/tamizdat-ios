@@ -260,7 +260,7 @@ struct SettingsView: View {
                         Text("Probe targets")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("ICMP ping every 30 s outside the tunnel")
+                        Text("ICMP ping every 3 s outside the tunnel")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }

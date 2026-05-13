@@ -1,5 +1,4 @@
 import Foundation
-import Network
 
 /// IPA-D28: WhitelistMonitor — runs in the MAIN APP while the VPN is
 /// disconnected so the App Group `WhitelistStatusStore.activeEndpoint`
@@ -27,16 +26,17 @@ import Network
 @MainActor
 final class WhitelistMonitor: ObservableObject {
 
-    // IPA-D28 fix: 30s → 5s cycle for near-instant whitelist detection.
-    // Monitor only runs when VPN is off AND main app is foregrounded,
-    // so battery cost of bumped cadence is bounded (user can only stare
-    // at the app for so long before backgrounding).
-    private static let probeTimeout: TimeInterval = 3
-    private static let cycleInterval: TimeInterval = 5
+    // IPA-D30: 5s → 3s cycle for near-instant whitelist detection.
+    // 2s ICMP timeout (was 3s TCP). Monitor only runs when VPN is off
+    // AND main app is foregrounded, so battery cost of bumped cadence
+    // is bounded (user can only stare at the app for so long before
+    // backgrounding).
+    private static let probeTimeout: TimeInterval = 2
+    private static let cycleInterval: TimeInterval = 3
     private static let firstCycleDelay: TimeInterval = 0
 
     private var task: Task<Void, Never>?
-    private var pendingConns: [NWConnection] = []
+    private var pingers: [ICMPPinger] = []
 
     /// Begin monitoring. Idempotent; no-op if already running.
     func start() {
@@ -55,8 +55,8 @@ final class WhitelistMonitor: ObservableObject {
     func stop() {
         task?.cancel()
         task = nil
-        for c in pendingConns { c.cancel() }
-        pendingConns.removeAll()
+        for p in pingers { p.cancel() }
+        pingers.removeAll()
     }
 
     private func runCycle() async {
@@ -97,43 +97,38 @@ final class WhitelistMonitor: ObservableObject {
     /// TCP-connect probe to `host:443`. Returns true on `.ready` within
     /// `probeTimeout`. The connection is canceled as soon as it
     /// resolves either way.
+    /// IPA-D30: real ICMP echo via the shared ICMPPinger (was TCP-connect
+    /// to port 443). TCP probes were too permissive — on operator's LTE,
+    /// the carrier dropped ICMP to 8.8.8.8 but TCP-to-443 worked anyway,
+    /// so the detector falsely reported "Free internet" while native ping
+    /// tool was showing 100% packet loss to 8.8.8.8.
+    ///
+    /// We're in main app process (VPN off, no utun present), so we don't
+    /// need IP_BOUND_IF — kernel routes via the system default route
+    /// (wifi/cellular).
     private func probeHost(_ host: String) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            let params: NWParameters = .tcp
-            // Force IPv4 — our probe hosts are IPv4-only by default
-            // (8.8.8.8, 77.88.8.8) and using v4 explicitly avoids
-            // any GeoDNS surprises if user typed a hostname.
-            if let ipOpt = params.defaultProtocolStack
-                .internetProtocol as? NWProtocolIP.Options
-            {
-                ipOpt.version = .v4
+            let target: ICMPPinger.Target
+            // Detect IP-literal vs hostname. Same simple shape check
+            // we use elsewhere — strictly enough for IPv4 dotted-quad
+            // or anything with ':' (IPv6).
+            if Self.looksLikeIPLiteral(host) {
+                target = .ip(host)
+            } else {
+                target = .hostname(host)
             }
-            let endpoint = NWEndpoint.hostPort(
-                host: NWEndpoint.Host(host),
-                port: NWEndpoint.Port(rawValue: 443)!
-            )
-            let conn = NWConnection(to: endpoint, using: params)
-            let q = DispatchQueue(label: "whitelist.monitor.probe.\(host)")
-            var resumed = false
-            func finish(_ ok: Bool) {
-                if resumed { return }
-                resumed = true
-                conn.cancel()
+            let pinger = ICMPPinger(target: target, interfaceIndex: nil)
+            pingers.append(pinger)
+            pinger.ping(timeout: Self.probeTimeout) { ok, _ in
                 cont.resume(returning: ok)
             }
-            // Hard timeout — Network framework `.waiting` state can
-            // hang past the OS connect timer.
-            q.asyncAfter(deadline: .now() + Self.probeTimeout) { finish(false) }
-            conn.stateUpdateHandler = { state in
-                switch state {
-                case .ready:    finish(true)
-                case .failed:   finish(false)
-                case .cancelled: finish(false)
-                default:        break
-                }
-            }
-            pendingConns.append(conn)
-            conn.start(queue: q)
         }
+    }
+
+    private static func looksLikeIPLiteral(_ s: String) -> Bool {
+        if s.contains(":") { return true }   // IPv6
+        let parts = s.split(separator: ".")
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { UInt($0).map { $0 <= 255 } ?? false }
     }
 }
