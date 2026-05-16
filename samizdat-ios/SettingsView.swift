@@ -32,6 +32,7 @@ struct SettingsView: View {
 
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
+    @State private var fragPoCTransportEnabled: Bool = FragPoCTransportStore.enabled
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -98,6 +99,12 @@ struct SettingsView: View {
                         SectionLabel(text: "Appearance")
                             .padding(.top, 22)
                         appearanceCard
+                            .padding(.horizontal, 16)
+
+                        // ── Transport ────────────────────────────
+                        SectionLabel(text: "Transport")
+                            .padding(.top, 22)
+                        transportCard
                             .padding(.horizontal, 16)
 
                         // ── Diagnostics ──────────────────────────
@@ -370,6 +377,25 @@ struct SettingsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
+    }
+
+    private var transportCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "antenna.radiowaves.left.and.right",
+                               bg: theme.blueDim, fg: theme.blue),
+                title: "FragPoC transport (test)",
+                sub: "Routes through the FragPoC test server. Applies on next reconnect.",
+                isLast: true
+            ) {
+                Toggle("FragPoC transport (test)", isOn: $fragPoCTransportEnabled)
+                    .labelsHidden()
+                    .tint(theme.mint)
+                    .onChange(of: fragPoCTransportEnabled) { _, newValue in
+                        FragPoCTransportStore.enabled = newValue
+                    }
+            }
+        }
     }
 
     private var diagnosticsCard: some View {

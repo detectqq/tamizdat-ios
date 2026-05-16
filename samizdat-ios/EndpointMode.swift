@@ -50,6 +50,24 @@ enum EndpointModeStore {
     }
 }
 
+/// Manual FragPoC-transport toggle. Persisted in App Group UserDefaults so
+/// the NEPacketTunnelProvider extension reads the same value the main-app
+/// Settings toggle writes. When true, the Go socksstub builds a FragPoC
+/// client (hardcoded test server) instead of the H2 client.
+enum FragPoCTransportStore {
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let key = "fragpocTransportEnabled"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    static var enabled: Bool {
+        get { defaults?.bool(forKey: key) ?? false }
+        set { defaults?.set(newValue, forKey: key) }
+    }
+}
+
 /// Splits a combined samizdat:// URL into (primary, backup) parts for
 /// UI display. The combined form is `samizdat://...primary...&backup=
 /// <base64url(samizdat://...backup...)>`. Returns the backup only if

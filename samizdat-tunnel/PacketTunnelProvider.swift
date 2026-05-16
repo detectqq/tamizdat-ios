@@ -224,6 +224,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // immediately after SetSamizdatConfig, so a user who is already
         // over-quota at connect time still gets the notification.
         SocksstubSetNotificationCallback(NotificationBridge.shared)
+        let useFragPoC = FragPoCTransportStore.enabled
+        SocksstubSetTransport(useFragPoC ? "fragpoc" : "h2")
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
