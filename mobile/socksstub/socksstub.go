@@ -378,10 +378,17 @@ func SetSamizdatConfig(blob string) error {
 		var fpShortID [fragpoc.ShortIDLen]byte
 		sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
 		copy(fpShortID[:], sidBytes)
+		// Spread per-op dials across the server's dynamic FragPoC port
+		// pool (31510-31560) so per-port carrier throttling is diluted.
+		fpPool := make([]int, 0, 51)
+		for p := 31510; p <= 31560; p++ {
+			fpPool = append(fpPool, p)
+		}
 		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
-			ServerAddr: "sync2.detectqq.dpdns.org:31503",
-			ShortID:    fpShortID,
-			Secure:     true,
+			ServerAddr:      "sync2.detectqq.dpdns.org:31503",
+			ShortID:         fpShortID,
+			Secure:          true,
+			DynamicPortPool: fpPool,
 		})
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig fragpoc.NewClient: %v", err))
