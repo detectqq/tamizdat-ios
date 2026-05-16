@@ -45,6 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anarki/samizdat-ios/mobile/fragpoc"
 	// Project renamed samizdat -> tamizdat (2026-05-01). Local alias
 	// kept as `samizdat` to minimise the diff; the imported package
 	// is github.com/detectqq/tamizdat (`package tamizdat`). All call
@@ -77,6 +78,36 @@ const (
 	socksReplyAtypNo   = 0x08
 )
 
+type upstreamClient interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+	DialUDP(ctx context.Context, addr string) (net.PacketConn, error)
+	Close() error
+	ShapeMode() string
+	RealShapeMode() string
+	ActiveRealtimeCount() int
+	LockedRealtimeCount() int32
+	LiteTransportAlive() int32
+	RTTProbeSnapshot() samizdat.RTTProbeStats
+}
+
+type fragpocUpstreamClient struct {
+	*fragpoc.Client
+}
+
+func (c *fragpocUpstreamClient) ShapeMode() string { return "" }
+
+func (c *fragpocUpstreamClient) RealShapeMode() string { return "" }
+
+func (c *fragpocUpstreamClient) ActiveRealtimeCount() int { return 0 }
+
+func (c *fragpocUpstreamClient) LockedRealtimeCount() int32 { return 0 }
+
+func (c *fragpocUpstreamClient) LiteTransportAlive() int32 { return 0 }
+
+func (c *fragpocUpstreamClient) RTTProbeSnapshot() samizdat.RTTProbeStats {
+	return samizdat.RTTProbeStats{LiteP50Ms: -1, BulkP50Ms: -1, LastMs: -1}
+}
+
 type runtimeState struct {
 	mu             sync.Mutex
 	listener       net.Listener
@@ -85,8 +116,8 @@ type runtimeState struct {
 	socketPath     string
 	logs           []string
 	logsMax        int
-	samizdatBlob   string           // empty → direct dial mode
-	samizdatClient *samizdat.Client // nil unless SetSamizdatConfig succeeded
+	samizdatBlob   string         // empty → direct dial mode
+	samizdatClient upstreamClient // nil unless SetSamizdatConfig succeeded
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
 	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
@@ -96,6 +127,7 @@ type runtimeState struct {
 	// When variant is "v1" we also flip StrictSingleH2=true to match
 	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
 	poolVariant atomic.Value // string
+	transport   atomic.Value // string
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -342,6 +374,33 @@ func ConnectionsTotal() int64 {
 // (potentially expensive) uTLS+H2 handshake to the upstream proxy server
 // happens once, lazily, on the first dial — instead of every dial.
 func SetSamizdatConfig(blob string) error {
+	if currentTransport() == "fragpoc" {
+		var fpShortID [fragpoc.ShortIDLen]byte
+		sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+		copy(fpShortID[:], sidBytes)
+		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
+			ServerAddr: "sync2.detectqq.dpdns.org:31503",
+			ShortID:    fpShortID,
+			Secure:     true,
+		})
+		if err != nil {
+			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig fragpoc.NewClient: %v", err))
+			return err
+		}
+
+		rt.mu.Lock()
+		old := rt.samizdatClient
+		rt.samizdatBlob = blob
+		rt.samizdatClient = &fragpocUpstreamClient{Client: fpClient}
+		rt.mu.Unlock()
+		stopPingProber()
+		if old != nil {
+			_ = old.Close()
+		}
+		rt.appendLog("info: dial mode = fragpoc → sync2.detectqq.dpdns.org:31503")
+		return nil
+	}
+
 	if blob == "" {
 		rt.mu.Lock()
 		oldClient := rt.samizdatClient
@@ -764,6 +823,29 @@ func currentPoolVariant() string {
 	v, _ := rt.poolVariant.Load().(string)
 	if v == "" {
 		return "v1"
+	}
+	return v
+}
+
+// SetTransport selects the upstream transport on the next
+// SetSamizdatConfig call. Accepted values: "h2" and "fragpoc";
+// empty or unknown values normalise to "h2".
+func SetTransport(t string) {
+	transport := strings.ToLower(strings.TrimSpace(t))
+	switch transport {
+	case "fragpoc":
+		// accepted
+	default:
+		transport = "h2"
+	}
+	rt.transport.Store(transport)
+	rt.appendLog(fmt.Sprintf("info: transport = %s (next client build will use this)", transport))
+}
+
+func currentTransport() string {
+	v, _ := rt.transport.Load().(string)
+	if v == "" {
+		return "h2"
 	}
 	return v
 }
@@ -1330,7 +1412,7 @@ var relayBufPool = sync.Pool{
 	},
 }
 
-func getRelayBuf() *[]byte { return relayBufPool.Get().(*[]byte) }
+func getRelayBuf() *[]byte  { return relayBufPool.Get().(*[]byte) }
 func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
 
 // IPA-D7: relay using sing-box's bufio.Copy with `with_low_memory` build
@@ -1411,4 +1493,3 @@ func WriteHeapProfile(path string) string {
 	rt.appendLog(fmt.Sprintf("info: heap profile written to %s", path))
 	return ""
 }
-
