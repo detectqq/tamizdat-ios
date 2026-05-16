@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -908,6 +909,67 @@ func fragpocPortList() []int {
 		ports = append(ports, p)
 	}
 	return ports
+}
+
+// RunFragPoCSmokeTest probes each port in a comma-separated list against the
+// FragPoC test server and returns a JSON array of per-port results (gomobile
+// exposes it as SocksstubRunFragPoCSmokeTest). Each probe is one OpOpenSecure
+// round-trip: ok=true when the port is reachable and the FragPoC protocol
+// answered, ok=false otherwise. Ports are probed concurrently; the call
+// blocks until every probe finishes (bounded by the per-probe timeout), so
+// callers must invoke it off the main thread.
+func RunFragPoCSmokeTest(portsCSV string) string {
+	type portResult struct {
+		Port int    `json:"port"`
+		OK   bool   `json:"ok"`
+		MS   int64  `json:"ms"`
+		Err  string `json:"err,omitempty"`
+	}
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+	const fpHost = "sync2.detectqq.dpdns.org"
+
+	seen := make(map[int]struct{})
+	ports := make([]int, 0, 8)
+	for _, tok := range strings.FieldsFunc(portsCSV, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		p, err := strconv.Atoi(tok)
+		if err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+
+	results := make([]portResult, len(ports))
+	var wg sync.WaitGroup
+	for i, p := range ports {
+		wg.Add(1)
+		go func(idx, port int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			start := time.Now()
+			probeErr := fragpoc.ProbePort(ctx, fpHost, port, fpShortID)
+			res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
+			if probeErr != nil {
+				res.Err = probeErr.Error()
+			}
+			results[idx] = res
+		}(i, p)
+	}
+	wg.Wait()
+	rt.appendLog(fmt.Sprintf("info: fragpoc smoke test — probed %d port(s)", len(ports)))
+	out, err := json.Marshal(results)
+	if err != nil {
+		return "[]"
+	}
+	return string(out)
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.

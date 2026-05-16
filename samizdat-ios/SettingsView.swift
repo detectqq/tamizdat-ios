@@ -1,4 +1,6 @@
 import SwiftUI
+import Foundation
+import SamizdatClient
 import UserNotifications
 
 /// IPA-D22: redesigned Settings sheet — grouped inset cards over the
@@ -36,6 +38,8 @@ struct SettingsView: View {
     @State private var fragPoCPortMode: FragPoCPortMode = FragPoCPortConfigStore.mode
     @State private var fragPoCPortsDraft: String = FragPoCPortConfigStore.activePorts
         .map(String.init).joined(separator: ", ")
+    @State private var smokeResults: [SmokePortResult] = []
+    @State private var smokeRunning = false
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -110,6 +114,9 @@ struct SettingsView: View {
                         transportCard
                             .padding(.horizontal, 16)
                         fragPoCPortCard
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
+                        fragPoCSmokeTestCard
                             .padding(.horizontal, 16)
                             .padding(.top, 10)
 
@@ -500,6 +507,84 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
+    /// One port's smoke-test result, decoded from the JSON that
+    /// SocksstubRunFragPoCSmokeTest returns.
+    private struct SmokePortResult: Codable, Identifiable {
+        let port: Int
+        let ok: Bool
+        let ms: Int
+        let err: String?
+        var id: Int { port }
+    }
+
+    /// IPA-D40: multi-port smoke test — probes each port of the active
+    /// FragPoC mode with one OpOpenSecure round-trip and shows a green/red
+    /// lamp per port. Probing runs outside the tunnel, so it must be run
+    /// with the VPN disconnected to measure the raw carrier path.
+    private var fragPoCSmokeTestCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "dot.radiowaves.left.and.right",
+                             bg: theme.mintDim, fg: theme.mint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Port smoke test")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("Probes each port of the active mode")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                Button {
+                    Task { await runSmokeTest() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if smokeRunning {
+                            ProgressView().controlSize(.small)
+                            Text("Probing…")
+                        } else {
+                            Text("Run test")
+                        }
+                    }
+                    .font(.geist(.semibold, size: 13))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(theme.mint)
+                    .foregroundStyle(theme.mintInk)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .disabled(smokeRunning)
+
+                if !smokeResults.isEmpty {
+                    VStack(spacing: 6) {
+                        ForEach(smokeResults) { result in
+                            HStack(spacing: 10) {
+                                Circle()
+                                    .fill(result.ok ? Color.green : Color.red)
+                                    .frame(width: 9, height: 9)
+                                Text(String(result.port))
+                                    .font(.geistMono(.regular, size: 13))
+                                    .foregroundStyle(theme.text)
+                                Spacer()
+                                Text("\(result.ms) ms")
+                                    .font(.geistMono(.regular, size: 11))
+                                    .foregroundStyle(theme.textDim)
+                            }
+                        }
+                    }
+                }
+
+                Text("Run with the VPN disconnected to test the raw network. Green = port reachable and FragPoC answered; red = blocked, unreachable, or no server on that port.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
     private var diagnosticsCard: some View {
         CardContainer(padding: 0) {
             DesignRow(
@@ -633,6 +718,22 @@ struct SettingsView: View {
         let defaults = FragPoCPortConfigStore.defaultPorts(for: fragPoCPortMode)
         FragPoCPortConfigStore.setPorts(defaults, for: fragPoCPortMode)
         fragPoCPortsDraft = defaults.map(String.init).joined(separator: ", ")
+    }
+
+    /// Runs the multi-port smoke test off the main thread, then publishes the
+    /// per-port results. Probes the active mode's port list; the Go side
+    /// probes all ports in parallel, each bounded by a ~6 s timeout.
+    private func runSmokeTest() async {
+        guard !smokeRunning else { return }
+        smokeRunning = true
+        smokeResults = []
+        let csv = FragPoCPortConfigStore.activePortsCSV
+        let json = await Task.detached(priority: .userInitiated) {
+            SocksstubRunFragPoCSmokeTest(csv)
+        }.value
+        smokeResults = (try? JSONDecoder().decode(
+            [SmokePortResult].self, from: Data(json.utf8))) ?? []
+        smokeRunning = false
     }
 
     private func saveWhitelistProbes() {

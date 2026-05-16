@@ -913,3 +913,55 @@ func applyDeadlineFromContext(conn net.Conn, ctx context.Context) {
 		_ = conn.SetDeadline(deadline)
 	}
 }
+
+// ProbePort runs one OpOpenSecure round-trip against the FragPoC server on a
+// specific host:port — the building block of the multi-port smoke test. It
+// returns nil when the port is reachable AND the FragPoC protocol answered
+// with AckOK; otherwise an error (dial failure, timeout, or protocol
+// mismatch). probeDest is deliberately unresolvable, so the server's handler
+// fails its upstream dial and drops the probe session within seconds. The
+// caller should bound the probe with a context deadline.
+func ProbePort(ctx context.Context, host string, port int, shortID [ShortIDLen]byte) error {
+	timeout := connectTimeout(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(deadline); d > 0 && d < timeout {
+			timeout = d
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	applyDeadlineFromContext(conn, ctx)
+
+	staticKey := deriveSecureStaticKey(shortID)
+	const probeDest = "fragpoc-smoke.invalid:80"
+	reqPlain := make([]byte, len(probeDest)+1)
+	copy(reqPlain, probeDest)
+	nonce, err := newSecureNonce()
+	if err != nil {
+		return err
+	}
+	prefix := make([]byte, 1+ShortIDLen)
+	prefix[0] = OpOpenSecure
+	copy(prefix[1:], shortID[:])
+	if _, err := conn.Write(prefix); err != nil {
+		return err
+	}
+	if err := writeSecureBodyWithNonce(conn, staticKey, secureRequestAD(OpOpenSecure, shortID[:]), nonce[:], reqPlain); err != nil {
+		return err
+	}
+	resp, _, err := readSecureBody(conn, staticKey, secureResponseAD(OpOpenSecure, shortID[:]), 1+SIDLen)
+	if err != nil {
+		return err
+	}
+	if len(resp) != 1+SIDLen || resp[0] != AckOK {
+		return fmt.Errorf("%w: probe ack rejected", ErrProtocol)
+	}
+	return nil
+}
