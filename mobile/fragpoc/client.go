@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -358,12 +359,23 @@ func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte,
 	return res, nil
 }
 
+// downRequestPadMin and downRequestPadMax bound the randomised DOWN poll
+// request padding. The DOWN poll is the highest-frequency FragPoC op and its
+// request was a fixed size — the protocol's strongest size fingerprint.
+// Randomising the pad length per request breaks that signature. The max
+// keeps the secure request plaintext (6 + padLen) within the server's
+// DownRequestSize acceptance ceiling, so this needs no server-side change:
+// the server reads the pad length from the frame and skips exactly that many
+// bytes.
+const (
+	downRequestPadMin = 128
+	downRequestPadMax = 480
+)
+
+// downRequestPaddingLen returns a random padding length for a DOWN poll
+// request, uniformly in [downRequestPadMin, downRequestPadMax].
 func downRequestPaddingLen() int {
-	n := DownRequestSize - (1 + SIDLen + 4 + 2)
-	if n < 0 {
-		return 0
-	}
-	return n
+	return downRequestPadMin + rand.Intn(downRequestPadMax-downRequestPadMin+1)
 }
 
 func fillDownRequestPadding(p []byte, sid [SIDLen]byte) {
