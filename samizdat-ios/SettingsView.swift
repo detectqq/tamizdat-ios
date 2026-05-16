@@ -33,6 +33,9 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
     @State private var fragPoCTransportEnabled: Bool = FragPoCTransportStore.enabled
+    @State private var fragPoCPortMode: FragPoCPortMode = FragPoCPortConfigStore.mode
+    @State private var fragPoCPortsDraft: String = FragPoCPortConfigStore.activePorts
+        .map(String.init).joined(separator: ", ")
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -106,6 +109,9 @@ struct SettingsView: View {
                             .padding(.top, 22)
                         transportCard
                             .padding(.horizontal, 16)
+                        fragPoCPortCard
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
 
                         // ── Diagnostics ──────────────────────────
                         SectionLabel(text: "Diagnostics")
@@ -398,6 +404,102 @@ struct SettingsView: View {
         }
     }
 
+    /// IPA-D38: FragPoC port-mode picker — One port / 80+443 / Multi-port,
+    /// each with an editable port list. Element 0 of the list is the base
+    /// server port; the rest form the dynamic dial pool the FragPoC client
+    /// rotates across. Only effective while the FragPoC transport is on.
+    private var fragPoCPortCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "network",
+                             bg: theme.blueDim, fg: theme.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Port mode")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("How FragPoC spreads dials across server ports")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                // 3-way segmented control
+                HStack(spacing: 2) {
+                    fragPoCPortSegment(.single)
+                    fragPoCPortSegment(.dual)
+                    fragPoCPortSegment(.multi)
+                }
+                .padding(3)
+                .background(theme.chip)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Text(fragPoCPortMode.hint)
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+
+                Text("Ports — comma-separated, first is the base port")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("443, 80", text: $fragPoCPortsDraft, axis: .vertical)
+                    .lineLimit(2...6)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.numbersAndPunctuation)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                HStack(spacing: 8) {
+                    Button(action: saveFragPoCPorts) {
+                        Text("Save")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: resetFragPoCPorts) {
+                        Text("Reset")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Text("Applies on next reconnect.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
+    private func fragPoCPortSegment(_ mode: FragPoCPortMode) -> some View {
+        let active = fragPoCPortMode == mode
+        return Button {
+            selectFragPoCPortMode(mode)
+        } label: {
+            Text(mode.label)
+                .font(.geist(.semibold, size: 12))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .background(active ? theme.chipActive : Color.clear)
+                .foregroundStyle(active ? theme.chipActiveText : theme.textDim)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+
     private var diagnosticsCard: some View {
         CardContainer(padding: 0) {
             DesignRow(
@@ -503,6 +605,34 @@ struct SettingsView: View {
         pingURL = PingURLPreferences.url
         pingURLDraft = pingURL
         Task { await VPNProfileStore.shared.refreshPingURL() }
+    }
+
+    /// Switches the FragPoC port mode. Commits any unsaved edits to the
+    /// outgoing mode first, then reloads the draft from the new mode's
+    /// stored list so each mode keeps its own ports.
+    private func selectFragPoCPortMode(_ mode: FragPoCPortMode) {
+        guard mode != fragPoCPortMode else { return }
+        saveFragPoCPorts()
+        fragPoCPortMode = mode
+        FragPoCPortConfigStore.mode = mode
+        fragPoCPortsDraft = FragPoCPortConfigStore.ports(for: mode)
+            .map(String.init).joined(separator: ", ")
+    }
+
+    /// Parses the draft and persists it as the current mode's port list.
+    /// Empty/all-invalid input is left untouched (keeps the previous list).
+    private func saveFragPoCPorts() {
+        let parsed = FragPoCPortConfigStore.parsePorts(fragPoCPortsDraft)
+        guard !parsed.isEmpty else { return }
+        FragPoCPortConfigStore.setPorts(parsed, for: fragPoCPortMode)
+        fragPoCPortsDraft = parsed.map(String.init).joined(separator: ", ")
+    }
+
+    /// Restores the current mode's port list to its built-in default.
+    private func resetFragPoCPorts() {
+        let defaults = FragPoCPortConfigStore.defaultPorts(for: fragPoCPortMode)
+        FragPoCPortConfigStore.setPorts(defaults, for: fragPoCPortMode)
+        fragPoCPortsDraft = defaults.map(String.init).joined(separator: ", ")
     }
 
     private func saveWhitelistProbes() {

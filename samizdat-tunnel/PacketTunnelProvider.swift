@@ -226,6 +226,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SocksstubSetNotificationCallback(NotificationBridge.shared)
         let useFragPoC = FragPoCTransportStore.enabled
         SocksstubSetTransport(useFragPoC ? "fragpoc" : "h2")
+        // IPA-D38: push the FragPoC port list selected in the Settings
+        // "Port mode" card. socksstub uses element 0 as the base server
+        // port and the rest as the dynamic dial pool; ignored unless the
+        // FragPoC transport is enabled above.
+        let fragPoCPortsCSV = FragPoCPortConfigStore.activePortsCSV
+        SocksstubSetFragPoCPorts(fragPoCPortsCSV)
+        if useFragPoC {
+            log("info: fragpoc port mode = \(FragPoCPortConfigStore.mode.rawValue), ports = \(fragPoCPortsCSV)")
+        }
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {

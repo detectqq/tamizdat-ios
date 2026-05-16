@@ -68,6 +68,140 @@ enum FragPoCTransportStore {
     }
 }
 
+/// FragPoC port mode — a manual test knob (like the FragPoC transport
+/// toggle) picking how the Go SOCKS stub spreads per-op dials across
+/// server ports.
+enum FragPoCPortMode: String, CaseIterable, Identifiable {
+    case single
+    case dual
+    case multi
+
+    var id: String { rawValue }
+
+    /// Short label for the segmented control.
+    var label: String {
+        switch self {
+        case .single: return "One port"
+        case .dual:   return "80 + 443"
+        case .multi:  return "Multi-port"
+        }
+    }
+
+    /// One-line explanation shown under the segmented control.
+    var hint: String {
+        switch self {
+        case .single:
+            return "A single server port. Smallest footprint."
+        case .dual:
+            return "Two well-known ports a mobile carrier rarely throttles."
+        case .multi:
+            return "Dials spread across a pool of ports for throughput."
+        }
+    }
+}
+
+/// FragPoC port configuration — the selected port mode plus the editable
+/// port list for each mode. Persisted in App Group UserDefaults so the
+/// NEPacketTunnelProvider extension reads the same values the Settings UI
+/// writes. The extension forwards the active list to the Go socksstub via
+/// SocksstubSetFragPoCPorts; socksstub treats element 0 as the base server
+/// port and the remaining entries as the dynamic dial pool.
+enum FragPoCPortConfigStore {
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let modeKey   = "fragpocPortMode"
+    private static let singleKey = "fragpocPortsSingle"
+    private static let dualKey   = "fragpocPortsDual"
+    private static let multiKey  = "fragpocPortsMulti"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    /// Default multi-port pool — matches the IPA-D37 hardcoded socksstub
+    /// behaviour (base 31503 + dynamic 31510…31560), so an install that
+    /// never opens this UI keeps dialling byte-identically to D37.
+    static let defaultSinglePorts: [Int] = [31503]
+    static let defaultDualPorts:   [Int] = [443, 80]
+    static let defaultMultiPorts:  [Int] = {
+        var ports = [31503]
+        for p in 31510...31560 { ports.append(p) }
+        return ports
+    }()
+
+    static var mode: FragPoCPortMode {
+        get {
+            guard let raw = defaults?.string(forKey: modeKey),
+                  let m = FragPoCPortMode(rawValue: raw)
+            else { return .multi }
+            return m
+        }
+        set { defaults?.set(newValue.rawValue, forKey: modeKey) }
+    }
+
+    /// Returns the stored port list for `mode`, or its default if unset.
+    static func ports(for mode: FragPoCPortMode) -> [Int] {
+        switch mode {
+        case .single: return read(singleKey) ?? defaultSinglePorts
+        case .dual:   return read(dualKey)   ?? defaultDualPorts
+        case .multi:  return read(multiKey)  ?? defaultMultiPorts
+        }
+    }
+
+    /// Persists `ports` as the list for `mode`. Empty lists are ignored.
+    static func setPorts(_ ports: [Int], for mode: FragPoCPortMode) {
+        guard !ports.isEmpty else { return }
+        let key: String
+        switch mode {
+        case .single: key = singleKey
+        case .dual:   key = dualKey
+        case .multi:  key = multiKey
+        }
+        defaults?.set(ports.map(String.init).joined(separator: ","), forKey: key)
+    }
+
+    /// Default port list for `mode`.
+    static func defaultPorts(for mode: FragPoCPortMode) -> [Int] {
+        switch mode {
+        case .single: return defaultSinglePorts
+        case .dual:   return defaultDualPorts
+        case .multi:  return defaultMultiPorts
+        }
+    }
+
+    /// Port list for the active mode — element 0 is the base server port,
+    /// the rest form the dynamic dial pool.
+    static var activePorts: [Int] { ports(for: mode) }
+
+    /// Comma-separated `activePorts` — the wire format passed to
+    /// SocksstubSetFragPoCPorts.
+    static var activePortsCSV: String {
+        activePorts.map(String.init).joined(separator: ",")
+    }
+
+    private static func read(_ key: String) -> [Int]? {
+        guard let raw = defaults?.string(forKey: key) else { return nil }
+        let parsed = parsePorts(raw)
+        return parsed.isEmpty ? nil : parsed
+    }
+
+    /// Parses a comma/space/newline-separated port list — keeps only valid
+    /// 1…65535 entries, in order, de-duplicated.
+    static func parsePorts(_ raw: String) -> [Int] {
+        var seen = Set<Int>()
+        var out: [Int] = []
+        let separators = CharacterSet(charactersIn: ", \n\t\r")
+        for token in raw.components(separatedBy: separators) {
+            let trimmed = token.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, let port = Int(trimmed),
+                  port >= 1, port <= 65535, !seen.contains(port)
+            else { continue }
+            seen.insert(port)
+            out.append(port)
+        }
+        return out
+    }
+}
+
 /// Splits a combined samizdat:// URL into (primary, backup) parts for
 /// UI display. The combined form is `samizdat://...primary...&backup=
 /// <base64url(samizdat://...backup...)>`. Returns the backup only if

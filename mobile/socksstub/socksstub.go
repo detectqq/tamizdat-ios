@@ -126,8 +126,9 @@ type runtimeState struct {
 	// before re-calling SocksstubSetSamizdatConfig with the same blob.
 	// When variant is "v1" we also flip StrictSingleH2=true to match
 	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
-	poolVariant atomic.Value // string
-	transport   atomic.Value // string
+	poolVariant  atomic.Value // string
+	transport    atomic.Value // string
+	fragpocPorts atomic.Value // []int — base server port + dynamic dial pool
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -378,14 +379,17 @@ func SetSamizdatConfig(blob string) error {
 		var fpShortID [fragpoc.ShortIDLen]byte
 		sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
 		copy(fpShortID[:], sidBytes)
-		// Spread per-op dials across the server's dynamic FragPoC port
-		// pool (31510-31560) so per-port carrier throttling is diluted.
-		fpPool := make([]int, 0, 51)
-		for p := 31510; p <= 31560; p++ {
-			fpPool = append(fpPool, p)
-		}
+		// Port list comes from the iOS "Port mode" UI via SetFragPoCPorts:
+		// element 0 is the base server port, the rest form the dynamic dial
+		// pool the FragPoC client rotates across. An unset list falls back
+		// to the IPA-D37 hardcoded set (base 31503 + pool 31510-31560), so
+		// an untouched install dials byte-identically to D37.
+		fpPorts := fragpocPortList()
+		fpBasePort := fpPorts[0]
+		fpPool := append([]int(nil), fpPorts[1:]...)
+		fpServerAddr := fmt.Sprintf("sync2.detectqq.dpdns.org:%d", fpBasePort)
 		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
-			ServerAddr:      "sync2.detectqq.dpdns.org:31503",
+			ServerAddr:      fpServerAddr,
 			ShortID:         fpShortID,
 			Secure:          true,
 			DynamicPortPool: fpPool,
@@ -404,7 +408,7 @@ func SetSamizdatConfig(blob string) error {
 		if old != nil {
 			_ = old.Close()
 		}
-		rt.appendLog("info: dial mode = fragpoc → sync2.detectqq.dpdns.org:31503")
+		rt.appendLog(fmt.Sprintf("info: dial mode = fragpoc → %s (+%d pool port(s))", fpServerAddr, len(fpPool)))
 		return nil
 	}
 
@@ -855,6 +859,55 @@ func currentTransport() string {
 		return "h2"
 	}
 	return v
+}
+
+// SetFragPoCPorts sets the FragPoC server port list from a comma-separated
+// string (gomobile exposes it as SocksstubSetFragPoCPorts). The first parsed
+// port is the base server port; the rest become the dynamic dial pool the
+// FragPoC client rotates across. Whitespace and newlines are also accepted as
+// separators; out-of-range entries are dropped and duplicates removed. Empty
+// or all-invalid input is ignored, leaving the previous value (or the IPA-D37
+// default) in effect. Takes effect on the next SetSamizdatConfig.
+func SetFragPoCPorts(csv string) {
+	seen := make(map[int]struct{})
+	ports := make([]int, 0, 8)
+	for _, tok := range strings.FieldsFunc(csv, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		p, err := strconv.Atoi(tok)
+		if err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+	if len(ports) == 0 {
+		rt.appendLog("info: fragpoc ports — input empty/invalid, keeping previous")
+		return
+	}
+	rt.fragpocPorts.Store(ports)
+	rt.appendLog(fmt.Sprintf("info: fragpoc ports set — base=%d pool=%d total=%d", ports[0], len(ports)-1, len(ports)))
+}
+
+// fragpocPortList returns the FragPoC server port list set via SetFragPoCPorts.
+// Element 0 is the base server port; the rest are the dynamic dial pool. An
+// unset value falls back to the IPA-D37 hardcoded set (base 31503 + dynamic
+// pool 31510-31560). The returned slice always has at least one element.
+func fragpocPortList() []int {
+	if v := rt.fragpocPorts.Load(); v != nil {
+		if ports, ok := v.([]int); ok && len(ports) > 0 {
+			return ports
+		}
+	}
+	ports := make([]int, 0, 52)
+	ports = append(ports, 31503)
+	for p := 31510; p <= 31560; p++ {
+		ports = append(ports, p)
+	}
+	return ports
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.
