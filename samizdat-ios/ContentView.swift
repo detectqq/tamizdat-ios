@@ -458,6 +458,7 @@ struct ContentView: View {
         Task {
             await VPNProfileStore.shared.switchEndpoint(to: ep)
         }
+        bridge.note("user: endpoint → \(ep.label)")
     }
 
     /// IPA-D28: start/stop the main-app WhitelistMonitor based on the
@@ -554,17 +555,23 @@ struct ContentView: View {
 
     private func toggleConnection() {
         if bridge.state == .connected {
+            bridge.note("user: tapped Disconnect")
             bridge.disconnect()
             return
         }
-        guard let blob = ConfigStore.shared.load() else { return }
+        guard let blob = ConfigStore.shared.load() else {
+            bridge.note("connect aborted — no config")
+            return
+        }
         isPreparingVPN = true
         vpnProfileError = nil
         Task { @MainActor in
             defer { isPreparingVPN = false }
             do {
+                bridge.note("user: tapped Connect — endpoint=\(EndpointModeStore.current.label)")
                 try await bridge.connect(blob)
             } catch {
+                bridge.note("connect failed — \(error.localizedDescription)")
                 vpnProfileError = error.localizedDescription
             }
         }
