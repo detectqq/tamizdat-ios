@@ -29,7 +29,7 @@ struct ContentView: View {
     @State private var hasConfig = ConfigStore.shared.load() != nil
     @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
 
-    @State private var isAutoMode: Bool = (EndpointModeStore.current == .auto)
+    @State private var isAutoMode: Bool = false
     @State private var manualEndpoint: EndpointMode = {
         let cur = EndpointModeStore.current
         return cur == .auto ? .primary : cur
@@ -212,6 +212,9 @@ struct ContentView: View {
             .environment(\.themeTokens, theme)
         }
         .onAppear {
+            if EndpointModeStore.current == .auto {
+                EndpointModeStore.current = .primary
+            }
             startStatusPolling()
             lampStore.start()
             exitIP.start(isConnected: bridge.state == .connected)
@@ -235,10 +238,6 @@ struct ContentView: View {
             exitIP.refreshSoon(isConnected: isUp)
             // Stop monitor when extension takes over; resume when
             // tunnel drops back to disconnected.
-            updateWhitelistMonitorState()
-        }
-        .onChange(of: isAutoMode) { _, _ in
-            // Toggle auto-mode → maybe start/stop monitor accordingly.
             updateWhitelistMonitorState()
         }
         // Phase C iOS-notify (preserved from D20): server-pushed alert.
@@ -399,21 +398,11 @@ struct ContentView: View {
                     icon: IconCard(systemName: "dot.radiowaves.up.forward",
                                    bg: theme.blueDim,
                                    fg: theme.blue),
-                    title: "Auto-detect Whitelist",
+                    title: "Endpoint",
                     sub: whitelistSub,
-                    isLast: isAutoMode    // last only when picker is hidden
+                    isLast: false
                 ) {
                     HStack(spacing: 8) {
-                        Toggle("", isOn: $isAutoMode)
-                            .labelsHidden()
-                            .tint(theme.mint)
-                            .onChange(of: isAutoMode) { _, newAuto in
-                                noteSwitchPending()
-                                let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
-                                Task {
-                                    await VPNProfileStore.shared.switchEndpoint(to: newMode)
-                                }
-                            }
                         // IPA-D24: chevron signals the card itself is
                         // tappable — opens the Proxies sheet so the
                         // user can jump straight to URL edit.
@@ -429,24 +418,19 @@ struct ContentView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { showEndpoints = true }
 
-                // IPA-D22 fix: when auto-detect is off, expose the manual
-                // Main/Whitelist picker inline below the toggle — port of
-                // the pre-D22 segmented control that was lost in the rewrite.
-                if !isAutoMode {
-                    HStack(spacing: 0) {
-                        manualPickerSegment(label: "Main",
-                                            isSelected: manualEndpoint == .primary,
-                                            tap: { selectManual(.primary) })
-                        manualPickerSegment(label: "Whitelist",
-                                            isSelected: manualEndpoint == .backup,
-                                            tap: { selectManual(.backup) })
-                    }
-                    .padding(4)
-                    .background(theme.chip)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 14)
+                HStack(spacing: 0) {
+                    manualPickerSegment(label: "Main",
+                                        isSelected: manualEndpoint == .primary,
+                                        tap: { selectManual(.primary) })
+                    manualPickerSegment(label: "Whitelist",
+                                        isSelected: manualEndpoint == .backup,
+                                        tap: { selectManual(.backup) })
                 }
+                .padding(4)
+                .background(theme.chip)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 14)
             }
         }
     }
@@ -483,12 +467,7 @@ struct ContentView: View {
     ///   - isAutoMode == true (no point monitoring if user picked
     ///     manual endpoint)
     private func updateWhitelistMonitorState() {
-        let shouldRun = bridge.state == .disconnected && isAutoMode
-        if shouldRun {
-            whitelistMonitor.start()
-        } else {
-            whitelistMonitor.stop()
-        }
+        whitelistMonitor.stop()
     }
 
     /// IPA-D25 fix6: flip the optimistic "reconnecting" flag instantly
@@ -523,15 +502,7 @@ struct ContentView: View {
     }
 
     private var whitelistSub: String {
-        // Detector status takes precedence — it's the live signal user wants
-        // to see ("Paused — no network" matters in elevator/metro).
-        switch whitelistStatus {
-        case .noNetwork:  return "Paused — no network"
-        case .frozen:     return "Frozen — captive portal?"
-        case .detected:   return "Whitelist active"
-        case .off:        return isAutoMode ? "Free internet" : "Manual"
-        case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
-        }
+        return manualEndpoint == .backup ? "Whitelist server" : "Main server"
     }
 
     // MARK: – Connect button
