@@ -129,13 +129,6 @@ final class SamizdatBridge: ObservableObject {
         rebuildUnifiedLogs()
     }
 
-    /// Append a user-action / diagnostic line to the unified log so it
-    /// interleaves chronologically with the extension + NE-status events.
-    func note(_ message: String) {
-        appendBridgeEvent(message)
-        rebuildUnifiedLogs()
-    }
-
     var version: String {
         SamizdatVersion()
     }
