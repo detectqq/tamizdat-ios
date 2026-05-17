@@ -994,14 +994,16 @@ func ensurePortsHinted(ports []int) {
 	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
 	copy(fpShortID[:], sidBytes)
 	const fpHost = "sync2.detectqq.dpdns.org"
-	basePort := ports[0]
+	// Always connect to the known base port (from fragpocPortList) for the
+	// OpPortHint control message. The `ports` argument is what we ask the
+	// server to OPEN — not where to connect. The server's FragPoC listener
+	// is on the base port (default 31503).
+	basePort := fragpocPortList()[0]
 	fpServerAddr := fmt.Sprintf("%s:%d", fpHost, basePort)
-	pool := append([]int(nil), ports[1:]...)
 	client, err := fragpoc.NewClient(fragpoc.ClientConfig{
-		ServerAddr:      fpServerAddr,
-		ShortID:         fpShortID,
-		Secure:          true,
-		DynamicPortPool: pool,
+		ServerAddr: fpServerAddr,
+		ShortID:    fpShortID,
+		Secure:     true,
 	})
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("warn: ensurePortsHinted client: %v", err))
