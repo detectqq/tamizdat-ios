@@ -40,12 +40,15 @@ struct SettingsView: View {
         .map(String.init).joined(separator: ", ")
     @State private var smokeResults: [SmokePortResult] = []
     @State private var smokeRunning = false
+    @State private var smokeTask: Task<Void, Never>?
     // D47: single-port payload size test (live step-by-step)
     @State private var payloadProgress = PayloadProgress()
     @State private var payloadRunning = false
+    @State private var payloadTask: Task<Void, Never>?
     // D47: sequential max connections test (fill port → next port)
     @State private var maxConnsProgress = MaxConnsProgress()
     @State private var maxConnsRunning = false
+    @State private var maxConnsTask: Task<Void, Never>?
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -591,12 +594,16 @@ struct SettingsView: View {
                 }
 
                 Button {
-                    Task { await runSmokeTest() }
+                    if smokeRunning {
+                        smokeTask?.cancel()
+                    } else {
+                        smokeTask = Task { await runSmokeTest() }
+                    }
                 } label: {
                     HStack(spacing: 8) {
                         if smokeRunning {
-                            ProgressView().controlSize(.small)
-                            Text("Probing…")
+                            Image(systemName: "stop.fill")
+                            Text("Stop")
                         } else {
                             Text("Run test")
                         }
@@ -604,12 +611,11 @@ struct SettingsView: View {
                     .font(.geist(.semibold, size: 13))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
-                    .background(theme.mint)
-                    .foregroundStyle(theme.mintInk)
+                    .background(smokeRunning ? theme.red : theme.mint)
+                    .foregroundStyle(smokeRunning ? .white : theme.mintInk)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-                .disabled(smokeRunning)
 
                 if !smokeResults.isEmpty {
                     // Summary line — only counts settled (non-pending) results.
@@ -821,6 +827,7 @@ struct SettingsView: View {
                 }
             }
             for await (idx, decoded) in group {
+                if Task.isCancelled { break }
                 guard idx < smokeResults.count else { continue }
                 if let d = decoded {
                     smokeResults[idx].status = d.ok ? .ok : .fail
@@ -833,6 +840,7 @@ struct SettingsView: View {
             }
         }
         smokeRunning = false
+        smokeTask = nil
     }
 
     /// Maps smoke status to a lamp color.
@@ -885,12 +893,16 @@ struct SettingsView: View {
                 }
 
                 Button {
-                    Task { await runPayloadTest() }
+                    if payloadRunning {
+                        payloadTask?.cancel()
+                    } else {
+                        payloadTask = Task { await runPayloadTest() }
+                    }
                 } label: {
                     HStack(spacing: 8) {
                         if payloadRunning {
-                            ProgressView().controlSize(.small)
-                            Text(":\(payloadProgress.port)  \(payloadProgress.currentSize) B…")
+                            Image(systemName: "stop.fill")
+                            Text("Stop  :\(payloadProgress.port)  \(payloadProgress.currentSize) B")
                         } else {
                             Text("Run test")
                         }
@@ -898,12 +910,11 @@ struct SettingsView: View {
                     .font(.geist(.semibold, size: 13))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
-                    .background(theme.blue)
+                    .background(payloadRunning ? theme.red : theme.blue)
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-                .disabled(payloadRunning)
 
                 if payloadRunning || payloadProgress.done {
                     VStack(alignment: .leading, spacing: 8) {
@@ -972,9 +983,11 @@ struct SettingsView: View {
         payloadProgress = PayloadProgress(port: port)
 
         for size in stride(from: 10, through: 1500, by: 10) {
+            if Task.isCancelled { break }
             let json = await Task.detached(priority: .userInitiated) {
                 SocksstubProbePayloadStep(port, size)
             }.value
+            if Task.isCancelled { break }
             let decoded = try? JSONDecoder().decode(
                 PayloadStepJSON.self, from: Data(json.utf8))
             let ok = decoded?.ok ?? false
@@ -991,6 +1004,7 @@ struct SettingsView: View {
         }
         if !payloadProgress.done { payloadProgress.done = true }
         payloadRunning = false
+        payloadTask = nil
     }
 
     // MARK: – D47: Sequential max connections test
@@ -1040,12 +1054,16 @@ struct SettingsView: View {
                 }
 
                 Button {
-                    Task { await runMaxConnsTest() }
+                    if maxConnsRunning {
+                        maxConnsTask?.cancel()
+                    } else {
+                        maxConnsTask = Task { await runMaxConnsTest() }
+                    }
                 } label: {
                     HStack(spacing: 8) {
                         if maxConnsRunning {
-                            ProgressView().controlSize(.small)
-                            Text("Opening…  \(maxConnsProgress.total)")
+                            Image(systemName: "stop.fill")
+                            Text("Stop  \(maxConnsProgress.total) conns")
                         } else {
                             Text("Run test")
                         }
@@ -1053,12 +1071,11 @@ struct SettingsView: View {
                     .font(.geist(.semibold, size: 13))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
-                    .background(theme.amber)
-                    .foregroundStyle(.black)
+                    .background(maxConnsRunning ? theme.red : theme.amber)
+                    .foregroundStyle(maxConnsRunning ? .white : .black)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-                .disabled(maxConnsRunning)
 
                 if maxConnsProgress.total > 0 || maxConnsProgress.done {
                     VStack(alignment: .leading, spacing: 8) {
@@ -1123,6 +1140,9 @@ struct SettingsView: View {
     /// D47: Sequential max-connections test — fills port 1 completely,
     /// then port 2, etc. All connections stay open across ports. UI
     /// updates after every single connection opened.
+    /// Max connections per single port before moving to the next.
+    private let maxConnsPerPort = 120
+
     private func runMaxConnsTest() async {
         guard !maxConnsRunning else { return }
         maxConnsRunning = true
@@ -1136,14 +1156,17 @@ struct SettingsView: View {
         // Initialize Go-side session
         _ = await Task.detached { SocksstubStartMaxConnsSession(csv) }.value
 
-        // Fill each port sequentially
+        // Fill each port sequentially (up to 120 per port)
         for (idx, port) in activePorts.enumerated() {
+            if Task.isCancelled { break }
             maxConnsProgress.ports[idx].testing = true
 
-            while true {
+            while maxConnsProgress.ports[idx].count < maxConnsPerPort {
+                if Task.isCancelled { break }
                 let json = await Task.detached(priority: .userInitiated) {
                     SocksstubMaxConnsOpenOne(port)
                 }.value
+                if Task.isCancelled { break }
 
                 guard let decoded = try? JSONDecoder().decode(
                     MaxConnsStepJSON.self, from: Data(json.utf8)) else {
@@ -1171,6 +1194,7 @@ struct SettingsView: View {
         // Cleanup — close all held connections
         _ = await Task.detached { SocksstubMaxConnsClose() }.value
         maxConnsRunning = false
+        maxConnsTask = nil
     }
 
     // MARK: – Whitelist probes
