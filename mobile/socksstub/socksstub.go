@@ -109,6 +109,16 @@ func (c *fragpocUpstreamClient) RTTProbeSnapshot() samizdat.RTTProbeStats {
 	return samizdat.RTTProbeStats{LiteP50Ms: -1, BulkP50Ms: -1, LastMs: -1}
 }
 
+// DialUDP overrides the embedded Client.DialUDP to gate on the runtime
+// UDP toggle. When UDP is disabled, returns an error so hev drops the
+// flow — DNS falls back to the system resolver, QUIC downgrades to TCP.
+func (c *fragpocUpstreamClient) DialUDP(ctx context.Context, addr string) (net.PacketConn, error) {
+	if !fragpocUDPEnabled() {
+		return nil, errors.New("fragpoc: UDP forwarding disabled")
+	}
+	return c.Client.DialUDP(ctx, addr)
+}
+
 // FragPoCPortStats returns a JSON object with the live runtime port stats from
 // the FragPoC client: active/pool port counts, open TCP connections, op-token
 // usage. Returns "{}" when FragPoC is not the active transport. Polled by the
@@ -155,9 +165,15 @@ type runtimeState struct {
 	poolVariant  atomic.Value // string
 	transport    atomic.Value // string
 	fragpocPorts atomic.Value // []int — base server port + dynamic dial pool
+	fragpocUDP   atomic.Bool  // true = forward UDP through FragPoC; false = drop
 }
 
 var rt = &runtimeState{logsMax: 500}
+
+func init() {
+	// Default: UDP forwarding enabled.
+	rt.fragpocUDP.Store(true)
+}
 
 // flowState is registered for every active SOCKS5 flow. The registry
 // is walked by CloseAllFlows() (called from Swift's kernel
@@ -881,6 +897,20 @@ func SetTransport(t string) {
 	}
 	rt.transport.Store(transport)
 	rt.appendLog(fmt.Sprintf("info: transport = %s (next client build will use this)", transport))
+}
+
+// SetFragPoCUDP enables or disables UDP forwarding through the FragPoC
+// transport. When disabled, DialUDP on the FragPoC client returns an error
+// so hev falls back to the system resolver for DNS and QUIC downgrades to
+// TCP. Default: true (UDP forwarding is on). Takes effect immediately —
+// no reconnect needed. Exported for gomobile as SocksstubSetFragPoCUDP.
+func SetFragPoCUDP(enabled bool) {
+	rt.fragpocUDP.Store(enabled)
+	rt.appendLog(fmt.Sprintf("info: fragpoc UDP = %v", enabled))
+}
+
+func fragpocUDPEnabled() bool {
+	return rt.fragpocUDP.Load()
 }
 
 func currentTransport() string {

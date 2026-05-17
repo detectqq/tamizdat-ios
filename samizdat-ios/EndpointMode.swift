@@ -68,6 +68,25 @@ enum FragPoCTransportStore {
     }
 }
 
+/// FragPoC UDP toggle. When disabled, the FragPoC transport drops all UDP
+/// flows (DNS, QUIC, etc.) instead of tunnelling them over TCP. Useful to
+/// reduce op-token pressure — DNS falls back to the system resolver and
+/// QUIC downgrades to HTTP/2 through the TCP tunnel.
+enum FragPoCUDPStore {
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let key = "fragpocUDPEnabled"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    /// Defaults to true — UDP forwarding is on unless explicitly disabled.
+    static var enabled: Bool {
+        get { defaults?.bool(forKey: key) ?? true }
+        set { defaults?.set(newValue, forKey: key) }
+    }
+}
+
 /// FragPoC port mode — a manual test knob (like the FragPoC transport
 /// toggle) picking how the Go SOCKS stub spreads per-op dials across
 /// server ports.

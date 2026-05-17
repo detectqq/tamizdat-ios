@@ -226,6 +226,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SocksstubSetNotificationCallback(NotificationBridge.shared)
         let useFragPoC = FragPoCTransportStore.enabled
         SocksstubSetTransport(useFragPoC ? "fragpoc" : "h2")
+        // Push the FragPoC UDP toggle — takes effect immediately, no
+        // reconnect needed. Default is true (UDP forwarding on).
+        SocksstubSetFragPoCUDP(FragPoCUDPStore.enabled)
         // IPA-D38: push the FragPoC port list selected in the Settings
         // "Port mode" card. socksstub uses element 0 as the base server
         // port and the rest as the dynamic dial pool; ignored unless the

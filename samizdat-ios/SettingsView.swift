@@ -35,6 +35,7 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
     @State private var fragPoCTransportEnabled: Bool = FragPoCTransportStore.enabled
+    @State private var fragPoCUDPEnabled: Bool = FragPoCUDPStore.enabled
     @State private var fragPoCPortMode: FragPoCPortMode = FragPoCPortConfigStore.mode
     @State private var fragPoCPortsDraft: String = FragPoCPortConfigStore.activePorts
         .map(String.init).joined(separator: ", ")
@@ -125,6 +126,9 @@ struct SettingsView: View {
                             .padding(.top, 22)
                         transportCard
                             .padding(.horizontal, 16)
+                        fragPoCUDPCard
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
                         fragPoCPortCard
                             .padding(.horizontal, 16)
                             .padding(.top, 10)
@@ -446,6 +450,30 @@ struct SettingsView: View {
                     .tint(theme.mint)
                     .onChange(of: fragPoCTransportEnabled) { _, newValue in
                         FragPoCTransportStore.enabled = newValue
+                    }
+            }
+        }
+    }
+
+    /// FragPoC UDP forwarding toggle. When off, UDP flows (DNS, QUIC)
+    /// are dropped — DNS falls back to the system resolver, QUIC
+    /// downgrades to HTTP/2 through the TCP tunnel. Takes effect
+    /// immediately without reconnect.
+    private var fragPoCUDPCard: some View {
+        CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "arrow.up.arrow.down.circle",
+                               bg: theme.blueDim, fg: theme.blue),
+                title: "UDP forwarding",
+                sub: "Forward DNS and QUIC through FragPoC. Off = TCP only, less tokens used.",
+                isLast: true
+            ) {
+                Toggle("UDP forwarding", isOn: $fragPoCUDPEnabled)
+                    .labelsHidden()
+                    .tint(theme.mint)
+                    .onChange(of: fragPoCUDPEnabled) { _, newValue in
+                        FragPoCUDPStore.enabled = newValue
+                        SocksstubSetFragPoCUDP(newValue)
                     }
             }
         }
