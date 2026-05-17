@@ -424,15 +424,19 @@ func SetSamizdatConfig(blob string) error {
 			return err
 		}
 
+		wrapper := &fragpocUpstreamClient{Client: fpClient}
 		rt.mu.Lock()
 		old := rt.samizdatClient
 		rt.samizdatBlob = blob
-		rt.samizdatClient = &fragpocUpstreamClient{Client: fpClient}
+		rt.samizdatClient = wrapper
 		rt.mu.Unlock()
-		stopPingProber()
 		if old != nil {
 			_ = old.Close()
 		}
+		// Start the ping prober through the FragPoC tunnel so the UI
+		// transitions from "Connecting…" to "Connected" once the first
+		// end-to-end probe succeeds.
+		startPingProber(wrapper)
 		rt.appendLog(fmt.Sprintf("info: dial mode = fragpoc → %s (+%d pool port(s))", fpServerAddr, len(fpPool)))
 		return nil
 	}

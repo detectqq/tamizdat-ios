@@ -39,9 +39,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	samizdat "github.com/detectqq/tamizdat"
 )
+
+// probeDialer is the minimal interface the ping prober needs from the
+// upstream client — just DialContext to route HTTP probes through the
+// tunnel. Both *samizdat.Client and *fragpocUpstreamClient satisfy it.
+type probeDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
 
 const (
 	defaultPingProbeURL = "http://www.gstatic.com/generate_204"
@@ -176,7 +181,7 @@ func PingProbeSnapshot() *PingSnapshot {
 // dial fails naturally and the next tick re-reads via the bound
 // reference (no, we don't re-read — we stop+restart the prober on
 // every config swap, see stopPingProber).
-func startPingProber(client *samizdat.Client) {
+func startPingProber(client probeDialer) {
 	proberMu.Lock()
 	defer proberMu.Unlock()
 
@@ -228,7 +233,7 @@ func stopPingProber() {
 // every 500 ms status RPC), 30 s when backgrounded. Each tick re-reads
 // the configured URL so live URL changes via SetPingProbeURL take effect
 // on the next probe without restarting.
-func runPingProbeLoop(ctx context.Context, client *samizdat.Client) {
+func runPingProbeLoop(ctx context.Context, client probeDialer) {
 	// Fire one probe immediately so the first sample shows up on the
 	// shield within a few seconds of connect. First probe gets a
 	// longer timeout because cold-start includes TLS handshake to the
@@ -254,14 +259,14 @@ func runPingProbeLoop(ctx context.Context, client *samizdat.Client) {
 // probeOnce performs one HTTP HEAD through the samizdat tunnel and
 // updates the shared snapshot. Errors and non-2xx/3xx responses both
 // count as "miss". Uses the steady-state timeout.
-func probeOnce(ctx context.Context, client *samizdat.Client) {
+func probeOnce(ctx context.Context, client probeDialer) {
 	probeOnceWithTimeout(ctx, client, pingProbeTimeout)
 }
 
 // probeOnceWithTimeout is the actual probe implementation with a
 // caller-supplied timeout. First-probe-of-session uses a longer
 // timeout to absorb cold-start TLS handshake to upstream.
-func probeOnceWithTimeout(ctx context.Context, client *samizdat.Client, timeout time.Duration) {
+func probeOnceWithTimeout(ctx context.Context, client probeDialer, timeout time.Duration) {
 	target := currentPingProbeURL()
 	u, err := url.Parse(target)
 	if err != nil {
