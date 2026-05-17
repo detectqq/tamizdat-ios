@@ -109,6 +109,30 @@ func (c *fragpocUpstreamClient) RTTProbeSnapshot() samizdat.RTTProbeStats {
 	return samizdat.RTTProbeStats{LiteP50Ms: -1, BulkP50Ms: -1, LastMs: -1}
 }
 
+// FragPoCPortStats returns a JSON object with the live runtime port stats from
+// the FragPoC client: dial port count, open TCP connections, op-token usage.
+// Returns "{}" when FragPoC is not the active transport. Polled by the main-app
+// status RPC so the home screen shows real runtime numbers.
+//
+// Format: {"dialPorts":N,"openConns":N,"opTokens":N,"opTokenCap":N}
+func FragPoCPortStats() string {
+	rt.mu.Lock()
+	client := rt.samizdatClient
+	rt.mu.Unlock()
+	fpc, ok := client.(*fragpocUpstreamClient)
+	if !ok || fpc == nil {
+		return "{}"
+	}
+	s := fpc.Client.PortStats()
+	out, _ := json.Marshal(map[string]int64{
+		"dialPorts":  int64(s.DialPorts),
+		"openConns":  s.OpenConns,
+		"opTokens":   int64(s.OpTokens),
+		"opTokenCap": int64(s.OpTokenCap),
+	})
+	return string(out)
+}
+
 type runtimeState struct {
 	mu             sync.Mutex
 	listener       net.Listener

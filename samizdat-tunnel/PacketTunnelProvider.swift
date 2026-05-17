@@ -564,6 +564,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "txBytes":     Int64(tx_bytes),
                 "uptimeSec":   uptime,
                 "isRewiring":  self.isRewiring ? 1 : 0,
+                // D45: live FragPoC port stats — JSON string from Go runtime.
+                "fragpocStats": SocksstubFragPoCPortStats(),
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

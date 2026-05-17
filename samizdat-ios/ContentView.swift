@@ -544,28 +544,58 @@ struct ContentView: View {
 
     // MARK: – FragPoC port info
 
-    /// D45: compact card showing the active FragPoC port mode + port count
-    /// on the main screen so the operator sees what's in use at a glance.
+    /// D45: live FragPoC runtime stats card — shows actual port/connection
+    /// counts from the Go runtime via the status RPC, not just config.
     private var fragPoCPortInfo: some View {
+        let stats = parseFragPoCStats(lampStore.snapshot.fragpocStats)
         let mode = FragPoCPortConfigStore.mode
-        let ports = FragPoCPortConfigStore.activePorts
-        let portCount = ports.count
-        let basePort = ports.first.map(String.init) ?? "—"
-        let poolCount = max(0, portCount - 1)
+        let isOnline = !lampStore.snapshot.realShape.isEmpty
+        let dialPorts = stats?.dialPorts ?? 0
+        let openConns = stats?.openConns ?? 0
+        let opTokens = stats?.opTokens ?? 0
+        let opTokenCap = stats?.opTokenCap ?? 0
 
         return CardContainer(padding: 0) {
             DesignRow(
                 icon: IconCard(systemName: "network",
                                bg: theme.blueDim, fg: theme.blue),
                 title: "FragPoC · \(mode.label)",
-                sub: "Base \(basePort) + \(poolCount) pool port\(poolCount == 1 ? "" : "s") · \(portCount) total",
+                sub: isOnline && stats != nil
+                    ? "\(dialPorts) port\(dialPorts == 1 ? "" : "s") · \(openConns) conn · tokens \(opTokens)/\(opTokenCap)"
+                    : "Offline",
                 isLast: true
             ) {
-                Text("\(portCount)")
-                    .font(.geistMono(.bold, size: 16))
-                    .foregroundStyle(theme.blue)
+                if isOnline && stats != nil {
+                    Text("\(openConns)")
+                        .font(.geistMono(.bold, size: 16))
+                        .foregroundStyle(openConns > 0 ? theme.mint : theme.textDim)
+                } else {
+                    Text("—")
+                        .font(.geistMono(.bold, size: 16))
+                        .foregroundStyle(theme.textDim)
+                }
             }
         }
+    }
+
+    private struct FragPoCRuntimeStats {
+        let dialPorts: Int
+        let openConns: Int
+        let opTokens: Int
+        let opTokenCap: Int
+    }
+
+    private func parseFragPoCStats(_ json: String) -> FragPoCRuntimeStats? {
+        guard !json.isEmpty, json != "{}" else { return nil }
+        guard let data = json.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return FragPoCRuntimeStats(
+            dialPorts: dict["dialPorts"] as? Int ?? 0,
+            openConns: dict["openConns"] as? Int ?? 0,
+            opTokens: dict["opTokens"] as? Int ?? 0,
+            opTokenCap: dict["opTokenCap"] as? Int ?? 0
+        )
     }
 
     // MARK: – Connect button

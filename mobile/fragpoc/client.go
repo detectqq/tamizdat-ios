@@ -152,6 +152,31 @@ func (c *Client) metricsLoop() {
 	}
 }
 
+type PortStats struct {
+	DialPorts  int   // total ports in the dial rotation set
+	OpenConns  int64 // TCP connections open right now
+	OpTokens   int   // op-token slots currently in use (out of cap)
+	OpTokenCap int   // total op-token capacity
+}
+
+func (c *Client) PortStats() PortStats {
+	c.portMu.Lock()
+	dp := len(c.dialPorts)
+	c.portMu.Unlock()
+	used := 0
+	capT := 0
+	if c.opTokens != nil {
+		used = len(c.opTokens)
+		capT = cap(c.opTokens)
+	}
+	return PortStats{
+		DialPorts:  dp,
+		OpenConns:  c.openConns.Load(),
+		OpTokens:   used,
+		OpTokenCap: capT,
+	}
+}
+
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedNetwork, network)
