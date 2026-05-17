@@ -23,11 +23,11 @@ import (
 // reapers are in place.
 const fragpocMetricsInterval = 10 * time.Second
 
-// downPollTimeout bounds a single DOWN long-poll. The previous 30s default
-// (OperationTimeout) meant a hung poll pinned its short-TCP connection and op
-// token for half a minute, starving every other operation; the server
+// defaultDownPollTimeout bounds a single DOWN long-poll. The previous 30s
+// default (OperationTimeout) meant a hung poll pinned its short-TCP connection
+// and token for half a minute, starving every other operation; the server
 // long-poll is sub-second to a couple of seconds, so 5s is a safe backstop.
-const downPollTimeout = 5 * time.Second
+const defaultDownPollTimeout = 5 * time.Second
 
 // fragPoCClientPortCooldown is how long the dial rotator skips a pooled
 // server port after a dial to it fails — the server has most likely scaled
@@ -48,6 +48,7 @@ type ClientConfig struct {
 	Workers          int
 	ConnectTimeout   time.Duration
 	OperationTimeout time.Duration
+	DownPollTimeout  time.Duration
 	// DynamicPortPool is an optional set of ADDITIONAL server ports the client
 	// spreads its per-op dials across (the server opens these dynamically under
 	// load). Empty = single-port behaviour. The base port from ServerAddr is
@@ -63,6 +64,8 @@ type Client struct {
 	downWorkers        int
 	downWindow         int
 	opTokens           chan struct{}
+	downTokens         chan struct{}
+	downPollTimeout    time.Duration
 	dnsTokens          chan struct{}
 	scheduler          *downScheduler
 	serverHost         string
@@ -96,9 +99,11 @@ func NewClient(config ClientConfig) (*Client, error) {
 		workers:      workers,
 		downWorkers:  downWorkers,
 		downWindow:   downWindowCount(workers),
-		opTokens:     make(chan struct{}, workers),
-		dnsTokens:    make(chan struct{}, dnsReserve),
-		serverHost:   host,
+		opTokens:        make(chan struct{}, workers),
+		downTokens:      make(chan struct{}, downWorkers),
+		downPollTimeout: durationDefault(config.DownPollTimeout, defaultDownPollTimeout),
+		dnsTokens:       make(chan struct{}, dnsReserve),
+		serverHost:      host,
 		serverPort:   port,
 		portCooldown: make(map[int]time.Time),
 		stopMetrics:  make(chan struct{}),
@@ -140,14 +145,18 @@ func (c *Client) metricsLoop() {
 			if c.opTokens != nil {
 				opTokens = len(c.opTokens)
 			}
+			downTokens := 0
+			if c.downTokens != nil {
+				downTokens = len(c.downTokens)
+			}
 			activeConns, queuedConns, inFlight := 0, 0, 0
 			if c.scheduler != nil {
 				activeConns, queuedConns, inFlight = c.scheduler.stats()
 			}
 			openConns := c.openConns.Load()
 			openPeak := c.openConnsPeak.Swap(openConns)
-			log.Printf("[FRAGPOC-METRICS] op_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
-				opTokens, cap(c.opTokens), activeConns, queuedConns, inFlight, c.downWorkers, c.downWindow, openConns, openPeak)
+			log.Printf("[FRAGPOC-METRICS] op_tokens=%d/%d down_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
+				opTokens, cap(c.opTokens), downTokens, cap(c.downTokens), activeConns, queuedConns, inFlight, c.downWorkers, c.downWindow, openConns, openPeak)
 		}
 	}
 }
@@ -315,10 +324,10 @@ type downResult struct {
 }
 
 func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte, ack uint32) (downResult, error) {
-	if err := c.acquireOpToken(ctx); err != nil {
+	if err := c.acquireDownToken(ctx); err != nil {
 		return downResult{}, err
 	}
-	defer c.releaseOpToken(ctx)
+	defer c.releaseDownToken()
 
 	padLen := downRequestPaddingLen()
 	var req []byte
@@ -686,6 +695,28 @@ func (c *Client) releaseOpToken(ctx context.Context) {
 	}
 }
 
+func (c *Client) acquireDownToken(ctx context.Context) error {
+	if c.downTokens == nil {
+		return nil
+	}
+	select {
+	case c.downTokens <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) releaseDownToken() {
+	if c.downTokens == nil {
+		return
+	}
+	select {
+	case <-c.downTokens:
+	default:
+	}
+}
+
 // dnsContextKey tags a context as belonging to a DNS flow so acquireOpToken
 // routes the request to the reserved dnsTokens pool.
 type dnsContextKey struct{}
@@ -708,6 +739,8 @@ func ctxIsDNS(ctx context.Context) bool {
 func isDNSDestination(address string) bool {
 	return strings.HasSuffix(address, ":53")
 }
+
+const maxPendingFrames = 16
 
 type Conn struct {
 	client     *Client
@@ -745,6 +778,7 @@ type Conn struct {
 	schedIdleDelay    time.Duration
 	schedErrorDelay   time.Duration
 	schedLastProgress time.Time
+	schedLastPayload  time.Time
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
@@ -803,7 +837,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 				c.readBuf = res.buf
 				break
 			}
-			if _, exists := c.pending[res.seq]; !exists {
+			if _, exists := c.pending[res.seq]; !exists && len(c.pending) < maxPendingFrames {
 				c.pending[res.seq] = res.buf
 			}
 		case err := <-c.errCh:
@@ -949,7 +983,7 @@ func (c *Conn) runScheduledDownPoll() downPollOutcome {
 		return downPollClosed
 	default:
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), downPollTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.client.downPollTimeout)
 	res, err := c.client.down(dnsContext(ctx, c.isDNS), c.sid, c.secureKey, c.recvAck.Load())
 	cancel()
 	if err != nil {

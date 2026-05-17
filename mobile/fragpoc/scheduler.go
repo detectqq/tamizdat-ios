@@ -20,6 +20,13 @@ const (
 // the primary anti-stick mechanism.
 const schedulerStuckTimeout = 75 * time.Second
 
+// schedulerAppStuckTimeout bounds how long a stream may succeed at the
+// transport level (idle DOWNs return OK) without receiving any real payload
+// before the scheduler treats the upstream as dead. Without this, a session
+// that gets nothing but empty idle DOWNs forever keeps refreshing
+// schedLastProgress and is never reaped by the transient-error reaper.
+const schedulerAppStuckTimeout = 120 * time.Second
+
 // errSchedulerStuck is delivered to a stream's errCh when schedulerStuckTimeout
 // is exceeded, so the gVisor Read() returns an error instead of blocking
 // forever.
@@ -63,6 +70,7 @@ func (s *downScheduler) addConn(conn *Conn) {
 	conn.schedInFlight = 0
 	conn.schedWindow = 1
 	conn.schedLastProgress = time.Now()
+	conn.schedLastPayload = time.Time{}
 	s.active[conn] = struct{}{}
 	s.conns = append(s.conns, conn)
 	s.cond.Broadcast()
@@ -170,15 +178,34 @@ func (s *downScheduler) pick() (*Conn, bool) {
 			s.mu.Unlock()
 			return conn, true
 		}
-		s.mu.Unlock()
-
-		wait := schedulerIdleInitial
-		if !earliest.IsZero() {
-			if d := time.Until(earliest); d > 0 && d < wait {
-				wait = d
+		if earliest.IsZero() {
+			// No conn is schedulable and none has a future poll time.
+			// Two sub-cases:
+			//  (a) all conns have in-flight polls — finish() will Broadcast
+			//      when one returns, so cond.Wait is correct.
+			//  (b) all conns are backpressured (downCh full, zero in-flight) —
+			//      no external signal will arrive; fall through to a short sleep
+			//      so we re-check once the consumer drains the channel.
+			anyInFlight := false
+			for c := range s.active {
+				if c.schedInFlight > 0 {
+					anyInFlight = true
+					break
+				}
 			}
+			if anyInFlight {
+				s.cond.Wait() // woken by Broadcast in finish/addConn
+				s.mu.Unlock()
+				continue
+			}
+			s.mu.Unlock()
+			time.Sleep(schedulerIdleInitial)
+			continue
 		}
-		time.Sleep(wait)
+		s.mu.Unlock()
+		if d := time.Until(earliest); d > 0 {
+			time.Sleep(d)
+		}
 	}
 }
 
@@ -207,6 +234,7 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 		conn.schedErrorDelay = schedulerErrorInitial
 		conn.schedNextPoll = now
 		conn.schedLastProgress = now
+		conn.schedLastPayload = now
 	case downPollIdle:
 		conn.schedWindow = 1
 		conn.schedErrorDelay = schedulerErrorInitial
@@ -216,9 +244,23 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 		}
 		conn.schedNextPoll = now.Add(delay)
 		conn.schedIdleDelay = growDelay(delay, schedulerIdleMax)
-		// An idle outcome means the DOWN round-trip succeeded — the server
-		// just had nothing to send. That is forward progress for liveness.
 		conn.schedLastProgress = now
+		// App-level stuck detection: if the application hasn't received
+		// any real payload for schedulerAppStuckTimeout, the upstream is
+		// likely dead even though the transport round-trip succeeds.
+		if conn.schedLastPayload.IsZero() {
+			conn.schedLastPayload = now
+		}
+		if schedulerAppStuckTimeout > 0 && now.Sub(conn.schedLastPayload) >= schedulerAppStuckTimeout {
+			stuck = true
+			delete(s.active, conn)
+			for i, c := range s.conns {
+				if c == conn {
+					s.removeAtLocked(i)
+					break
+				}
+			}
+		}
 	case downPollTransient:
 		// Transient is NOT progress: the DOWN round-trip itself failed. If a
 		// stream sees nothing but transient failures for schedulerStuckTimeout

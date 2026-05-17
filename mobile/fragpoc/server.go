@@ -260,9 +260,7 @@ func (s *Server) handleUp(conn net.Conn) {
 		return
 	}
 	sess.upMu.Lock()
-	if s.operationTimeout > 0 {
-		_ = sess.conn.SetWriteDeadline(time.Now().Add(s.operationTimeout))
-	}
+	_ = sess.conn.SetWriteDeadline(time.Now().Add(upWriteTimeout(s.operationTimeout)))
 	_, err := sess.conn.Write(buf)
 	_ = sess.conn.SetWriteDeadline(time.Time{})
 	sess.upMu.Unlock()
@@ -294,9 +292,7 @@ func (s *Server) handleUpSecure(conn net.Conn) {
 		return
 	}
 	sess.upMu.Lock()
-	if s.operationTimeout > 0 {
-		_ = sess.conn.SetWriteDeadline(time.Now().Add(s.operationTimeout))
-	}
+	_ = sess.conn.SetWriteDeadline(time.Now().Add(upWriteTimeout(s.operationTimeout)))
 	_, err = sess.conn.Write(plain[2:])
 	_ = sess.conn.SetWriteDeadline(time.Time{})
 	sess.upMu.Unlock()
@@ -655,6 +651,16 @@ func intDefault(v, d int) int {
 		return d
 	}
 	return v
+}
+
+// upWriteTimeout caps the UP write deadline to prevent holding upMu for
+// the full operationTimeout (default 30s) when the upstream handler stalls.
+func upWriteTimeout(opTimeout time.Duration) time.Duration {
+	const maxUpWrite = 8 * time.Second
+	if opTimeout <= 0 || opTimeout > maxUpWrite {
+		return maxUpWrite
+	}
+	return opTimeout
 }
 
 func isTimeout(err error) bool {

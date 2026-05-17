@@ -79,16 +79,10 @@ func downWorkerCount(workers int) int {
 }
 
 func downWindowCount(workers int) int {
-	switch {
-	case workers <= 4:
-		return 1
-	case workers <= 16:
-		return 2
-	case workers <= 64:
-		return 4
-	default:
-		return 8
-	}
+	// DOWN per session is strictly sequential on the server: window > 1
+	// only duplicates the same frame via replay and wastes tokens/sockets.
+	// Parallelism should be spent across DIFFERENT streams, not within one.
+	return 1
 }
 
 func connectTimeout(d time.Duration) time.Duration {
