@@ -1297,9 +1297,7 @@ func ProbePayloadStep(port int, size int) string {
 type maxConnsSessionState struct {
 	mu      sync.Mutex
 	conns   []net.Conn
-	ports   []int
 	perPort map[string]int
-	idx     int // round-robin index into ports
 	active  bool
 }
 
@@ -1314,36 +1312,34 @@ func StartMaxConnsSession(portsCSV string) {
 		_ = c.Close()
 	}
 	mcSession.conns = nil
-	mcSession.ports = parsePortList(portsCSV)
 	mcSession.perPort = make(map[string]int)
-	mcSession.idx = 0
 	mcSession.active = true
 }
 
-// MaxConnsOpenNext opens one more connection on the next port in the
-// round-robin list. Returns JSON with the running totals:
+// MaxConnsOpenOne opens one more connection on the specified port. The
+// Swift side controls port order (fill one port completely, then move
+// to the next). Returns JSON with running totals:
 //
-//	{"total":N,"port":N,"ok":true/false,"perPort":{...},"err":"..."}
+//	{"total":N,"port":N,"ok":true/false,"portCount":N,"perPort":{...},"err":"..."}
 //
-// ok=false means this connection failed — the test should stop. All
-// previously opened connections remain held until MaxConnsClose().
-func MaxConnsOpenNext() string {
+// ok=false means this connection failed — move to the next port or
+// stop. All previously opened connections remain held until MaxConnsClose().
+func MaxConnsOpenOne(port int) string {
 	type result struct {
-		Total   int            `json:"total"`
-		Port    int            `json:"port"`
-		OK      bool           `json:"ok"`
-		PerPort map[string]int `json:"perPort"`
-		Err     string         `json:"err,omitempty"`
+		Total     int            `json:"total"`
+		Port      int            `json:"port"`
+		OK        bool           `json:"ok"`
+		PortCount int            `json:"portCount"`
+		PerPort   map[string]int `json:"perPort"`
+		Err       string         `json:"err,omitempty"`
 	}
 
 	mcSession.mu.Lock()
-	if !mcSession.active || len(mcSession.ports) == 0 {
+	if !mcSession.active {
 		mcSession.mu.Unlock()
 		out, _ := json.Marshal(result{Err: "no active session"})
 		return string(out)
 	}
-	port := mcSession.ports[mcSession.idx%len(mcSession.ports)]
-	mcSession.idx++
 	currentTotal := len(mcSession.conns)
 	mcSession.mu.Unlock()
 
@@ -1359,18 +1355,19 @@ func MaxConnsOpenNext() string {
 	mcSession.mu.Lock()
 	defer mcSession.mu.Unlock()
 
+	portKey := strconv.Itoa(port)
 	res := result{Port: port}
 	if err != nil {
 		res.OK = false
 		res.Err = fmt.Sprintf("port %d, conn #%d: %v", port, currentTotal+1, err)
 		res.Total = len(mcSession.conns)
+		res.PortCount = mcSession.perPort[portKey]
 		res.PerPort = cloneMap(mcSession.perPort)
-		mcSession.active = false
 	} else {
 		mcSession.conns = append(mcSession.conns, conn)
-		portKey := strconv.Itoa(port)
 		mcSession.perPort[portKey]++
 		res.Total = len(mcSession.conns)
+		res.PortCount = mcSession.perPort[portKey]
 		res.PerPort = cloneMap(mcSession.perPort)
 		res.OK = true
 		if len(mcSession.conns) >= 2000 {
@@ -1394,7 +1391,6 @@ func MaxConnsClose() {
 	mcSession.conns = nil
 	mcSession.perPort = nil
 	mcSession.active = false
-	mcSession.idx = 0
 }
 
 func cloneMap(m map[string]int) map[string]int {
