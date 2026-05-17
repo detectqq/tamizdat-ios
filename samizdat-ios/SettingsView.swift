@@ -40,11 +40,11 @@ struct SettingsView: View {
         .map(String.init).joined(separator: ", ")
     @State private var smokeResults: [SmokePortResult] = []
     @State private var smokeRunning = false
-    // D46: payload size test
-    @State private var payloadResults: [PayloadPortResult] = []
+    // D47: progressive payload size test
+    @State private var payloadProgress: [PayloadPortProgress] = []
     @State private var payloadRunning = false
-    // D46: max connections test
-    @State private var maxConnsResult: MaxConnsResult?
+    // D47: progressive max connections test
+    @State private var maxConnsProgress = MaxConnsProgress()
     @State private var maxConnsRunning = false
 
     // IPA-D23: whitelist-detection probe targets.
@@ -844,20 +844,26 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: – D46: Payload size test
+    // MARK: – D47: Progressive payload size test
 
-    private struct PayloadPortResult: Identifiable {
+    /// Per-port progress for the payload size test. Each port starts as
+    /// `testing`, showing the current step size live. Settles to `done`
+    /// when the port's loop completes (all sizes OK or first failure).
+    private struct PayloadPortProgress: Identifiable {
         let port: Int
-        var status: SmokeStatus
-        var maxBytes: Int
+        var currentSize: Int = 0  // last size tested
+        var maxOKSize: Int = 0    // largest size that got AckOK
+        var testing: Bool = false
+        var done: Bool = false
         var err: String?
         var id: Int { port }
     }
 
-    private struct PayloadJSON: Codable {
+    /// JSON shape returned by SocksstubProbePayloadStep.
+    private struct PayloadStepJSON: Codable {
         let port: Int
-        let maxBytes: Int
-        let attempts: Int
+        let size: Int
+        let ok: Bool
         let err: String?
     }
 
@@ -899,23 +905,56 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
                 .disabled(payloadRunning)
 
-                if !payloadResults.isEmpty {
+                if !payloadProgress.isEmpty {
+                    // Summary line — settled ports only.
+                    let settled = payloadProgress.filter(\.done)
+                    if !settled.isEmpty || payloadRunning {
+                        HStack(spacing: 6) {
+                            if !settled.isEmpty {
+                                Text("\(settled.filter { $0.maxOKSize > 0 }.count) pass")
+                                    .foregroundStyle(Color.green)
+                                Text("·").foregroundStyle(theme.textDim)
+                                Text("\(settled.filter { $0.maxOKSize == 0 }.count) fail")
+                                    .foregroundStyle(Color.red)
+                            }
+                            if payloadRunning {
+                                let testing = payloadProgress.filter(\.testing).count
+                                if testing > 0 {
+                                    Text("·").foregroundStyle(theme.textDim)
+                                    Text("\(testing) testing")
+                                        .foregroundStyle(Color.yellow)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .font(.geist(.semibold, size: 12))
+                    }
+
                     VStack(spacing: 6) {
-                        ForEach(payloadResults) { r in
+                        ForEach(payloadProgress) { p in
                             HStack(spacing: 10) {
                                 Circle()
-                                    .fill(smokeColor(r.status))
+                                    .fill(payloadLampColor(p))
                                     .frame(width: 9, height: 9)
-                                Text(String(r.port))
+                                Text(String(p.port))
                                     .font(.geistMono(.regular, size: 13))
                                     .foregroundStyle(theme.text)
                                 Spacer()
-                                if r.status == .pending {
-                                    ProgressView().controlSize(.mini)
-                                } else {
-                                    Text("\(r.maxBytes) B")
+                                if p.testing {
+                                    HStack(spacing: 4) {
+                                        Text("\(p.currentSize) B")
+                                            .font(.geistMono(.regular, size: 11))
+                                            .foregroundStyle(theme.textDim)
+                                        ProgressView().controlSize(.mini)
+                                    }
+                                } else if p.done {
+                                    Text("\(p.maxOKSize) B")
                                         .font(.geistMono(.bold, size: 13))
-                                        .foregroundStyle(r.maxBytes > 0 ? theme.blue : theme.red)
+                                        .foregroundStyle(p.maxOKSize > 0 ? theme.blue : theme.red)
+                                } else {
+                                    Text("—")
+                                        .font(.geistMono(.regular, size: 11))
+                                        .foregroundStyle(theme.textDim)
                                 }
                             }
                         }
@@ -929,46 +968,78 @@ struct SettingsView: View {
         }
     }
 
+    /// Maps payload-progress state to a lamp color.
+    private func payloadLampColor(_ p: PayloadPortProgress) -> Color {
+        if p.testing { return .yellow }
+        if p.done && p.maxOKSize > 0 { return .green }
+        if p.done { return .red }
+        return Color.gray.opacity(0.4)
+    }
+
+    /// D47: Progressive payload test — each port runs its step loop
+    /// concurrently; the UI updates after every single step so the user
+    /// sees the current byte-size climbing in real time.
     private func runPayloadTest() async {
         guard !payloadRunning else { return }
         payloadRunning = true
         let ports = FragPoCPortConfigStore.activePorts
-        payloadResults = ports.map { PayloadPortResult(port: $0, status: .pending, maxBytes: 0) }
+        payloadProgress = ports.map { PayloadPortProgress(port: $0, testing: true) }
 
-        await withTaskGroup(of: (Int, PayloadJSON?).self) { group in
+        await withTaskGroup(of: Void.self) { group in
             for (idx, port) in ports.enumerated() {
                 group.addTask {
-                    let json = SocksstubProbeMaxPayload(port)
-                    let decoded = try? JSONDecoder().decode(
-                        PayloadJSON.self, from: Data(json.utf8))
-                    return (idx, decoded)
-                }
-            }
-            for await (idx, decoded) in group {
-                guard idx < payloadResults.count else { continue }
-                if let d = decoded {
-                    payloadResults[idx].status = d.maxBytes > 0 ? .ok : .fail
-                    payloadResults[idx].maxBytes = d.maxBytes
-                    payloadResults[idx].err = d.err
-                } else {
-                    payloadResults[idx].status = .fail
-                    payloadResults[idx].err = "decode error"
+                    for size in stride(from: 10, through: 1500, by: 10) {
+                        let json = await Task.detached(priority: .userInitiated) {
+                            SocksstubProbePayloadStep(port, size)
+                        }.value
+                        let decoded = try? JSONDecoder().decode(
+                            PayloadStepJSON.self, from: Data(json.utf8))
+                        let ok = decoded?.ok ?? false
+
+                        await MainActor.run {
+                            guard idx < self.payloadProgress.count else { return }
+                            self.payloadProgress[idx].currentSize = size
+                            if ok {
+                                self.payloadProgress[idx].maxOKSize = size
+                            } else {
+                                self.payloadProgress[idx].err = decoded?.err
+                                self.payloadProgress[idx].testing = false
+                                self.payloadProgress[idx].done = true
+                            }
+                        }
+                        if !ok { break }
+                    }
+                    // If all 1500 bytes passed without failure
+                    await MainActor.run {
+                        guard idx < self.payloadProgress.count else { return }
+                        if self.payloadProgress[idx].testing {
+                            self.payloadProgress[idx].testing = false
+                            self.payloadProgress[idx].done = true
+                        }
+                    }
                 }
             }
         }
         payloadRunning = false
     }
 
-    // MARK: – D46: Max connections test
+    // MARK: – D47: Progressive max connections test
 
-    private struct MaxConnsResult {
-        var total: Int
-        var perPort: [(port: String, count: Int)]
+    /// Live progress for the max-connections test. Updated after every
+    /// single connection so the user sees the counter climbing in real time.
+    private struct MaxConnsProgress {
+        var total: Int = 0
+        var perPort: [(port: String, count: Int)] = []
+        var lastPort: Int = 0
         var err: String?
+        var done: Bool = false
     }
 
-    private struct MaxConnsJSON: Codable {
+    /// JSON shape returned by SocksstubMaxConnsOpenNext.
+    private struct MaxConnsStepJSON: Codable {
         let total: Int
+        let port: Int
+        let ok: Bool
         let perPort: [String: Int]
         let err: String?
     }
@@ -996,7 +1067,7 @@ struct SettingsView: View {
                     HStack(spacing: 8) {
                         if maxConnsRunning {
                             ProgressView().controlSize(.small)
-                            Text("Testing…")
+                            Text("Opening…  \(maxConnsProgress.total)")
                         } else {
                             Text("Run test")
                         }
@@ -1011,28 +1082,35 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
                 .disabled(maxConnsRunning)
 
-                if let r = maxConnsResult {
+                if maxConnsProgress.total > 0 || maxConnsProgress.done {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Total connections:")
+                            Text("Connections:")
                                 .font(.geist(.semibold, size: 14))
                                 .foregroundStyle(theme.text)
-                            Text("\(r.total)")
-                                .font(.geistMono(.bold, size: 18))
-                                .foregroundStyle(r.total > 0 ? theme.amber : theme.red)
+                            Text("\(maxConnsProgress.total)")
+                                .font(.geistMono(.bold, size: 24))
+                                .foregroundStyle(theme.amber)
+                                .contentTransition(.numericText())
+                                .animation(.easeInOut(duration: 0.15), value: maxConnsProgress.total)
                         }
-                        ForEach(r.perPort, id: \.port) { item in
-                            HStack(spacing: 10) {
-                                Text(":\(item.port)")
-                                    .font(.geistMono(.regular, size: 12))
-                                    .foregroundStyle(theme.textDim)
-                                Spacer()
-                                Text("\(item.count) conn")
-                                    .font(.geistMono(.regular, size: 12))
-                                    .foregroundStyle(theme.text)
+
+                        if !maxConnsProgress.perPort.isEmpty {
+                            ForEach(maxConnsProgress.perPort, id: \.port) { item in
+                                HStack(spacing: 10) {
+                                    Text(":\(item.port)")
+                                        .font(.geistMono(.regular, size: 12))
+                                        .foregroundStyle(theme.textDim)
+                                    Spacer()
+                                    Text("\(item.count)")
+                                        .font(.geistMono(.regular, size: 12))
+                                        .foregroundStyle(theme.text)
+                                        .contentTransition(.numericText())
+                                }
                             }
                         }
-                        if let err = r.err {
+
+                        if let err = maxConnsProgress.err {
                             Text(err)
                                 .font(.geistMono(.regular, size: 10))
                                 .foregroundStyle(theme.red)
@@ -1047,24 +1125,47 @@ struct SettingsView: View {
         }
     }
 
+    /// D47: Progressive max-connections test — opens connections one by one
+    /// via a Go-side session, updating the UI counter after each. The user
+    /// sees the total climbing in real time and the per-port breakdown.
     private func runMaxConnsTest() async {
         guard !maxConnsRunning else { return }
         maxConnsRunning = true
-        maxConnsResult = nil
+        maxConnsProgress = MaxConnsProgress()
+
         let csv = FragPoCPortConfigStore.activePortsCSV
-        let json = await Task.detached(priority: .userInitiated) {
-            SocksstubProbeMaxConns(csv)
-        }.value
-        if let decoded = try? JSONDecoder().decode(MaxConnsJSON.self, from: Data(json.utf8)) {
+
+        // Initialize Go-side session (closes any leftover from previous run)
+        _ = await Task.detached { SocksstubStartMaxConnsSession(csv) }.value
+
+        // Open connections one by one, updating UI after each
+        while true {
+            let json = await Task.detached(priority: .userInitiated) {
+                SocksstubMaxConnsOpenNext()
+            }.value
+
+            guard let decoded = try? JSONDecoder().decode(
+                MaxConnsStepJSON.self, from: Data(json.utf8)) else {
+                maxConnsProgress.err = "decode error"
+                maxConnsProgress.done = true
+                break
+            }
+
+            maxConnsProgress.total = decoded.total
+            maxConnsProgress.lastPort = decoded.port
             let sorted = decoded.perPort.sorted { $0.key < $1.key }
-            maxConnsResult = MaxConnsResult(
-                total: decoded.total,
-                perPort: sorted.map { (port: $0.key, count: $0.value) },
-                err: decoded.err
-            )
-        } else {
-            maxConnsResult = MaxConnsResult(total: 0, perPort: [], err: "decode error")
+            maxConnsProgress.perPort = sorted.map { (port: $0.key, count: $0.value) }
+
+            if !decoded.ok {
+                maxConnsProgress.err = decoded.err
+                maxConnsProgress.done = true
+                break
+            }
         }
+
+        // Cleanup — close all held connections
+        _ = await Task.detached { SocksstubMaxConnsClose() }.value
+
         maxConnsRunning = false
     }
 

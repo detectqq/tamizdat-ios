@@ -1256,6 +1256,155 @@ func openAndHold(ctx context.Context, host string, port int, shortID [fragpoc.Sh
 	return conn, nil
 }
 
+// ProbePayloadStep tests a single payload size on a single port and returns
+// the result as JSON. This is the per-step building block for the progressive
+// payload test UI: Swift calls it once per (port, size) pair, updating the
+// screen after each call so the user sees live progress.
+//
+// Return format: {"port":N,"size":N,"ok":true/false,"err":"..."}
+func ProbePayloadStep(port int, size int) string {
+	type result struct {
+		Port int    `json:"port"`
+		Size int    `json:"size"`
+		OK   bool   `json:"ok"`
+		Err  string `json:"err,omitempty"`
+	}
+	const fpHost = "sync2.detectqq.dpdns.org"
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	err := probeWithPayloadSize(ctx, fpHost, port, fpShortID, staticKey, size)
+	res := result{Port: port, Size: size, OK: err == nil}
+	if err != nil {
+		res.Err = err.Error()
+	}
+	out, _ := json.Marshal(res)
+	return string(out)
+}
+
+// ── Max-connections session ──────────────────────────────────────────
+//
+// The session pattern lets Swift open one connection at a time via
+// MaxConnsOpenNext(), updating the UI after each, while all previous
+// connections remain held open in Go memory. Call StartMaxConnsSession
+// before the loop, MaxConnsOpenNext inside the loop, and MaxConnsClose
+// when done (or on error).
+
+type maxConnsSessionState struct {
+	mu      sync.Mutex
+	conns   []net.Conn
+	ports   []int
+	perPort map[string]int
+	idx     int // round-robin index into ports
+	active  bool
+}
+
+var mcSession = &maxConnsSessionState{}
+
+// StartMaxConnsSession prepares a new max-connections test. Closes any
+// leftover connections from a previous session.
+func StartMaxConnsSession(portsCSV string) {
+	mcSession.mu.Lock()
+	defer mcSession.mu.Unlock()
+	for _, c := range mcSession.conns {
+		_ = c.Close()
+	}
+	mcSession.conns = nil
+	mcSession.ports = parsePortList(portsCSV)
+	mcSession.perPort = make(map[string]int)
+	mcSession.idx = 0
+	mcSession.active = true
+}
+
+// MaxConnsOpenNext opens one more connection on the next port in the
+// round-robin list. Returns JSON with the running totals:
+//
+//	{"total":N,"port":N,"ok":true/false,"perPort":{...},"err":"..."}
+//
+// ok=false means this connection failed — the test should stop. All
+// previously opened connections remain held until MaxConnsClose().
+func MaxConnsOpenNext() string {
+	type result struct {
+		Total   int            `json:"total"`
+		Port    int            `json:"port"`
+		OK      bool           `json:"ok"`
+		PerPort map[string]int `json:"perPort"`
+		Err     string         `json:"err,omitempty"`
+	}
+
+	mcSession.mu.Lock()
+	if !mcSession.active || len(mcSession.ports) == 0 {
+		mcSession.mu.Unlock()
+		out, _ := json.Marshal(result{Err: "no active session"})
+		return string(out)
+	}
+	port := mcSession.ports[mcSession.idx%len(mcSession.ports)]
+	mcSession.idx++
+	currentTotal := len(mcSession.conns)
+	mcSession.mu.Unlock()
+
+	const fpHost = "sync2.detectqq.dpdns.org"
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	conn, err := openAndHold(ctx, fpHost, port, fpShortID)
+	cancel()
+
+	mcSession.mu.Lock()
+	defer mcSession.mu.Unlock()
+
+	res := result{Port: port}
+	if err != nil {
+		res.OK = false
+		res.Err = fmt.Sprintf("port %d, conn #%d: %v", port, currentTotal+1, err)
+		res.Total = len(mcSession.conns)
+		res.PerPort = cloneMap(mcSession.perPort)
+		mcSession.active = false
+	} else {
+		mcSession.conns = append(mcSession.conns, conn)
+		portKey := strconv.Itoa(port)
+		mcSession.perPort[portKey]++
+		res.Total = len(mcSession.conns)
+		res.PerPort = cloneMap(mcSession.perPort)
+		res.OK = true
+		if len(mcSession.conns) >= 2000 {
+			res.Err = "reached 2000 connection cap"
+			mcSession.active = false
+			res.OK = false
+		}
+	}
+	out, _ := json.Marshal(res)
+	return string(out)
+}
+
+// MaxConnsClose closes all connections held by the current session.
+// Always call this when the test completes or on error.
+func MaxConnsClose() {
+	mcSession.mu.Lock()
+	defer mcSession.mu.Unlock()
+	for _, c := range mcSession.conns {
+		_ = c.Close()
+	}
+	mcSession.conns = nil
+	mcSession.perPort = nil
+	mcSession.active = false
+	mcSession.idx = 0
+}
+
+func cloneMap(m map[string]int) map[string]int {
+	cp := make(map[string]int, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
 func parsePortList(csv string) []int {
 	seen := make(map[int]struct{})
 	var ports []int
