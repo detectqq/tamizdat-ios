@@ -1029,6 +1029,252 @@ func ProbeOnePort(port int) string {
 	return string(out)
 }
 
+// ProbeMaxPayload probes a single port to find the maximum TCP payload size
+// that can pass through the network path. Sends increasingly large packets
+// (step 10 bytes) via FragPoC OpOpenSecure with a padded destination field.
+// Each attempt is a fresh TCP connection. Returns a JSON result:
+//
+//	{"port":N,"maxBytes":N,"attempts":N,"err":"..."}
+func ProbeMaxPayload(port int) string {
+	type result struct {
+		Port     int    `json:"port"`
+		MaxBytes int    `json:"maxBytes"`
+		Attempts int    `json:"attempts"`
+		Err      string `json:"err,omitempty"`
+	}
+	const fpHost = "sync2.detectqq.dpdns.org"
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
+
+	maxOK := 0
+	attempts := 0
+	var lastErr string
+
+	// Test payload sizes from 10 to 1500 in steps of 10.
+	// Each test: TCP connect, send OpOpenSecure with a destination string
+	// padded to the target size, check if we get AckOK back.
+	for size := 10; size <= 1500; size += 10 {
+		attempts++
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		err := probeWithPayloadSize(ctx, fpHost, port, fpShortID, staticKey, size)
+		cancel()
+		if err != nil {
+			lastErr = fmt.Sprintf("failed at %d bytes: %v", size, err)
+			break
+		}
+		maxOK = size
+	}
+
+	res := result{Port: port, MaxBytes: maxOK, Attempts: attempts}
+	if lastErr != "" {
+		res.Err = lastErr
+	}
+	out, _ := json.Marshal(res)
+	return string(out)
+}
+
+// probeWithPayloadSize sends an OpOpenSecure with a destination field padded
+// to exactly `size` bytes. The server will attempt to resolve the destination
+// and fail, but we still get AckOK + SID back — proving the payload traversed
+// the network path intact.
+func probeWithPayloadSize(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, staticKey [32]byte, size int) error {
+	timeout := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(deadline); d > 0 && d < timeout {
+			timeout = d
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	fragpoc.ApplyDeadlineFromContext(conn, ctx)
+
+	// Build destination string padded to `size` bytes.
+	// Format: "probe-NNNN-<padding>.invalid:80\x00"
+	dest := fmt.Sprintf("probe-%04d-", size)
+	if len(dest) < size {
+		padding := make([]byte, size-len(dest))
+		for i := range padding {
+			padding[i] = 'x'
+		}
+		dest += string(padding)
+	}
+	dest = dest[:size]
+
+	reqPlain := make([]byte, len(dest)+1)
+	copy(reqPlain, dest)
+	nonce, err := fragpoc.NewSecureNonce()
+	if err != nil {
+		return err
+	}
+	prefix := make([]byte, 1+fragpoc.ShortIDLen)
+	prefix[0] = fragpoc.OpOpenSecure
+	copy(prefix[1:], shortID[:])
+	if _, err := conn.Write(prefix); err != nil {
+		return err
+	}
+	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
+	if err := fragpoc.WriteSecureBodyWithNonce(conn, staticKey, reqAD, nonce[:], reqPlain); err != nil {
+		return err
+	}
+	respAD := fragpoc.SecureResponseAD(fragpoc.OpOpenSecure, shortID[:])
+	resp, _, err := fragpoc.ReadSecureBody(conn, staticKey, respAD, 1+fragpoc.SIDLen)
+	if err != nil {
+		return err
+	}
+	if len(resp) < 1 || resp[0] != fragpoc.AckOK {
+		return fmt.Errorf("server rejected payload: ack=%d", resp[0])
+	}
+	return nil
+}
+
+// ProbeMaxConns tests how many simultaneous TCP connections can be held open
+// across all ports in the config list. Opens connections round-robin across
+// ports, each performing a full OpOpenSecure handshake. Keeps all connections
+// open until one fails (connection refused, timeout, etc). Returns JSON:
+//
+//	{"total":N,"perPort":{...},"err":"..."}
+func ProbeMaxConns(portsCSV string) string {
+	type result struct {
+		Total   int            `json:"total"`
+		PerPort map[string]int `json:"perPort"`
+		Err     string         `json:"err,omitempty"`
+	}
+
+	const fpHost = "sync2.detectqq.dpdns.org"
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+
+	ports := parsePortList(portsCSV)
+	if len(ports) == 0 {
+		out, _ := json.Marshal(result{Err: "no ports"})
+		return string(out)
+	}
+
+	perPort := make(map[string]int)
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	total := 0
+	var lastErr string
+	portIdx := 0
+
+	for {
+		port := ports[portIdx%len(ports)]
+		portKey := strconv.Itoa(port)
+		portIdx++
+
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		conn, err := openAndHold(ctx, fpHost, port, fpShortID)
+		cancel()
+		if err != nil {
+			lastErr = fmt.Sprintf("port %d, conn #%d: %v", port, total+1, err)
+			break
+		}
+		conns = append(conns, conn)
+		total++
+		perPort[portKey]++
+
+		// Safety cap — don't open more than 2000 connections.
+		if total >= 2000 {
+			lastErr = "reached 2000 connection cap"
+			break
+		}
+	}
+
+	res := result{Total: total, PerPort: perPort}
+	if lastErr != "" {
+		res.Err = lastErr
+	}
+	out, _ := json.Marshal(res)
+	return string(out)
+}
+
+// openAndHold dials a FragPoC port, performs OpOpenSecure, and returns the
+// raw TCP connection WITHOUT closing it. The caller holds it open to test
+// concurrent connection limits.
+func openAndHold(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte) (net.Conn, error) {
+	timeout := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(deadline); d > 0 && d < timeout {
+			timeout = d
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return nil, err
+	}
+	fragpoc.ApplyDeadlineFromContext(conn, ctx)
+
+	staticKey := fragpoc.DeriveSecureStaticKey(shortID)
+	const probeDest = "conntest.invalid:80"
+	reqPlain := make([]byte, len(probeDest)+1)
+	copy(reqPlain, probeDest)
+	nonce, err := fragpoc.NewSecureNonce()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	prefix := make([]byte, 1+fragpoc.ShortIDLen)
+	prefix[0] = fragpoc.OpOpenSecure
+	copy(prefix[1:], shortID[:])
+	if _, err := conn.Write(prefix); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
+	if err := fragpoc.WriteSecureBodyWithNonce(conn, staticKey, reqAD, nonce[:], reqPlain); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	respAD := fragpoc.SecureResponseAD(fragpoc.OpOpenSecure, shortID[:])
+	resp, _, err := fragpoc.ReadSecureBody(conn, staticKey, respAD, 1+fragpoc.SIDLen)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if len(resp) < 1 || resp[0] != fragpoc.AckOK {
+		conn.Close()
+		return nil, fmt.Errorf("ack rejected: %d", resp[0])
+	}
+	// Clear deadline so connection stays open.
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func parsePortList(csv string) []int {
+	seen := make(map[int]struct{})
+	var ports []int
+	for _, tok := range strings.FieldsFunc(csv, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		p, err := strconv.Atoi(tok)
+		if err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+	return ports
+}
+
 // Logs returns the recent in-memory log buffer joined with newlines.
 func Logs() string {
 	rt.mu.Lock()

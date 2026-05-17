@@ -40,6 +40,12 @@ struct SettingsView: View {
         .map(String.init).joined(separator: ", ")
     @State private var smokeResults: [SmokePortResult] = []
     @State private var smokeRunning = false
+    // D46: payload size test
+    @State private var payloadResults: [PayloadPortResult] = []
+    @State private var payloadRunning = false
+    // D46: max connections test
+    @State private var maxConnsResult: MaxConnsResult?
+    @State private var maxConnsRunning = false
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -120,6 +126,12 @@ struct SettingsView: View {
                             .padding(.horizontal, 16)
                             .padding(.top, 10)
                         fragPoCSmokeTestCard
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
+                        fragPoCPayloadTestCard
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
+                        fragPoCMaxConnsTestCard
                             .padding(.horizontal, 16)
                             .padding(.top, 10)
 
@@ -831,6 +843,232 @@ struct SettingsView: View {
         case .fail:    return .red
         }
     }
+
+    // MARK: – D46: Payload size test
+
+    private struct PayloadPortResult: Identifiable {
+        let port: Int
+        var status: SmokeStatus
+        var maxBytes: Int
+        var err: String?
+        var id: Int { port }
+    }
+
+    private struct PayloadJSON: Codable {
+        let port: Int
+        let maxBytes: Int
+        let attempts: Int
+        let err: String?
+    }
+
+    private var fragPoCPayloadTestCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "arrow.up.arrow.down",
+                             bg: theme.blueDim, fg: theme.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Max payload test")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("Finds max bytes per port (step 10 B)")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                Button {
+                    Task { await runPayloadTest() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if payloadRunning {
+                            ProgressView().controlSize(.small)
+                            Text("Testing…")
+                        } else {
+                            Text("Run test")
+                        }
+                    }
+                    .font(.geist(.semibold, size: 13))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(theme.blue)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .disabled(payloadRunning)
+
+                if !payloadResults.isEmpty {
+                    VStack(spacing: 6) {
+                        ForEach(payloadResults) { r in
+                            HStack(spacing: 10) {
+                                Circle()
+                                    .fill(smokeColor(r.status))
+                                    .frame(width: 9, height: 9)
+                                Text(String(r.port))
+                                    .font(.geistMono(.regular, size: 13))
+                                    .foregroundStyle(theme.text)
+                                Spacer()
+                                if r.status == .pending {
+                                    ProgressView().controlSize(.mini)
+                                } else {
+                                    Text("\(r.maxBytes) B")
+                                        .font(.geistMono(.bold, size: 13))
+                                        .foregroundStyle(r.maxBytes > 0 ? theme.blue : theme.red)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text("Sends increasingly larger payloads via OpOpenSecure. Max = last size that got AckOK. Run with VPN off.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
+    private func runPayloadTest() async {
+        guard !payloadRunning else { return }
+        payloadRunning = true
+        let ports = FragPoCPortConfigStore.activePorts
+        payloadResults = ports.map { PayloadPortResult(port: $0, status: .pending, maxBytes: 0) }
+
+        await withTaskGroup(of: (Int, PayloadJSON?).self) { group in
+            for (idx, port) in ports.enumerated() {
+                group.addTask {
+                    let json = SocksstubProbeMaxPayload(port)
+                    let decoded = try? JSONDecoder().decode(
+                        PayloadJSON.self, from: Data(json.utf8))
+                    return (idx, decoded)
+                }
+            }
+            for await (idx, decoded) in group {
+                guard idx < payloadResults.count else { continue }
+                if let d = decoded {
+                    payloadResults[idx].status = d.maxBytes > 0 ? .ok : .fail
+                    payloadResults[idx].maxBytes = d.maxBytes
+                    payloadResults[idx].err = d.err
+                } else {
+                    payloadResults[idx].status = .fail
+                    payloadResults[idx].err = "decode error"
+                }
+            }
+        }
+        payloadRunning = false
+    }
+
+    // MARK: – D46: Max connections test
+
+    private struct MaxConnsResult {
+        var total: Int
+        var perPort: [(port: String, count: Int)]
+        var err: String?
+    }
+
+    private struct MaxConnsJSON: Codable {
+        let total: Int
+        let perPort: [String: Int]
+        let err: String?
+    }
+
+    private var fragPoCMaxConnsTestCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "point.3.connected.trianglepath.dotted",
+                             bg: theme.amberDim, fg: theme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Max connections test")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("Total simultaneous TCP across all ports")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                Button {
+                    Task { await runMaxConnsTest() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if maxConnsRunning {
+                            ProgressView().controlSize(.small)
+                            Text("Testing…")
+                        } else {
+                            Text("Run test")
+                        }
+                    }
+                    .font(.geist(.semibold, size: 13))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(theme.amber)
+                    .foregroundStyle(.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .disabled(maxConnsRunning)
+
+                if let r = maxConnsResult {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Total connections:")
+                                .font(.geist(.semibold, size: 14))
+                                .foregroundStyle(theme.text)
+                            Text("\(r.total)")
+                                .font(.geistMono(.bold, size: 18))
+                                .foregroundStyle(r.total > 0 ? theme.amber : theme.red)
+                        }
+                        ForEach(r.perPort, id: \.port) { item in
+                            HStack(spacing: 10) {
+                                Text(":\(item.port)")
+                                    .font(.geistMono(.regular, size: 12))
+                                    .foregroundStyle(theme.textDim)
+                                Spacer()
+                                Text("\(item.count) conn")
+                                    .font(.geistMono(.regular, size: 12))
+                                    .foregroundStyle(theme.text)
+                            }
+                        }
+                        if let err = r.err {
+                            Text(err)
+                                .font(.geistMono(.regular, size: 10))
+                                .foregroundStyle(theme.red)
+                        }
+                    }
+                }
+
+                Text("Opens connections round-robin across all ports until failure. Each performs a full FragPoC handshake. Run with VPN off.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
+    private func runMaxConnsTest() async {
+        guard !maxConnsRunning else { return }
+        maxConnsRunning = true
+        maxConnsResult = nil
+        let csv = FragPoCPortConfigStore.activePortsCSV
+        let json = await Task.detached(priority: .userInitiated) {
+            SocksstubProbeMaxConns(csv)
+        }.value
+        if let decoded = try? JSONDecoder().decode(MaxConnsJSON.self, from: Data(json.utf8)) {
+            let sorted = decoded.perPort.sorted { $0.key < $1.key }
+            maxConnsResult = MaxConnsResult(
+                total: decoded.total,
+                perPort: sorted.map { (port: $0.key, count: $0.value) },
+                err: decoded.err
+            )
+        } else {
+            maxConnsResult = MaxConnsResult(total: 0, perPort: [], err: "decode error")
+        }
+        maxConnsRunning = false
+    }
+
+    // MARK: – Whitelist probes
 
     private func saveWhitelistProbes() {
         WhitelistProbePreferences.testHost = testHostDraft
