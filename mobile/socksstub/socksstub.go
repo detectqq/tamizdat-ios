@@ -95,9 +95,9 @@ type fragpocUpstreamClient struct {
 	*fragpoc.Client
 }
 
-func (c *fragpocUpstreamClient) ShapeMode() string { return "" }
+func (c *fragpocUpstreamClient) ShapeMode() string { return "FragPoC" }
 
-func (c *fragpocUpstreamClient) RealShapeMode() string { return "" }
+func (c *fragpocUpstreamClient) RealShapeMode() string { return "FragPoC" }
 
 func (c *fragpocUpstreamClient) ActiveRealtimeCount() int { return 0 }
 
