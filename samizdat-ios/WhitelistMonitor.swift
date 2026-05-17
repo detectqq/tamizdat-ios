@@ -31,8 +31,11 @@ final class WhitelistMonitor: ObservableObject {
     // AND main app is foregrounded, so battery cost of bumped cadence
     // is bounded (user can only stare at the app for so long before
     // backgrounding).
+    // D45: cadence now user-configurable via WhitelistProbePreferences.
     private static let probeTimeout: TimeInterval = 2
-    private static let cycleInterval: TimeInterval = 3
+    private static var cycleInterval: TimeInterval {
+        TimeInterval(WhitelistProbePreferences.probeInterval)
+    }
     private static let firstCycleDelay: TimeInterval = 0
 
     private var task: Task<Void, Never>?

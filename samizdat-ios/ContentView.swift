@@ -59,7 +59,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D44"
+    private static let milestoneTag = "D45"
 
     // MARK: – Derived state
 
@@ -162,6 +162,14 @@ struct ContentView: View {
                 statTiles
                     .padding(.horizontal, 16)
                     .padding(.top, 4)
+
+                // D45: FragPoC port info — visible on the main screen
+                // when the FragPoC transport is enabled.
+                if FragPoCTransportStore.enabled {
+                    fragPoCPortInfo
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                }
 
                 // IPA-D25 fix5: row is always visible. The picker
                 // inside the row is gated on hasBackupConfigured —
@@ -531,6 +539,32 @@ struct ContentView: View {
         case .detected:   return "Whitelist active"
         case .off:        return isAutoMode ? "Free internet" : "Manual"
         case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
+        }
+    }
+
+    // MARK: – FragPoC port info
+
+    /// D45: compact card showing the active FragPoC port mode + port count
+    /// on the main screen so the operator sees what's in use at a glance.
+    private var fragPoCPortInfo: some View {
+        let mode = FragPoCPortConfigStore.mode
+        let ports = FragPoCPortConfigStore.activePorts
+        let portCount = ports.count
+        let basePort = ports.first.map(String.init) ?? "—"
+        let poolCount = max(0, portCount - 1)
+
+        return CardContainer(padding: 0) {
+            DesignRow(
+                icon: IconCard(systemName: "network",
+                               bg: theme.blueDim, fg: theme.blue),
+                title: "FragPoC · \(mode.label)",
+                sub: "Base \(basePort) + \(poolCount) pool port\(poolCount == 1 ? "" : "s") · \(portCount) total",
+                isLast: true
+            ) {
+                Text("\(portCount)")
+                    .font(.geistMono(.bold, size: 16))
+                    .foregroundStyle(theme.blue)
+            }
         }
     }
 

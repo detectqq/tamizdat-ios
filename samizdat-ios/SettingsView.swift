@@ -44,6 +44,9 @@ struct SettingsView: View {
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
+    // D45: expanded whitelist tunables.
+    @State private var wlSuccessesDraft: Int = WhitelistProbePreferences.successesNeeded
+    @State private var wlIntervalDraft: Int = WhitelistProbePreferences.probeInterval
 
     @State private var showEndpoints = false
     @State private var showLogs = false
@@ -316,6 +319,28 @@ struct SettingsView: View {
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .onSubmit { saveWhitelistProbes() }
+
+                // D45: successes needed before switching back to primary
+                Text("Successes before failback")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Stepper(value: $wlSuccessesDraft, in: 1...10) {
+                    Text("\(wlSuccessesDraft)")
+                        .font(.geistMono(.regular, size: 14))
+                        .foregroundStyle(theme.text)
+                }
+                .tint(theme.mint)
+
+                // D45: probe interval (seconds)
+                Text("Probe interval (seconds)")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Stepper(value: $wlIntervalDraft, in: 1...30) {
+                    Text("\(wlIntervalDraft) s")
+                        .font(.geistMono(.regular, size: 14))
+                        .foregroundStyle(theme.text)
+                }
+                .tint(theme.mint)
 
                 HStack(spacing: 8) {
                     Button(action: saveWhitelistProbes) {
@@ -810,9 +835,13 @@ struct SettingsView: View {
     private func saveWhitelistProbes() {
         WhitelistProbePreferences.testHost = testHostDraft
         WhitelistProbePreferences.whitelistHost = whitelistHostDraft
+        WhitelistProbePreferences.successesNeeded = wlSuccessesDraft
+        WhitelistProbePreferences.probeInterval = wlIntervalDraft
         // Re-sync drafts so blank-saves snap back to the resolved default.
         testHostDraft = WhitelistProbePreferences.testHost
         whitelistHostDraft = WhitelistProbePreferences.whitelistHost
+        wlSuccessesDraft = WhitelistProbePreferences.successesNeeded
+        wlIntervalDraft = WhitelistProbePreferences.probeInterval
         Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
     }
 
@@ -820,6 +849,8 @@ struct SettingsView: View {
         WhitelistProbePreferences.reset()
         testHostDraft = WhitelistProbePreferences.testHost
         whitelistHostDraft = WhitelistProbePreferences.whitelistHost
+        wlSuccessesDraft = WhitelistProbePreferences.successesNeeded
+        wlIntervalDraft = WhitelistProbePreferences.probeInterval
         Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
     }
 

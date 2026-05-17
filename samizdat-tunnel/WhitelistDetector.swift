@@ -38,10 +38,18 @@ final class WhitelistDetector {
     // by tunnel-active time. Hold-down (60s) still prevents endpoint
     // thrashing on flapping networks.
     private static let probeTimeout: TimeInterval = 3
-    private static let normalCadence: TimeInterval = 5
-    private static let onBackupCadence: TimeInterval = 10
     private static let holdDownSeconds: TimeInterval = 60
-    private static let failbackSuccessesNeeded: Int = 2
+
+    /// Read user-configured cadence; double it when on backup.
+    private static var normalCadence: TimeInterval {
+        TimeInterval(WhitelistProbePreferences.probeInterval)
+    }
+    private static var onBackupCadence: TimeInterval {
+        TimeInterval(WhitelistProbePreferences.probeInterval) * 2
+    }
+    private static var failbackSuccessesNeeded: Int {
+        WhitelistProbePreferences.successesNeeded
+    }
 
     // Hooks injected by PacketTunnelProvider.
     private let log: (String) -> Void
