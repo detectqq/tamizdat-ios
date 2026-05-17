@@ -551,6 +551,7 @@ struct ContentView: View {
         let mode = FragPoCPortConfigStore.mode
         let isOnline = !lampStore.snapshot.realShape.isEmpty
         let dialPorts = stats?.dialPorts ?? 0
+        let poolPorts = stats?.poolPorts ?? 0
         let openConns = stats?.openConns ?? 0
         let opTokens = stats?.opTokens ?? 0
         let opTokenCap = stats?.opTokenCap ?? 0
@@ -561,7 +562,7 @@ struct ContentView: View {
                                bg: theme.blueDim, fg: theme.blue),
                 title: "FragPoC · \(mode.label)",
                 sub: isOnline && stats != nil
-                    ? "\(dialPorts) port\(dialPorts == 1 ? "" : "s") · \(openConns) conn · tokens \(opTokens)/\(opTokenCap)"
+                    ? "\(dialPorts)/\(poolPorts) port\(poolPorts == 1 ? "" : "s") · \(openConns) conn · tokens \(opTokens)/\(opTokenCap)"
                     : "Offline",
                 isLast: true
             ) {
@@ -579,7 +580,8 @@ struct ContentView: View {
     }
 
     private struct FragPoCRuntimeStats {
-        let dialPorts: Int
+        let dialPorts: Int  // active ports in the dynamic rotation window
+        let poolPorts: Int  // total ports available in the pool
         let openConns: Int
         let opTokens: Int
         let opTokenCap: Int
@@ -592,6 +594,7 @@ struct ContentView: View {
         else { return nil }
         return FragPoCRuntimeStats(
             dialPorts: dict["dialPorts"] as? Int ?? 0,
+            poolPorts: dict["poolPorts"] as? Int ?? 0,
             openConns: dict["openConns"] as? Int ?? 0,
             opTokens: dict["opTokens"] as? Int ?? 0,
             opTokenCap: dict["opTokenCap"] as? Int ?? 0

@@ -34,6 +34,25 @@ const defaultDownPollTimeout = 5 * time.Second
 // that listener down. The base port is never cooled.
 const fragPoCClientPortCooldown = 30 * time.Second
 
+// Dynamic port-pool scaling: the client starts with a small active window
+// and grows it under burst traffic, then contracts when idle.
+const (
+	// portScaleMinActive is the minimum number of ports in the active
+	// rotation (base + pool). Even at idle we keep a small set to spread
+	// traffic and avoid single-port fingerprinting.
+	portScaleMinActive = 2
+	// portScaleBurstPerPort: when openConns / activePorts exceeds this,
+	// bring another port into the rotation. At 2 active ports this fires
+	// at >40 conns; at 3 → >60; etc.
+	portScaleBurstPerPort = 20
+	// portScaleShrinkPerPort: when openConns / activePorts falls below
+	// this AND the shrink delay has passed, remove a port from rotation.
+	portScaleShrinkPerPort = 4
+	// portScaleShrinkDelay: don't shrink until this much time has passed
+	// since the last scale-up, to avoid thrashing under bursty traffic.
+	portScaleShrinkDelay = 30 * time.Second
+)
+
 // dnsReserve is the size of the priority op-token pool reserved for DNS flows
 // (UDP :53). DNS ops draw from this pool instead of the shared data pool, so
 // a DNS query never waits behind a saturated bulk transfer — the operator's
@@ -71,10 +90,12 @@ type Client struct {
 	serverHost         string
 	serverPort         string
 	basePortNum        int
-	dialPorts          []int // rotation set: [basePort] + pooled ports, de-duplicated
-	portMu             sync.Mutex
-	portRR             int // round-robin cursor
-	portCooldown       map[int]time.Time
+	dialPorts       []int // full pool: [basePort] + pooled ports, de-duplicated
+	portMu          sync.Mutex
+	portRR          int // round-robin cursor
+	portCooldown    map[int]time.Time
+	activePortCount int       // dynamic window — how many of dialPorts[0:N] we rotate through
+	lastScaleUp     time.Time // debounce shrink after burst
 	resolveMu          sync.Mutex
 	resolvedServerAddr string
 	closeOnce          sync.Once
@@ -126,6 +147,14 @@ func NewClient(config ClientConfig) (*Client, error) {
 			}
 		}
 	}
+	// Dynamic port scaling: start with a small active window so the UI
+	// shows actual port utilisation, not the full pool size.
+	if n := len(client.dialPorts); n > 0 {
+		client.activePortCount = portScaleMinActive
+		if client.activePortCount > n {
+			client.activePortCount = n
+		}
+	}
 	client.scheduler = newDownScheduler(client)
 	go client.metricsLoop()
 	return client, nil
@@ -162,7 +191,8 @@ func (c *Client) metricsLoop() {
 }
 
 type PortStats struct {
-	DialPorts  int   // total ports in the dial rotation set
+	DialPorts  int   // active ports in the dynamic rotation window
+	PoolPorts  int   // total ports available (full pool including inactive)
 	OpenConns  int64 // TCP connections open right now
 	OpTokens   int   // op-token slots currently in use (out of cap)
 	OpTokenCap int   // total op-token capacity
@@ -170,8 +200,12 @@ type PortStats struct {
 
 func (c *Client) PortStats() PortStats {
 	c.portMu.Lock()
-	dp := len(c.dialPorts)
+	dp := c.activePortCount
+	pool := len(c.dialPorts)
 	c.portMu.Unlock()
+	if dp <= 0 {
+		dp = pool
+	}
 	used := 0
 	capT := 0
 	if c.opTokens != nil {
@@ -180,6 +214,7 @@ func (c *Client) PortStats() PortStats {
 	}
 	return PortStats{
 		DialPorts:  dp,
+		PoolPorts:  pool,
 		OpenConns:  c.openConns.Load(),
 		OpTokens:   used,
 		OpTokenCap: capT,
@@ -585,10 +620,32 @@ func (c *Client) nextDialPort() int {
 	if len(c.dialPorts) == 0 {
 		return c.basePortNum
 	}
+
+	// Dynamic scale-up: when per-port concurrency exceeds the burst
+	// threshold, bring another port into the active rotation immediately
+	// so the current dial benefits from the wider pool.
+	conns := c.openConns.Load()
+	if c.activePortCount > 0 && c.activePortCount < len(c.dialPorts) &&
+		conns > int64(c.activePortCount*portScaleBurstPerPort) {
+		c.activePortCount++
+		c.lastScaleUp = time.Now()
+		log.Printf("[FRAGPOC-PORTS] scale-up → %d/%d active ports (openConns=%d)",
+			c.activePortCount, len(c.dialPorts), conns)
+	}
+
+	active := c.activePortCount
+	if active <= 0 || active > len(c.dialPorts) {
+		active = len(c.dialPorts)
+	}
+	// Keep RR cursor within the active window.
+	if c.portRR >= active {
+		c.portRR = 0
+	}
+
 	now := time.Now()
-	for range c.dialPorts {
+	for range active {
 		port := c.dialPorts[c.portRR]
-		c.portRR = (c.portRR + 1) % len(c.dialPorts)
+		c.portRR = (c.portRR + 1) % active
 		if port == c.basePortNum {
 			return port
 		}
@@ -628,8 +685,30 @@ type countedConn struct {
 func (cc *countedConn) Close() error {
 	cc.closeOnce.Do(func() {
 		cc.client.openConns.Add(-1)
+		cc.client.maybeScaleDown()
 	})
 	return cc.Conn.Close()
+}
+
+// maybeScaleDown contracts the active port window when per-port concurrency
+// drops below the shrink threshold and enough time has passed since the last
+// burst growth. Only shrinks by 1 per Close to drain gracefully.
+func (c *Client) maybeScaleDown() {
+	c.portMu.Lock()
+	defer c.portMu.Unlock()
+
+	if c.activePortCount <= portScaleMinActive {
+		return
+	}
+	if time.Since(c.lastScaleUp) < portScaleShrinkDelay {
+		return
+	}
+	conns := c.openConns.Load()
+	if conns < int64(c.activePortCount*portScaleShrinkPerPort) {
+		c.activePortCount--
+		log.Printf("[FRAGPOC-PORTS] scale-down → %d/%d active ports (openConns=%d)",
+			c.activePortCount, len(c.dialPorts), conns)
+	}
 }
 
 func (c *Client) serverDialAddr(ctx context.Context) (string, error) {
