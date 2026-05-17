@@ -238,8 +238,8 @@ func (c *Client) openSecure(ctx context.Context, destination string) (openResult
 }
 
 func (c *Client) sendUp(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte, p []byte) error {
-	if len(p) > c.maxPayload {
-		return fmt.Errorf("fragpoc: UP chunk too large: %d > %d", len(p), c.maxPayload)
+	if len(p) > MaxUpPayload {
+		return fmt.Errorf("fragpoc: UP chunk too large: %d > %d", len(p), MaxUpPayload)
 	}
 	if c.config.Secure {
 		reqPlain := make([]byte, 2+len(p))
@@ -376,6 +376,22 @@ const (
 // request, uniformly in [downRequestPadMin, downRequestPadMax].
 func downRequestPaddingLen() int {
 	return downRequestPadMin + rand.Intn(downRequestPadMax-downRequestPadMin+1)
+}
+
+// upChunkMin and upChunkMax bound the randomised UP payload chunk size. Write
+// splits outbound data into chunks of a random size in this range (it was a
+// fixed MaxPayload), so a bulk transfer no longer emits a stream of
+// identically sized UP frames. upChunkMax stays within the server's
+// MaxUpPayload acceptance ceiling.
+const (
+	upChunkMin = 480
+	upChunkMax = 620
+)
+
+// randomUpChunk returns a random UP payload chunk size, uniformly in
+// [upChunkMin, upChunkMax].
+func randomUpChunk() int {
+	return upChunkMin + rand.Intn(upChunkMax-upChunkMin+1)
 }
 
 func fillDownRequestPadding(p []byte, sid [SIDLen]byte) {
@@ -751,7 +767,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	total := 0
 	for len(p) > 0 {
-		n := c.client.maxPayload
+		n := randomUpChunk()
 		if n > len(p) {
 			n = len(p)
 		}

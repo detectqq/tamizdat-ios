@@ -19,6 +19,7 @@ const (
 	SIDLen          = 12
 	ShortIDLen      = 8
 	MaxPayload      = 480
+	MaxUpPayload    = 640 // UP payload ceiling; client sends randomised <=620-byte chunks
 	DownRequestSize = 500
 	DefaultWorkers  = 64
 	MaxWorkers      = 120

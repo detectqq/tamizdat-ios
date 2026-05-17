@@ -250,7 +250,7 @@ func (s *Server) handleUp(conn net.Conn) {
 		return
 	}
 	n := int(binary.BigEndian.Uint16(hdr[:]))
-	if n > s.maxPayload {
+	if n > MaxUpPayload {
 		_, _ = conn.Write([]byte{AckErr})
 		return
 	}
@@ -283,13 +283,13 @@ func (s *Server) handleUpSecure(conn net.Conn) {
 	writeErr := func() {
 		_, _ = writeSecureBody(conn, sess.secureKey, respAD, []byte{AckErr})
 	}
-	plain, _, err := readSecureBody(conn, sess.secureKey, secureRequestAD(OpUpSecure, sess.sid[:]), 2+s.maxPayload)
+	plain, _, err := readSecureBody(conn, sess.secureKey, secureRequestAD(OpUpSecure, sess.sid[:]), 2+MaxUpPayload)
 	if err != nil || len(plain) < 2 {
 		writeErr()
 		return
 	}
 	n := int(binary.BigEndian.Uint16(plain[:2]))
-	if n > s.maxPayload || len(plain) != 2+n {
+	if n > MaxUpPayload || len(plain) != 2+n {
 		writeErr()
 		return
 	}
