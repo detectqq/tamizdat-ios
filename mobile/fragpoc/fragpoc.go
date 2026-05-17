@@ -8,10 +8,11 @@ import (
 )
 
 const (
-	OpOpen  byte = 0x01
-	OpUp    byte = 0x02
-	OpDown  byte = 0x03
-	OpClose byte = 0x04
+	OpOpen     byte = 0x01
+	OpUp       byte = 0x02
+	OpDown     byte = 0x03
+	OpClose    byte = 0x04
+	OpPortHint byte = 0x05
 
 	AckOK  byte = 0x00
 	AckErr byte = 0xff

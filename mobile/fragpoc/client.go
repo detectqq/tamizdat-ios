@@ -1167,3 +1167,114 @@ func ProbePort(ctx context.Context, host string, port int, shortID [ShortIDLen]b
 	}
 	return nil
 }
+
+// SendPortHint sends an OpPortHint to the server with the desired port list.
+// The server opens the requested ports (within its allowed pool/max) and
+// responds with the list of actually-open ports. On success, the client
+// updates its dialPorts to match the server's response.
+//
+// Wire format:
+//
+//	Client → [OpPortHint][ShortID 8B][ports CSV\0]
+//	Server → [AckOK][open ports CSV\0]   or   [AckErr]
+func (c *Client) SendPortHint(ctx context.Context, requestedPorts []int) ([]int, error) {
+	csv := formatPortCSV(requestedPorts)
+	req := make([]byte, 1+ShortIDLen+len(csv)+1)
+	req[0] = OpPortHint
+	copy(req[1:1+ShortIDLen], c.config.ShortID[:])
+	copy(req[1+ShortIDLen:], csv)
+	req[len(req)-1] = 0 // NUL terminator
+
+	if err := c.acquireOpToken(ctx); err != nil {
+		return nil, err
+	}
+	defer c.releaseOpToken(ctx)
+
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.Write(req); err != nil {
+		return nil, err
+	}
+	applyDeadlineFromContext(conn, ctx)
+
+	// Read response: [AckOK/AckErr][CSV\0]
+	var ack [1]byte
+	if _, err := io.ReadFull(conn, ack[:]); err != nil {
+		return nil, err
+	}
+	if ack[0] != AckOK {
+		return nil, fmt.Errorf("fragpoc: port hint rejected by server")
+	}
+	// Read NUL-terminated CSV of open ports.
+	var buf []byte
+	one := make([]byte, 1)
+	for {
+		if _, err := io.ReadFull(conn, one); err != nil {
+			return nil, err
+		}
+		if one[0] == 0 {
+			break
+		}
+		buf = append(buf, one[0])
+		if len(buf) > 1024 {
+			return nil, fmt.Errorf("fragpoc: port hint response too large")
+		}
+	}
+	openPorts := parsePortCSV(string(buf))
+
+	// Update client's dial ports to match server's actual open ports.
+	if len(openPorts) > 0 {
+		c.updateDialPorts(openPorts)
+	}
+	return openPorts, nil
+}
+
+// updateDialPorts replaces the client's dialPorts with the server-provided
+// list and resets the active window.
+func (c *Client) updateDialPorts(ports []int) {
+	c.portMu.Lock()
+	defer c.portMu.Unlock()
+	seen := make(map[int]struct{})
+	var deduped []int
+	for _, p := range ports {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		deduped = append(deduped, p)
+	}
+	c.dialPorts = deduped
+	if len(deduped) < portScaleMinActive {
+		c.activePortCount = len(deduped)
+	} else {
+		c.activePortCount = portScaleMinActive
+	}
+	c.portRR = 0
+}
+
+func parsePortCSV(s string) []int {
+	var out []int
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		p, err := strconv.Atoi(tok)
+		if err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func formatPortCSV(ports []int) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(p)
+	}
+	return strings.Join(parts, ",")
+}

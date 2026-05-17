@@ -441,6 +441,18 @@ func SetSamizdatConfig(blob string) error {
 			return err
 		}
 
+		// Send OpPortHint: tell the server which ports the client wants,
+		// server opens them and responds with the actually-open list.
+		// Best-effort — failure just means we keep the client-side pool.
+		hintCtx, hintCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		openPorts, hintErr := fpClient.SendPortHint(hintCtx, fpPorts)
+		hintCancel()
+		if hintErr != nil {
+			rt.appendLog(fmt.Sprintf("warn: port hint failed: %v (keeping client-side pool)", hintErr))
+		} else {
+			rt.appendLog(fmt.Sprintf("info: server confirmed %d open port(s): %v", len(openPorts), openPorts))
+		}
+
 		wrapper := &fragpocUpstreamClient{Client: fpClient}
 		rt.mu.Lock()
 		old := rt.samizdatClient
