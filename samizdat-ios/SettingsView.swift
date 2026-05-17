@@ -507,14 +507,29 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
-    /// One port's smoke-test result, decoded from the JSON that
-    /// SocksstubRunFragPoCSmokeTest returns.
-    private struct SmokePortResult: Codable, Identifiable {
+    /// Smoke-test status for a single port.
+    private enum SmokeStatus: String {
+        case pending  // yellow — probe launched but not finished
+        case ok       // green  — port reachable, FragPoC answered
+        case fail     // red    — blocked / unreachable / timeout
+    }
+
+    /// One port's smoke-test result. Starts as `.pending` (yellow lamp),
+    /// updated to `.ok` or `.fail` as its probe completes.
+    private struct SmokePortResult: Identifiable {
+        let port: Int
+        var status: SmokeStatus
+        var ms: Int
+        var err: String?
+        var id: Int { port }
+    }
+
+    /// JSON shape returned by SocksstubProbeOnePort.
+    private struct SmokePortJSON: Codable {
         let port: Int
         let ok: Bool
         let ms: Int
         let err: String?
-        var id: Int { port }
     }
 
     /// IPA-D40: multi-port smoke test — probes each port of the active
@@ -560,29 +575,44 @@ struct SettingsView: View {
                 .disabled(smokeRunning)
 
                 if !smokeResults.isEmpty {
-                    HStack(spacing: 6) {
-                        Text("\(smokeResults.filter { $0.ok }.count) reachable")
-                            .foregroundStyle(Color.green)
-                        Text("·")
-                            .foregroundStyle(theme.textDim)
-                        Text("\(smokeResults.filter { !$0.ok }.count) blocked")
-                            .foregroundStyle(Color.red)
-                        Spacer()
+                    // Summary line — only counts settled (non-pending) results.
+                    let settled = smokeResults.filter { $0.status != .pending }
+                    if !settled.isEmpty {
+                        HStack(spacing: 6) {
+                            Text("\(settled.filter { $0.status == .ok }.count) reachable")
+                                .foregroundStyle(Color.green)
+                            Text("·")
+                                .foregroundStyle(theme.textDim)
+                            Text("\(settled.filter { $0.status == .fail }.count) blocked")
+                                .foregroundStyle(Color.red)
+                            if smokeRunning {
+                                Text("·")
+                                    .foregroundStyle(theme.textDim)
+                                Text("\(smokeResults.filter { $0.status == .pending }.count) pending")
+                                    .foregroundStyle(Color.yellow)
+                            }
+                            Spacer()
+                        }
+                        .font(.geist(.semibold, size: 12))
                     }
-                    .font(.geist(.semibold, size: 12))
                     VStack(spacing: 6) {
                         ForEach(smokeResults) { result in
                             HStack(spacing: 10) {
                                 Circle()
-                                    .fill(result.ok ? Color.green : Color.red)
+                                    .fill(smokeColor(result.status))
                                     .frame(width: 9, height: 9)
                                 Text(String(result.port))
                                     .font(.geistMono(.regular, size: 13))
                                     .foregroundStyle(theme.text)
                                 Spacer()
-                                Text("\(result.ms) ms")
-                                    .font(.geistMono(.regular, size: 11))
-                                    .foregroundStyle(theme.textDim)
+                                if result.status == .pending {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                } else {
+                                    Text("\(result.ms) ms")
+                                        .font(.geistMono(.regular, size: 11))
+                                        .foregroundStyle(theme.textDim)
+                                }
                             }
                         }
                     }
@@ -730,20 +760,51 @@ struct SettingsView: View {
         fragPoCPortsDraft = defaults.map(String.init).joined(separator: ", ")
     }
 
-    /// Runs the multi-port smoke test off the main thread, then publishes the
-    /// per-port results. Probes the active mode's port list; the Go side
-    /// probes all ports in parallel, each bounded by a ~6 s timeout.
+    /// D44: Progressive smoke test — all ports appear as yellow lamps immediately,
+    /// each turning green or red as its probe completes. Probes run concurrently
+    /// via TaskGroup; each finished probe updates its entry on the main actor so
+    /// the UI refreshes in real time.
     private func runSmokeTest() async {
         guard !smokeRunning else { return }
         smokeRunning = true
-        smokeResults = []
-        let csv = FragPoCPortConfigStore.activePortsCSV
-        let json = await Task.detached(priority: .userInitiated) {
-            SocksstubRunFragPoCSmokeTest(csv)
-        }.value
-        smokeResults = (try? JSONDecoder().decode(
-            [SmokePortResult].self, from: Data(json.utf8))) ?? []
+
+        // Parse the active port list and seed every port as pending (yellow).
+        let ports = FragPoCPortConfigStore.activePorts
+        smokeResults = ports.map { SmokePortResult(port: $0, status: .pending, ms: 0) }
+
+        // Launch all probes concurrently. Each probe calls the per-port Go
+        // function and posts its result back to the main actor individually.
+        await withTaskGroup(of: (Int, SmokePortJSON?).self) { group in
+            for (idx, port) in ports.enumerated() {
+                group.addTask {
+                    let json = SocksstubProbeOnePort(port)
+                    let decoded = try? JSONDecoder().decode(
+                        SmokePortJSON.self, from: Data(json.utf8))
+                    return (idx, decoded)
+                }
+            }
+            for await (idx, decoded) in group {
+                guard idx < smokeResults.count else { continue }
+                if let d = decoded {
+                    smokeResults[idx].status = d.ok ? .ok : .fail
+                    smokeResults[idx].ms = d.ms
+                    smokeResults[idx].err = d.err
+                } else {
+                    smokeResults[idx].status = .fail
+                    smokeResults[idx].err = "decode error"
+                }
+            }
+        }
         smokeRunning = false
+    }
+
+    /// Maps smoke status to a lamp color.
+    private func smokeColor(_ status: SmokeStatus) -> Color {
+        switch status {
+        case .pending: return .yellow
+        case .ok:      return .green
+        case .fail:    return .red
+        }
     }
 
     private func saveWhitelistProbes() {

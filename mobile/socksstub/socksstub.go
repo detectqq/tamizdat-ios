@@ -972,6 +972,39 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 	return string(out)
 }
 
+// ProbeOnePort probes a single FragPoC port and returns a JSON object with the
+// result (gomobile exposes it as SocksstubProbeOnePort). This is the per-port
+// building block for the progressive smoke test UI: Swift calls it once per
+// port inside a TaskGroup so results stream to the UI as they arrive.
+//
+// Return format: {"port":N,"ok":true/false,"ms":N,"err":"..."}
+func ProbeOnePort(port int) string {
+	type portResult struct {
+		Port int    `json:"port"`
+		OK   bool   `json:"ok"`
+		MS   int64  `json:"ms"`
+		Err  string `json:"err,omitempty"`
+	}
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+	const fpHost = "sync2.detectqq.dpdns.org"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	start := time.Now()
+	probeErr := fragpoc.ProbePort(ctx, fpHost, port, fpShortID)
+	res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
+	if probeErr != nil {
+		res.Err = probeErr.Error()
+	}
+	out, err := json.Marshal(res)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
 // Logs returns the recent in-memory log buffer joined with newlines.
 func Logs() string {
 	rt.mu.Lock()
