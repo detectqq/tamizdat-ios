@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,12 @@ const downPollTimeout = 5 * time.Second
 // server port after a dial to it fails — the server has most likely scaled
 // that listener down. The base port is never cooled.
 const fragPoCClientPortCooldown = 30 * time.Second
+
+// dnsReserve is the size of the priority op-token pool reserved for DNS flows
+// (UDP :53). DNS ops draw from this pool instead of the shared data pool, so
+// a DNS query never waits behind a saturated bulk transfer — the operator's
+// "DNS gets queue priority" knob. Additive: it does not shrink the data pool.
+const dnsReserve = 8
 
 type ClientConfig struct {
 	ServerAddr       string
@@ -56,6 +63,7 @@ type Client struct {
 	downWorkers        int
 	downWindow         int
 	opTokens           chan struct{}
+	dnsTokens          chan struct{}
 	scheduler          *downScheduler
 	serverHost         string
 	serverPort         string
@@ -89,6 +97,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		downWorkers:  downWorkers,
 		downWindow:   downWindowCount(workers),
 		opTokens:     make(chan struct{}, workers),
+		dnsTokens:    make(chan struct{}, dnsReserve),
 		serverHost:   host,
 		serverPort:   port,
 		portCooldown: make(map[int]time.Time),
@@ -150,7 +159,8 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	if address == "" {
 		return nil, errors.New("fragpoc: empty destination")
 	}
-	opened, err := c.open(ctx, address)
+	isDNS := isDNSDestination(address)
+	opened, err := c.open(dnsContext(ctx, isDNS), address)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +168,7 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 		client:     c,
 		sid:        opened.sid,
 		secureKey:  opened.secureKey,
+		isDNS:      isDNS,
 		localAddr:  streamAddr{network: "tcp", address: "fragpoc-client"},
 		remoteAddr: streamAddr{network: "tcp", address: address},
 		downCh:     make(chan downResult, c.downWindow*2),
@@ -282,7 +293,7 @@ func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte,
 	if err := c.acquireOpToken(ctx); err != nil {
 		return downResult{}, err
 	}
-	defer c.releaseOpToken()
+	defer c.releaseOpToken(ctx)
 
 	padLen := downRequestPaddingLen()
 	var req []byte
@@ -431,7 +442,7 @@ func (c *Client) exchangeSecure(ctx context.Context, prefix []byte, key [32]byte
 	if err := c.acquireOpToken(ctx); err != nil {
 		return nil, err
 	}
-	defer c.releaseOpToken()
+	defer c.releaseOpToken(ctx)
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
@@ -459,7 +470,7 @@ func (c *Client) exchangeFixed(ctx context.Context, req []byte, respLen int) ([]
 	if err := c.acquireOpToken(ctx); err != nil {
 		return nil, err
 	}
-	defer c.releaseOpToken()
+	defer c.releaseOpToken(ctx)
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
@@ -616,26 +627,61 @@ func (c *Client) serverDialAddr(ctx context.Context) (string, error) {
 	return c.resolvedServerAddr, nil
 }
 
+// opTokenPool returns the op-token pool a request should use: the small
+// reserved dnsTokens pool for DNS flows (so a DNS query never queues behind a
+// saturated bulk transfer), the shared opTokens pool otherwise.
+func (c *Client) opTokenPool(ctx context.Context) chan struct{} {
+	if ctxIsDNS(ctx) && c.dnsTokens != nil {
+		return c.dnsTokens
+	}
+	return c.opTokens
+}
+
 func (c *Client) acquireOpToken(ctx context.Context) error {
-	if c.opTokens == nil {
+	pool := c.opTokenPool(ctx)
+	if pool == nil {
 		return nil
 	}
 	select {
-	case c.opTokens <- struct{}{}:
+	case pool <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (c *Client) releaseOpToken() {
-	if c.opTokens == nil {
+func (c *Client) releaseOpToken(ctx context.Context) {
+	pool := c.opTokenPool(ctx)
+	if pool == nil {
 		return
 	}
 	select {
-	case <-c.opTokens:
+	case <-pool:
 	default:
 	}
+}
+
+// dnsContextKey tags a context as belonging to a DNS flow so acquireOpToken
+// routes the request to the reserved dnsTokens pool.
+type dnsContextKey struct{}
+
+func dnsContext(ctx context.Context, isDNS bool) context.Context {
+	if !isDNS {
+		return ctx
+	}
+	return context.WithValue(ctx, dnsContextKey{}, true)
+}
+
+func ctxIsDNS(ctx context.Context) bool {
+	v, _ := ctx.Value(dnsContextKey{}).(bool)
+	return v
+}
+
+// isDNSDestination reports whether a dial address targets port 53 — DNS.
+// DialUDP prefixes UDP destinations with UDPDestinationPrefix, so a DNS query
+// arrives here as "udp:host:53"; the ":53" suffix catches it.
+func isDNSDestination(address string) bool {
+	return strings.HasSuffix(address, ":53")
 }
 
 type Conn struct {
@@ -644,6 +690,7 @@ type Conn struct {
 	secureKey  [32]byte
 	localAddr  net.Addr
 	remoteAddr net.Addr
+	isDNS      bool
 
 	readMu  sync.Mutex
 	writeMu sync.Mutex
@@ -775,6 +822,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 		if err != nil {
 			return total, err
 		}
+		ctx = dnsContext(ctx, c.isDNS)
 		err = c.client.sendUp(ctx, c.sid, c.secureKey, p[:n])
 		cancel()
 		if err != nil {
@@ -795,7 +843,7 @@ func (c *Conn) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout(c.client.config.OperationTimeout))
 	defer cancel()
 	c.closeDone()
-	return c.client.closeSession(ctx, c.sid, c.secureKey)
+	return c.client.closeSession(dnsContext(ctx, c.isDNS), c.sid, c.secureKey)
 }
 
 func (c *Conn) LocalAddr() net.Addr  { return c.localAddr }
@@ -877,7 +925,7 @@ func (c *Conn) runScheduledDownPoll() downPollOutcome {
 	default:
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), downPollTimeout)
-	res, err := c.client.down(ctx, c.sid, c.secureKey, c.recvAck.Load())
+	res, err := c.client.down(dnsContext(ctx, c.isDNS), c.sid, c.secureKey, c.recvAck.Load())
 	cancel()
 	if err != nil {
 		if isTransientDownError(err) {
