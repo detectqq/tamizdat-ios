@@ -560,6 +560,16 @@ struct SettingsView: View {
                 .disabled(smokeRunning)
 
                 if !smokeResults.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("\(smokeResults.filter { $0.ok }.count) reachable")
+                            .foregroundStyle(Color.green)
+                        Text("·")
+                            .foregroundStyle(theme.textDim)
+                        Text("\(smokeResults.filter { !$0.ok }.count) blocked")
+                            .foregroundStyle(Color.red)
+                        Spacer()
+                    }
+                    .font(.geist(.semibold, size: 12))
                     VStack(spacing: 6) {
                         ForEach(smokeResults) { result in
                             HStack(spacing: 10) {
