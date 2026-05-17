@@ -982,6 +982,42 @@ func fragpocPortList() []int {
 	return ports
 }
 
+// ensurePortsHinted sends OpPortHint to the server with the given ports so
+// the server opens them before any probe/test attempts to connect. Best-effort:
+// failure is logged but does not abort the caller — the test will show which
+// ports are unreachable regardless.
+func ensurePortsHinted(ports []int) {
+	if len(ports) == 0 {
+		return
+	}
+	var fpShortID [fragpoc.ShortIDLen]byte
+	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	copy(fpShortID[:], sidBytes)
+	const fpHost = "sync2.detectqq.dpdns.org"
+	basePort := ports[0]
+	fpServerAddr := fmt.Sprintf("%s:%d", fpHost, basePort)
+	pool := append([]int(nil), ports[1:]...)
+	client, err := fragpoc.NewClient(fragpoc.ClientConfig{
+		ServerAddr:      fpServerAddr,
+		ShortID:         fpShortID,
+		Secure:          true,
+		DynamicPortPool: pool,
+	})
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("warn: ensurePortsHinted client: %v", err))
+		return
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	openPorts, hintErr := client.SendPortHint(ctx, ports)
+	if hintErr != nil {
+		rt.appendLog(fmt.Sprintf("warn: ensurePortsHinted: %v", hintErr))
+	} else {
+		rt.appendLog(fmt.Sprintf("info: port hint OK — server confirmed %d port(s)", len(openPorts)))
+	}
+}
+
 // RunFragPoCSmokeTest probes each port in a comma-separated list against the
 // FragPoC test server and returns a JSON array of per-port results (gomobile
 // exposes it as SocksstubRunFragPoCSmokeTest). Each probe is one OpOpenSecure
@@ -1016,6 +1052,9 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 		seen[p] = struct{}{}
 		ports = append(ports, p)
 	}
+
+	// Ask the server to open the requested ports before probing them.
+	ensurePortsHinted(ports)
 
 	results := make([]portResult, len(ports))
 	var wg sync.WaitGroup
@@ -1061,6 +1100,8 @@ func ProbeOnePort(port int) string {
 	copy(fpShortID[:], sidBytes)
 	const fpHost = "sync2.detectqq.dpdns.org"
 
+	ensurePortsHinted([]int{port})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -1094,6 +1135,8 @@ func ProbeMaxPayload(port int) string {
 	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
 	copy(fpShortID[:], sidBytes)
 	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
+
+	ensurePortsHinted([]int{port})
 
 	maxOK := 0
 	attempts := 0
@@ -1206,6 +1249,8 @@ func ProbeMaxConns(portsCSV string) string {
 		out, _ := json.Marshal(result{Err: "no ports"})
 		return string(out)
 	}
+
+	ensurePortsHinted(ports)
 
 	perPort := make(map[string]int)
 	var conns []net.Conn
@@ -1322,6 +1367,8 @@ func ProbePayloadStep(port int, size int) string {
 	copy(fpShortID[:], sidBytes)
 	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
 
+	ensurePortsHinted([]int{port})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	err := probeWithPayloadSize(ctx, fpHost, port, fpShortID, staticKey, size)
@@ -1361,6 +1408,12 @@ func StartMaxConnsSession(portsCSV string) {
 	mcSession.conns = nil
 	mcSession.perPort = make(map[string]int)
 	mcSession.active = true
+
+	// Pre-hint all session ports so the server opens them before the test.
+	ports := parsePortList(portsCSV)
+	if len(ports) > 0 {
+		ensurePortsHinted(ports)
+	}
 }
 
 // MaxConnsOpenOne opens one more connection on the specified port. The
