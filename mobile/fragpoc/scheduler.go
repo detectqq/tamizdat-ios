@@ -13,6 +13,7 @@ const (
 	schedulerErrorMax           = 2 * time.Second
 	schedulerRecentData         = time.Second
 	schedulerSlowStartThreshold = 8
+	schedulerMaxInflightRatio   = 70
 )
 
 // schedulerStuckTimeout bounds how long a logical stream may receive nothing
@@ -84,11 +85,12 @@ func (s *downScheduler) addConn(conn *Conn) {
 // track activeConns), totalInFlight is the sum of per-stream in-flight DOWN
 // polls, and windowCur/windowMax expose whether parallel DOWN is actually
 // ramping instead of just having a high configured ceiling.
-func (s *downScheduler) stats() (activeConns, queuedConns, totalInFlight, windowCur, windowMax int) {
+func (s *downScheduler) stats() (activeConns, queuedConns, totalInFlight, windowCur, windowMax, inflightCap int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	activeConns = len(s.active)
 	queuedConns = len(s.conns)
+	inflightCap = s.maxInflight()
 	for _, c := range s.conns {
 		if _, ok := s.active[c]; !ok {
 			continue
@@ -101,7 +103,7 @@ func (s *downScheduler) stats() (activeConns, queuedConns, totalInFlight, window
 			windowMax = c.schedWindow
 		}
 	}
-	return activeConns, queuedConns, totalInFlight, windowCur, windowMax
+	return activeConns, queuedConns, totalInFlight, windowCur, windowMax, inflightCap
 }
 
 func (s *downScheduler) removeConn(conn *Conn) {
@@ -154,6 +156,11 @@ func (s *downScheduler) pick() (*Conn, bool) {
 
 		now := time.Now()
 		var earliest time.Time
+		if s.totalInflightLocked() >= s.maxInflight() {
+			s.cond.Wait()
+			s.mu.Unlock()
+			continue
+		}
 		n := len(s.conns)
 		for scanned := 0; scanned < n && len(s.conns) > 0; scanned++ {
 			idx := (s.next + scanned) % len(s.conns)
@@ -219,6 +226,32 @@ func (s *downScheduler) pick() (*Conn, bool) {
 			time.Sleep(d)
 		}
 	}
+}
+
+func (s *downScheduler) maxInflight() int {
+	workers := 0
+	if s.client != nil {
+		workers = s.client.downWorkers
+	}
+	if workers <= 0 {
+		return 1
+	}
+	limit := workers * schedulerMaxInflightRatio / 100
+	if limit < 16 {
+		limit = 16
+	}
+	if limit > workers {
+		return workers
+	}
+	return limit
+}
+
+func (s *downScheduler) totalInflightLocked() int {
+	total := 0
+	for c := range s.active {
+		total += c.schedInFlight
+	}
+	return total
 }
 
 func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {

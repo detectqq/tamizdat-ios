@@ -171,6 +171,7 @@ func TestSchedulerStatsReportsWindow(t *testing.T) {
 	connA := &Conn{schedWindow: 3, schedInFlight: 1}
 	connB := &Conn{schedWindow: 7, schedInFlight: 2}
 	s := &downScheduler{
+		client: &Client{downWorkers: 96},
 		active: map[*Conn]struct{}{
 			connA: {},
 			connB: {},
@@ -179,12 +180,33 @@ func TestSchedulerStatsReportsWindow(t *testing.T) {
 	}
 	s.cond = sync.NewCond(&s.mu)
 
-	active, queued, inFlight, windowCur, windowMax := s.stats()
+	active, queued, inFlight, windowCur, windowMax, inflightCap := s.stats()
 
 	if active != 2 || queued != 2 || inFlight != 3 {
 		t.Fatalf("stats active/queued/inFlight = %d/%d/%d, want 2/2/3", active, queued, inFlight)
 	}
 	if windowCur != 3 || windowMax != 7 {
 		t.Fatalf("stats windowCur/windowMax = %d/%d, want 3/7", windowCur, windowMax)
+	}
+	if inflightCap != 67 {
+		t.Fatalf("stats inflightCap = %d, want 67", inflightCap)
+	}
+}
+
+func TestSchedulerMaxInflight(t *testing.T) {
+	tests := []struct {
+		workers int
+		want    int
+	}{
+		{workers: 0, want: 1},
+		{workers: 8, want: 8},
+		{workers: 24, want: 16},
+		{workers: 96, want: 67},
+	}
+	for _, tt := range tests {
+		s := &downScheduler{client: &Client{downWorkers: tt.workers}}
+		if got := s.maxInflight(); got != tt.want {
+			t.Fatalf("maxInflight(%d) = %d, want %d", tt.workers, got, tt.want)
+		}
 	}
 }

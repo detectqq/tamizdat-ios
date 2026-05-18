@@ -181,14 +181,14 @@ func (c *Client) metricsLoop() {
 			if c.downTokens != nil {
 				downTokens = len(c.downTokens)
 			}
-			activeConns, queuedConns, inFlight, windowCur, windowMax := 0, 0, 0, 0, 0
+			activeConns, queuedConns, inFlight, windowCur, windowMax, inFlightCap := 0, 0, 0, 0, 0, 0
 			if c.scheduler != nil {
-				activeConns, queuedConns, inFlight, windowCur, windowMax = c.scheduler.stats()
+				activeConns, queuedConns, inFlight, windowCur, windowMax, inFlightCap = c.scheduler.stats()
 			}
 			openConns := c.openConns.Load()
 			openPeak := c.openConnsPeak.Swap(openConns)
-			line := fmt.Sprintf("[FRAGPOC-METRICS] op_tokens=%d/%d down_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d sched_window_cur=%d sched_window_max=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
-				opTokens, cap(c.opTokens), downTokens, cap(c.downTokens), activeConns, queuedConns, inFlight, windowCur, windowMax, c.downWorkers, c.downWindow, openConns, openPeak)
+			line := fmt.Sprintf("[FRAGPOC-METRICS] op_tokens=%d/%d down_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d sched_inflight_cap=%d sched_window_cur=%d sched_window_max=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
+				opTokens, cap(c.opTokens), downTokens, cap(c.downTokens), activeConns, queuedConns, inFlight, inFlightCap, windowCur, windowMax, c.downWorkers, c.downWindow, openConns, openPeak)
 			log.Print(line)
 			if c.config.MetricsLog != nil {
 				c.config.MetricsLog(line)

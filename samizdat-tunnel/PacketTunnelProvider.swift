@@ -353,7 +353,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         } else {
             typeName = "other"
         }
-        let names = path.availableInterfaces.map { $0.name }.joined(separator: ",")
+        var seenNames = Set<String>()
+        let names = path.availableInterfaces.compactMap { iface -> String? in
+            let name = iface.name
+            guard !name.hasPrefix("utun"), seenNames.insert(name).inserted else {
+                return nil
+            }
+            return name
+        }.joined(separator: ",")
         return "\(typeName)[\(names)]"
     }
 

@@ -91,7 +91,7 @@ func downWindowCount(workers int) int {
 	if workers <= 16 {
 		return 4
 	}
-	return 10
+	return 6
 }
 
 func connectTimeout(d time.Duration) time.Duration {
