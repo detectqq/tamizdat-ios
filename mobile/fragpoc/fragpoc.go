@@ -24,7 +24,6 @@ const (
 	DownRequestSize = 500
 	DefaultWorkers  = 64
 	MaxWorkers      = 120
-	MaxDownWindow   = 16
 
 	UDPDestinationPrefix = "udp:"
 
@@ -80,21 +79,11 @@ func downWorkerCount(workers int) int {
 	return n
 }
 
-func downWindowCount(workers int, configured int) int {
-	if configured <= 0 {
-		return 1
-	}
-	if configured > MaxDownWindow {
-		configured = MaxDownWindow
-	}
-	downWorkers := downWorkerCount(workerCount(workers))
-	if configured > downWorkers {
-		configured = downWorkers
-	}
-	if configured < 1 {
-		return 1
-	}
-	return configured
+func downWindowCount(workers int) int {
+	// DOWN per session is strictly sequential on the server: window > 1
+	// only duplicates the same frame via replay and wastes tokens/sockets.
+	// Parallelism should be spent across DIFFERENT streams, not within one.
+	return 1
 }
 
 func connectTimeout(d time.Duration) time.Duration {
