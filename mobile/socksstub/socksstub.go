@@ -419,7 +419,7 @@ func ConnectionsTotal() int64 {
 func SetSamizdatConfig(blob string) error {
 	if currentTransport() == "fragpoc" {
 		var fpShortID [fragpoc.ShortIDLen]byte
-		sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+		sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 		copy(fpShortID[:], sidBytes)
 		// Port list comes from the iOS "Port mode" UI via SetFragPoCPorts:
 		// element 0 is the base server port, the rest form the dynamic dial
@@ -991,7 +991,7 @@ func ensurePortsHinted(ports []int) {
 		return
 	}
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 	const fpHost = "sync2.detectqq.dpdns.org"
 	// Always connect to the known base port (from fragpocPortList) for the
@@ -1035,7 +1035,7 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 		Err  string `json:"err,omitempty"`
 	}
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 	const fpHost = "sync2.detectqq.dpdns.org"
 
@@ -1098,7 +1098,7 @@ func ProbeOnePort(port int) string {
 		Err  string `json:"err,omitempty"`
 	}
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 	const fpHost = "sync2.detectqq.dpdns.org"
 
@@ -1134,7 +1134,7 @@ func ProbeMaxPayload(port int) string {
 	}
 	const fpHost = "sync2.detectqq.dpdns.org"
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
 
@@ -1243,7 +1243,7 @@ func ProbeMaxConns(portsCSV string) string {
 
 	const fpHost = "sync2.detectqq.dpdns.org"
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 
 	ports := parsePortList(portsCSV)
@@ -1365,7 +1365,7 @@ func ProbePayloadStep(port int, size int) string {
 	}
 	const fpHost = "sync2.detectqq.dpdns.org"
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
 
@@ -1447,7 +1447,7 @@ func MaxConnsOpenOne(port int) string {
 
 	const fpHost = "sync2.detectqq.dpdns.org"
 	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("aa2444553de02a9a")
+	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
 	copy(fpShortID[:], sidBytes)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
