@@ -73,7 +73,10 @@ type ClientConfig struct {
 	// load). Empty = single-port behaviour. The base port from ServerAddr is
 	// always used and is the fallback when a pooled port is unreachable.
 	DynamicPortPool []int
-	Dialer          DialFunc
+	// MetricsLog receives periodic diagnostic lines such as [FRAGPOC-METRICS].
+	// It is optional and must not block for long.
+	MetricsLog func(string)
+	Dialer     DialFunc
 }
 
 type Client struct {
@@ -90,12 +93,12 @@ type Client struct {
 	serverHost         string
 	serverPort         string
 	basePortNum        int
-	dialPorts       []int // full pool: [basePort] + pooled ports, de-duplicated
-	portMu          sync.Mutex
-	portRR          int // round-robin cursor
-	portCooldown    map[int]time.Time
-	activePortCount int       // dynamic window — how many of dialPorts[0:N] we rotate through
-	lastScaleUp     time.Time // debounce shrink after burst
+	dialPorts          []int // full pool: [basePort] + pooled ports, de-duplicated
+	portMu             sync.Mutex
+	portRR             int // round-robin cursor
+	portCooldown       map[int]time.Time
+	activePortCount    int       // dynamic window — how many of dialPorts[0:N] we rotate through
+	lastScaleUp        time.Time // debounce shrink after burst
 	resolveMu          sync.Mutex
 	resolvedServerAddr string
 	closeOnce          sync.Once
@@ -115,19 +118,19 @@ func NewClient(config ClientConfig) (*Client, error) {
 	workers := workerCount(config.Workers)
 	downWorkers := downWorkerCount(workers)
 	client := &Client{
-		config:       config,
-		maxPayload:   maxPayload(config.MaxPayload),
-		workers:      workers,
-		downWorkers:  downWorkers,
-		downWindow:   downWindowCount(workers),
+		config:          config,
+		maxPayload:      maxPayload(config.MaxPayload),
+		workers:         workers,
+		downWorkers:     downWorkers,
+		downWindow:      downWindowCount(workers),
 		opTokens:        make(chan struct{}, workers),
 		downTokens:      make(chan struct{}, downWorkers),
 		downPollTimeout: durationDefault(config.DownPollTimeout, defaultDownPollTimeout),
 		dnsTokens:       make(chan struct{}, dnsReserve),
 		serverHost:      host,
-		serverPort:   port,
-		portCooldown: make(map[int]time.Time),
-		stopMetrics:  make(chan struct{}),
+		serverPort:      port,
+		portCooldown:    make(map[int]time.Time),
+		stopMetrics:     make(chan struct{}),
 	}
 	if len(config.DynamicPortPool) > 0 {
 		basePort, err := strconv.Atoi(port)
@@ -184,8 +187,12 @@ func (c *Client) metricsLoop() {
 			}
 			openConns := c.openConns.Load()
 			openPeak := c.openConnsPeak.Swap(openConns)
-			log.Printf("[FRAGPOC-METRICS] op_tokens=%d/%d down_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
+			line := fmt.Sprintf("[FRAGPOC-METRICS] op_tokens=%d/%d down_tokens=%d/%d sched_conns=%d sched_queued=%d sched_inflight=%d down_workers=%d down_window=%d open_conns=%d open_conns_peak=%d",
 				opTokens, cap(c.opTokens), downTokens, cap(c.downTokens), activeConns, queuedConns, inFlight, c.downWorkers, c.downWindow, openConns, openPeak)
+			log.Print(line)
+			if c.config.MetricsLog != nil {
+				c.config.MetricsLog(line)
+			}
 		}
 	}
 }

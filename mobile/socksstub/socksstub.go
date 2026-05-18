@@ -162,10 +162,11 @@ type runtimeState struct {
 	// before re-calling SocksstubSetSamizdatConfig with the same blob.
 	// When variant is "v1" we also flip StrictSingleH2=true to match
 	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
-	poolVariant  atomic.Value // string
-	transport    atomic.Value // string
-	fragpocPorts atomic.Value // []int — base server port + dynamic dial pool
-	fragpocUDP   atomic.Bool  // true = forward UDP through FragPoC; false = drop
+	poolVariant      atomic.Value // string
+	transport        atomic.Value // string
+	fragpocPorts     atomic.Value // []int — base server port + dynamic dial pool
+	fragpocHintPorts atomic.Value // []int — last server-confirmed ports, survives rewire
+	fragpocUDP       atomic.Bool  // true = forward UDP through FragPoC; false = drop
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -428,13 +429,22 @@ func SetSamizdatConfig(blob string) error {
 		// an untouched install dials byte-identically to D37.
 		fpPorts := fragpocPortList()
 		fpBasePort := fpPorts[0]
-		fpPool := append([]int(nil), fpPorts[1:]...)
+		initialPorts := fpPorts
+		if v := rt.fragpocHintPorts.Load(); v != nil {
+			if cached, ok := v.([]int); ok && len(cached) > 0 && cached[0] == fpBasePort {
+				initialPorts = append([]int(nil), cached...)
+			}
+		}
+		fpPool := append([]int(nil), initialPorts[1:]...)
 		fpServerAddr := fmt.Sprintf("sync2.detectqq.dpdns.org:%d", fpBasePort)
 		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
 			ServerAddr:      fpServerAddr,
 			ShortID:         fpShortID,
 			Secure:          true,
 			DynamicPortPool: fpPool,
+			MetricsLog: func(line string) {
+				rt.appendLog(line)
+			},
 		})
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig fragpoc.NewClient: %v", err))
@@ -450,6 +460,7 @@ func SetSamizdatConfig(blob string) error {
 		if hintErr != nil {
 			rt.appendLog(fmt.Sprintf("warn: port hint failed: %v (keeping client-side pool)", hintErr))
 		} else {
+			rt.fragpocHintPorts.Store(append([]int(nil), openPorts...))
 			rt.appendLog(fmt.Sprintf("info: server confirmed %d open port(s): %v", len(openPorts), openPorts))
 		}
 
@@ -466,7 +477,13 @@ func SetSamizdatConfig(blob string) error {
 		// transitions from "Connecting…" to "Connected" once the first
 		// end-to-end probe succeeds.
 		startPingProber(wrapper)
-		rt.appendLog(fmt.Sprintf("info: dial mode = fragpoc → %s (+%d pool port(s))", fpServerAddr, len(fpPool)))
+		stats := fpClient.PortStats()
+		poolPorts := stats.PoolPorts - 1
+		if poolPorts < 0 {
+			poolPorts = 0
+		}
+		rt.appendLog(fmt.Sprintf("info: dial mode = fragpoc → %s (+%d pool port(s), active=%d)",
+			fpServerAddr, poolPorts, stats.DialPorts))
 		return nil
 	}
 
