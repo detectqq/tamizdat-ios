@@ -11,6 +11,7 @@ const (
 	schedulerIdleMax      = 2 * time.Second
 	schedulerErrorInitial = 100 * time.Millisecond
 	schedulerErrorMax     = 2 * time.Second
+	schedulerRecentData   = time.Second
 )
 
 // schedulerStuckTimeout bounds how long a logical stream may receive nothing
@@ -79,17 +80,27 @@ func (s *downScheduler) addConn(conn *Conn) {
 // stats returns a point-in-time snapshot of scheduler occupancy for the
 // diagnostic metrics log. activeConns is the number of logical streams the
 // scheduler is polling, queuedConns is the round-robin slice length (should
-// track activeConns), and totalInFlight is the sum of per-stream in-flight
-// DOWN polls — i.e. how many DOWN workers are currently committed.
-func (s *downScheduler) stats() (activeConns, queuedConns, totalInFlight int) {
+// track activeConns), totalInFlight is the sum of per-stream in-flight DOWN
+// polls, and windowCur/windowMax expose whether parallel DOWN is actually
+// ramping instead of just having a high configured ceiling.
+func (s *downScheduler) stats() (activeConns, queuedConns, totalInFlight, windowCur, windowMax int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	activeConns = len(s.active)
 	queuedConns = len(s.conns)
-	for c := range s.active {
+	for _, c := range s.conns {
+		if _, ok := s.active[c]; !ok {
+			continue
+		}
 		totalInFlight += c.schedInFlight
+		if windowCur == 0 {
+			windowCur = c.schedWindow
+		}
+		if c.schedWindow > windowMax {
+			windowMax = c.schedWindow
+		}
 	}
-	return activeConns, queuedConns, totalInFlight
+	return activeConns, queuedConns, totalInFlight, windowCur, windowMax
 }
 
 func (s *downScheduler) removeConn(conn *Conn) {
@@ -236,14 +247,21 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 		conn.schedLastProgress = now
 		conn.schedLastPayload = now
 	case downPollIdle:
-		conn.schedWindow = 1
+		recentPayload := !conn.schedLastPayload.IsZero() && now.Sub(conn.schedLastPayload) < schedulerRecentData
 		conn.schedErrorDelay = schedulerErrorInitial
-		delay := conn.schedIdleDelay
-		if delay <= 0 {
-			delay = schedulerIdleInitial
+		if recentPayload {
+			conn.schedWindow = halveWindow(conn.schedWindow)
+			conn.schedNextPoll = now
+			conn.schedIdleDelay = schedulerIdleInitial
+		} else {
+			conn.schedWindow = 1
+			delay := conn.schedIdleDelay
+			if delay <= 0 {
+				delay = schedulerIdleInitial
+			}
+			conn.schedNextPoll = now.Add(delay)
+			conn.schedIdleDelay = growDelay(delay, schedulerIdleMax)
 		}
-		conn.schedNextPoll = now.Add(delay)
-		conn.schedIdleDelay = growDelay(delay, schedulerIdleMax)
 		conn.schedLastProgress = now
 		// App-level stuck detection: if the application hasn't received
 		// any real payload for schedulerAppStuckTimeout, the upstream is
@@ -279,7 +297,7 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 				}
 			}
 		} else {
-			conn.schedWindow = 1
+			conn.schedWindow = halveWindow(conn.schedWindow)
 			conn.schedIdleDelay = schedulerIdleInitial
 			delay := conn.schedErrorDelay
 			if delay <= 0 {
@@ -328,6 +346,13 @@ func (s *downScheduler) removeAtLocked(i int) {
 	if s.next >= len(s.conns) {
 		s.next = 0
 	}
+}
+
+func halveWindow(window int) int {
+	if window <= 2 {
+		return 1
+	}
+	return window / 2
 }
 
 func growDelay(current, max time.Duration) time.Duration {
