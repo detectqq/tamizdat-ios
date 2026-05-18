@@ -434,6 +434,7 @@ func SetSamizdatConfig(blob string) error {
 			ServerAddr:      fpServerAddr,
 			ShortID:         fpShortID,
 			Secure:          true,
+			DownWindow:      10,
 			DynamicPortPool: fpPool,
 		})
 		if err != nil {

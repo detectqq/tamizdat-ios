@@ -65,6 +65,10 @@ type ClientConfig struct {
 	Secure           bool
 	MaxPayload       int
 	Workers          int
+	// DownWindow is the per-logical-stream number of concurrent DOWN polls.
+	// 0 keeps the legacy conservative window of 1. Values above MaxDownWindow
+	// or the DOWN worker budget are clamped.
+	DownWindow       int
 	ConnectTimeout   time.Duration
 	OperationTimeout time.Duration
 	DownPollTimeout  time.Duration
@@ -119,7 +123,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		maxPayload:   maxPayload(config.MaxPayload),
 		workers:      workers,
 		downWorkers:  downWorkers,
-		downWindow:   downWindowCount(workers),
+		downWindow:   downWindowCount(workers, config.DownWindow),
 		opTokens:        make(chan struct{}, workers),
 		downTokens:      make(chan struct{}, downWorkers),
 		downPollTimeout: durationDefault(config.DownPollTimeout, defaultDownPollTimeout),
