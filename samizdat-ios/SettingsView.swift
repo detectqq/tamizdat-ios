@@ -126,21 +126,26 @@ struct SettingsView: View {
                             .padding(.top, 22)
                         transportCard
                             .padding(.horizontal, 16)
-                        fragPoCUDPCard
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
-                        fragPoCPortCard
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
-                        fragPoCSmokeTestCard
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
-                        fragPoCPayloadTestCard
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
-                        fragPoCMaxConnsTestCard
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
+
+                        // FragPoC sub-settings — only visible when
+                        // the FragPoC toggle above is ON.
+                        if fragPoCTransportEnabled {
+                            fragPoCUDPCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                            fragPoCPortCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                            fragPoCSmokeTestCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                            fragPoCPayloadTestCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                            fragPoCMaxConnsTestCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                        }
 
                         // ── Diagnostics ──────────────────────────
                         SectionLabel(text: "Diagnostics")
