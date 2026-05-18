@@ -771,7 +771,7 @@ struct SettingsView: View {
         let info = Bundle.main.infoDictionary
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(marketing) (\(build)) · IPA-D24"
+        return "\(marketing) (\(build)) · IPA-D54"
     }
 
     private var configSubtitle: String {
