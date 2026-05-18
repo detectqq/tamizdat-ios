@@ -59,7 +59,7 @@ struct ContentView: View {
     }
 
     /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D55"
+    private static let milestoneTag = "D56"
 
     // MARK: – Derived state
 

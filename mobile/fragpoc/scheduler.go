@@ -7,11 +7,12 @@ import (
 )
 
 const (
-	schedulerIdleInitial  = 100 * time.Millisecond
-	schedulerIdleMax      = 2 * time.Second
-	schedulerErrorInitial = 100 * time.Millisecond
-	schedulerErrorMax     = 2 * time.Second
-	schedulerRecentData   = time.Second
+	schedulerIdleInitial        = 100 * time.Millisecond
+	schedulerIdleMax            = 2 * time.Second
+	schedulerErrorInitial       = 100 * time.Millisecond
+	schedulerErrorMax           = 2 * time.Second
+	schedulerRecentData         = time.Second
+	schedulerSlowStartThreshold = 8
 )
 
 // schedulerStuckTimeout bounds how long a logical stream may receive nothing
@@ -235,12 +236,7 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 	stuck := false
 	switch outcome {
 	case downPollData:
-		if conn.schedWindow <= 0 {
-			conn.schedWindow = 1
-		}
-		if conn.schedWindow < s.client.downWindow {
-			conn.schedWindow++
-		}
+		conn.schedWindow = growDataWindow(conn.schedWindow, s.client.downWindow)
 		conn.schedIdleDelay = schedulerIdleInitial
 		conn.schedErrorDelay = schedulerErrorInitial
 		conn.schedNextPoll = now
@@ -250,7 +246,7 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 		recentPayload := !conn.schedLastPayload.IsZero() && now.Sub(conn.schedLastPayload) < schedulerRecentData
 		conn.schedErrorDelay = schedulerErrorInitial
 		if recentPayload {
-			conn.schedWindow = halveWindow(conn.schedWindow)
+			conn.schedWindow = reduceActiveWindow(conn.schedWindow, s.client.downWindow)
 			conn.schedNextPoll = now
 			conn.schedIdleDelay = schedulerIdleInitial
 		} else {
@@ -297,7 +293,12 @@ func (s *downScheduler) finish(conn *Conn, outcome downPollOutcome) {
 				}
 			}
 		} else {
-			conn.schedWindow = halveWindow(conn.schedWindow)
+			recentPayload := !conn.schedLastPayload.IsZero() && now.Sub(conn.schedLastPayload) < schedulerRecentData
+			if recentPayload {
+				conn.schedWindow = reduceActiveWindow(conn.schedWindow, s.client.downWindow)
+			} else {
+				conn.schedWindow = 1
+			}
 			conn.schedIdleDelay = schedulerIdleInitial
 			delay := conn.schedErrorDelay
 			if delay <= 0 {
@@ -348,11 +349,49 @@ func (s *downScheduler) removeAtLocked(i int) {
 	}
 }
 
-func halveWindow(window int) int {
-	if window <= 2 {
+func growDataWindow(window, cap int) int {
+	cap = normalizeWindowCap(cap)
+	if window <= 0 {
+		window = 1
+	}
+	if window < schedulerSlowStartThreshold {
+		window *= 2
+		if window < 2 {
+			window = 2
+		}
+	} else {
+		window++
+	}
+	if window > cap {
+		return cap
+	}
+	return window
+}
+
+func reduceActiveWindow(window, cap int) int {
+	cap = normalizeWindowCap(cap)
+	floor := 2
+	if cap < floor {
+		floor = cap
+	}
+	if window <= floor {
+		return floor
+	}
+	window /= 2
+	if window < floor {
+		return floor
+	}
+	if window > cap {
+		return cap
+	}
+	return window
+}
+
+func normalizeWindowCap(cap int) int {
+	if cap <= 0 {
 		return 1
 	}
-	return window / 2
+	return cap
 }
 
 func growDelay(current, max time.Duration) time.Duration {

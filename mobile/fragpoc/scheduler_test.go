@@ -18,14 +18,30 @@ func newTestScheduler(conn *Conn, downWindow int) *downScheduler {
 	return s
 }
 
-func TestSchedulerDataGrowsWindow(t *testing.T) {
+func finishScheduledPoll(s *downScheduler, conn *Conn, outcome downPollOutcome) {
+	conn.schedInFlight = 1
+	s.finish(conn, outcome)
+}
+
+func TestSchedulerDataSlowStartsThenAddsWindow(t *testing.T) {
 	conn := &Conn{schedWindow: 1, schedInFlight: 1}
 	s := newTestScheduler(conn, 10)
 
 	s.finish(conn, downPollData)
-
 	if conn.schedWindow != 2 {
-		t.Fatalf("schedWindow after data = %d, want 2", conn.schedWindow)
+		t.Fatalf("schedWindow after first data = %d, want 2", conn.schedWindow)
+	}
+	finishScheduledPoll(s, conn, downPollData)
+	if conn.schedWindow != 4 {
+		t.Fatalf("schedWindow after second data = %d, want 4", conn.schedWindow)
+	}
+	finishScheduledPoll(s, conn, downPollData)
+	if conn.schedWindow != 8 {
+		t.Fatalf("schedWindow after third data = %d, want 8", conn.schedWindow)
+	}
+	finishScheduledPoll(s, conn, downPollData)
+	if conn.schedWindow != 9 {
+		t.Fatalf("schedWindow after fourth data = %d, want 9", conn.schedWindow)
 	}
 	if conn.schedInFlight != 0 {
 		t.Fatalf("schedInFlight after finish = %d, want 0", conn.schedInFlight)
@@ -35,11 +51,24 @@ func TestSchedulerDataGrowsWindow(t *testing.T) {
 	}
 }
 
-func TestSchedulerTransientHalvesWindow(t *testing.T) {
+func TestSchedulerDataCapsAtDownWindow(t *testing.T) {
+	conn := &Conn{schedWindow: 4, schedInFlight: 1}
+	s := newTestScheduler(conn, 6)
+
+	s.finish(conn, downPollData)
+
+	if conn.schedWindow != 6 {
+		t.Fatalf("schedWindow after capped data = %d, want 6", conn.schedWindow)
+	}
+}
+
+func TestSchedulerRecentTransientReducesWithFloor(t *testing.T) {
+	now := time.Now()
 	conn := &Conn{
 		schedWindow:       9,
 		schedInFlight:     1,
-		schedLastProgress: time.Now(),
+		schedLastProgress: now,
+		schedLastPayload:  now.Add(-200 * time.Millisecond),
 		schedErrorDelay:   schedulerErrorInitial,
 	}
 	s := newTestScheduler(conn, 10)
@@ -55,9 +84,36 @@ func TestSchedulerTransientHalvesWindow(t *testing.T) {
 	if conn.schedErrorDelay <= schedulerErrorInitial {
 		t.Fatalf("schedErrorDelay = %s, want grown beyond %s", conn.schedErrorDelay, schedulerErrorInitial)
 	}
+
+	conn.schedWindow = 2
+	conn.schedInFlight = 1
+	conn.schedLastProgress = time.Now()
+	conn.schedLastPayload = time.Now().Add(-200 * time.Millisecond)
+	conn.schedErrorDelay = schedulerErrorInitial
+	s.finish(conn, downPollTransient)
+
+	if conn.schedWindow != 2 {
+		t.Fatalf("schedWindow after recent transient at floor = %d, want 2", conn.schedWindow)
+	}
 }
 
-func TestSchedulerRecentIdleHalvesWithoutBackoff(t *testing.T) {
+func TestSchedulerTransientWithoutPayloadCollapses(t *testing.T) {
+	conn := &Conn{
+		schedWindow:       9,
+		schedInFlight:     1,
+		schedLastProgress: time.Now(),
+		schedErrorDelay:   schedulerErrorInitial,
+	}
+	s := newTestScheduler(conn, 10)
+
+	s.finish(conn, downPollTransient)
+
+	if conn.schedWindow != 1 {
+		t.Fatalf("schedWindow after transient without payload = %d, want 1", conn.schedWindow)
+	}
+}
+
+func TestSchedulerRecentIdleReducesWithFloorWithoutBackoff(t *testing.T) {
 	now := time.Now()
 	conn := &Conn{
 		schedWindow:      8,
@@ -77,6 +133,15 @@ func TestSchedulerRecentIdleHalvesWithoutBackoff(t *testing.T) {
 	}
 	if conn.schedIdleDelay != schedulerIdleInitial {
 		t.Fatalf("schedIdleDelay after recent idle = %s, want %s", conn.schedIdleDelay, schedulerIdleInitial)
+	}
+
+	conn.schedWindow = 2
+	conn.schedInFlight = 1
+	conn.schedLastPayload = time.Now().Add(-200 * time.Millisecond)
+	s.finish(conn, downPollIdle)
+
+	if conn.schedWindow != 2 {
+		t.Fatalf("schedWindow after recent idle at floor = %d, want 2", conn.schedWindow)
 	}
 }
 
