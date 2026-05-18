@@ -1079,6 +1079,14 @@ func (c *Conn) runScheduledDownPoll() downPollOutcome {
 	if !res.eof && len(res.buf) == 0 {
 		return downPollIdle
 	}
+	// Duplicate detection: if the received frame's seq is behind our ack
+	// watermark, the server replayed an already-consumed frame. This happens
+	// when a new client (parallel DOWN) talks to an old server (sequential
+	// DOWN) — multiple polls get the same replay. Treat as idle so the
+	// scheduler collapses the window back to 1 for backward compatibility.
+	if !res.eof && res.seq < c.recvAck.Load() {
+		return downPollIdle
+	}
 	select {
 	case c.downCh <- res:
 	case <-c.done:

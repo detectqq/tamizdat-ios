@@ -22,8 +22,8 @@ const (
 	MaxPayload      = 480
 	MaxUpPayload    = 640 // UP payload ceiling; client sends randomised <=620-byte chunks
 	DownRequestSize = 500
-	DefaultWorkers  = 64
-	MaxWorkers      = 120
+	DefaultWorkers  = 120
+	MaxWorkers      = 200
 
 	UDPDestinationPrefix = "udp:"
 
@@ -80,10 +80,18 @@ func downWorkerCount(workers int) int {
 }
 
 func downWindowCount(workers int) int {
-	// DOWN per session is strictly sequential on the server: window > 1
-	// only duplicates the same frame via replay and wastes tokens/sockets.
-	// Parallelism should be spent across DIFFERENT streams, not within one.
-	return 1
+	// Parallel DOWN: allow multiple concurrent DOWN polls per stream so the
+	// client can saturate the upstream link. The server's producer model
+	// feeds each concurrent DOWN a different frame from its buffered channel.
+	// Backward compat: old server replays → client detects duplicates (seq <
+	// recvAck) and treats them as idle → window collapses to 1 automatically.
+	if workers <= 4 {
+		return 1
+	}
+	if workers <= 16 {
+		return 4
+	}
+	return 10
 }
 
 func connectTimeout(d time.Duration) time.Duration {
