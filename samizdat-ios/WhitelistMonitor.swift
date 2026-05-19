@@ -63,9 +63,17 @@ final class WhitelistMonitor: ObservableObject {
         let whitelistHost = WhitelistProbePreferences.whitelistHost
         let threshold = WhitelistProbePreferences.successesNeeded
 
-        async let testOK = probeHost(testHost)
-        async let whitelistOK = probeHost(whitelistHost)
-        let (t, w) = await (testOK, whitelistOK)
+        // Clean up any leftover pingers from previous cycle.
+        for p in pingers { p.cancel() }
+        pingers.removeAll()
+
+        // D65 fix: probes run SEQUENTIALLY — two simultaneous SOCK_DGRAM
+        // ICMP sockets confuse the kernel's reply demux on some devices
+        // (iPhone 16 Pro Max observed: replies delivered to wrong socket,
+        // sequence mismatch → both probes timeout). Serializing avoids
+        // this. Worst case: 2 × probeTimeout per cycle.
+        let t = await probeHost(testHost)
+        let w = await probeHost(whitelistHost)
 
         switch (t, w) {
         case (true, true):

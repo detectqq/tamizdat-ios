@@ -213,45 +213,40 @@ final class WhitelistDetector {
         case noNetwork
     }
 
-    /// Pings both targets in parallel, calls completion with their
-    /// outcomes once both have settled. Completion delivered on `queue`.
+    /// Pings both targets SEQUENTIALLY (not in parallel). D65 fix:
+    /// two simultaneous SOCK_DGRAM ICMP sockets confuse the kernel's
+    /// reply demux on some devices — replies arrive at the wrong socket,
+    /// sequence mismatch, both timeout. Serializing avoids this.
+    /// Completion delivered on `queue`.
     private func parallelProbe(completion: @escaping (_ testOK: Bool, _ whitelistOK: Bool) -> Void) {
-        // Snapshot interface index for both probes.
         let ifindex = pickPhysicalInterfaceIndex()
         if ifindex == nil {
             log("warn: detector probe — no physical interface available, pings will likely fail")
         }
+
+        // Probe 1: testHost
         let pingerTest = ICMPPinger(target: parseTarget(testHost),
                                     interfaceIndex: ifindex)
-        let pingerWhitelist = ICMPPinger(target: parseTarget(whitelistHost),
-                                         interfaceIndex: ifindex)
-        activePingers = [pingerTest, pingerWhitelist]
-
-        var testRes: Bool?
-        var whitelistRes: Bool?
-        let group = DispatchGroup()
-        group.enter()
-        group.enter()
-
-        pingerTest.ping(timeout: Self.probeTimeout) { [weak self] ok, rtt in
-            self?.queue.async {
-                self?.log("info: detector ping testHost=\(self?.testHost ?? "?") → \(ok ? "ok" : "fail") in \(Int(rtt*1000))ms")
-                testRes = ok
-                group.leave()
-            }
-        }
-        pingerWhitelist.ping(timeout: Self.probeTimeout) { [weak self] ok, rtt in
-            self?.queue.async {
-                self?.log("info: detector ping whitelistHost=\(self?.whitelistHost ?? "?") → \(ok ? "ok" : "fail") in \(Int(rtt*1000))ms")
-                whitelistRes = ok
-                group.leave()
-            }
-        }
-
-        group.notify(queue: queue) { [weak self] in
+        activePingers = [pingerTest]
+        pingerTest.ping(timeout: Self.probeTimeout) { [weak self] testOK, testRTT in
             guard let self else { return }
-            self.activePingers.removeAll()
-            completion(testRes ?? false, whitelistRes ?? false)
+            self.queue.async {
+                self.log("info: detector ping testHost=\(self.testHost) → \(testOK ? "ok" : "fail") in \(Int(testRTT*1000))ms")
+                self.activePingers.removeAll()
+
+                // Probe 2: whitelistHost (after testHost settles)
+                let pingerWL = ICMPPinger(target: self.parseTarget(self.whitelistHost),
+                                          interfaceIndex: ifindex)
+                self.activePingers = [pingerWL]
+                pingerWL.ping(timeout: Self.probeTimeout) { [weak self] wlOK, wlRTT in
+                    guard let self else { return }
+                    self.queue.async {
+                        self.log("info: detector ping whitelistHost=\(self.whitelistHost) → \(wlOK ? "ok" : "fail") in \(Int(wlRTT*1000))ms")
+                        self.activePingers.removeAll()
+                        completion(testOK, wlOK)
+                    }
+                }
+            }
         }
     }
 
