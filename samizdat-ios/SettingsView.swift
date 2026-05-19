@@ -895,6 +895,10 @@ struct SettingsView: View {
         }
         fragPoCConfigError = nil
         FragPoCConfigStore.configBlob = trimmed
+        // Keep the main-app Go runtime in sync too. The Settings smoke/
+        // payload/connection tests run in the app process, not in the Network
+        // Extension, so the provider-message refresh below is not enough.
+        SocksstubSetFragPoCConfig(trimmed)
         fragPoCConfigDraft = trimmed
         Task { await VPNProfileStore.shared.refreshSamizdatClient() }
     }
@@ -903,7 +907,12 @@ struct SettingsView: View {
         fragPoCConfigDraft = ""
         fragPoCConfigError = nil
         FragPoCConfigStore.configBlob = ""
+        SocksstubSetFragPoCConfig("")
         Task { await VPNProfileStore.shared.refreshSamizdatClient() }
+    }
+
+    private func syncFragPoCConfigToAppRuntime() {
+        SocksstubSetFragPoCConfig(FragPoCConfigStore.configBlob)
     }
 
     /// Switches the FragPoC port mode. Commits any unsaved edits to the
@@ -941,6 +950,7 @@ struct SettingsView: View {
     private func runSmokeTest() async {
         guard !smokeRunning else { return }
         smokeRunning = true
+        syncFragPoCConfigToAppRuntime()
 
         // Parse the active port list and seed every port as pending (yellow).
         let ports = FragPoCPortConfigStore.activePorts
@@ -1110,6 +1120,7 @@ struct SettingsView: View {
     private func runPayloadTest() async {
         guard !payloadRunning else { return }
         payloadRunning = true
+        syncFragPoCConfigToAppRuntime()
         let port = FragPoCPortConfigStore.activePorts.first ?? 443
         payloadProgress = PayloadProgress(port: port)
 
@@ -1277,6 +1288,7 @@ struct SettingsView: View {
     private func runMaxConnsTest() async {
         guard !maxConnsRunning else { return }
         maxConnsRunning = true
+        syncFragPoCConfigToAppRuntime()
 
         let activePorts = FragPoCPortConfigStore.activePorts
         let csv = FragPoCPortConfigStore.activePortsCSV
