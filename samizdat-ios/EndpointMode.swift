@@ -68,6 +68,45 @@ enum FragPoCTransportStore {
     }
 }
 
+/// Optional FragPoC endpoint URI. Empty means the Go bridge keeps its
+/// historical built-in sync2 test endpoint. A non-empty value is a separate
+/// FragPoC URI, not the normal tamizdat:// H2 URI, for example:
+/// `fragpoc://<shortid>@ai-archive.ru:443?secure=1&ports=443,80`.
+enum FragPoCConfigStore {
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let key = "fragpocConfigBlob"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    static var configBlob: String {
+        get { defaults?.string(forKey: key) ?? "" }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                defaults?.removeObject(forKey: key)
+            } else {
+                defaults?.set(trimmed, forKey: key)
+            }
+        }
+    }
+
+    static var hasConfig: Bool {
+        !configBlob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func summaryLabel(for blob: String = configBlob) -> String {
+        let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Legacy sync2" }
+        guard let components = URLComponents(string: trimmed),
+              components.scheme == "fragpoc",
+              let host = components.host else { return "Custom FragPoC" }
+        let port = components.port ?? 443
+        return "\(host):\(port)"
+    }
+}
+
 /// FragPoC UDP toggle. When disabled, the FragPoC transport drops all UDP
 /// flows (DNS, QUIC, etc.) instead of tunnelling them over TCP. Useful to
 /// reduce op-token pressure — DNS falls back to the system resolver and

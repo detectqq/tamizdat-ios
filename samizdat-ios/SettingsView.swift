@@ -36,6 +36,8 @@ struct SettingsView: View {
     @State private var pingURLDraft: String = PingURLPreferences.url
     @State private var fragPoCTransportEnabled: Bool = FragPoCTransportStore.enabled
     @State private var fragPoCUDPEnabled: Bool = FragPoCUDPStore.enabled
+    @State private var fragPoCConfigDraft: String = FragPoCConfigStore.configBlob
+    @State private var fragPoCConfigError: String?
     @State private var fragPoCPortMode: FragPoCPortMode = FragPoCPortConfigStore.mode
     @State private var fragPoCPortsDraft: String = FragPoCPortConfigStore.activePorts
         .map(String.init).joined(separator: ", ")
@@ -131,6 +133,9 @@ struct SettingsView: View {
                         // the FragPoC toggle above is ON.
                         if fragPoCTransportEnabled {
                             fragPoCUDPCard
+                                .padding(.horizontal, 16)
+                                .padding(.top, 10)
+                            fragPoCServerCard
                                 .padding(.horizontal, 16)
                                 .padding(.top, 10)
                             fragPoCPortCard
@@ -447,7 +452,7 @@ struct SettingsView: View {
                 icon: IconCard(systemName: "antenna.radiowaves.left.and.right",
                                bg: theme.blueDim, fg: theme.blue),
                 title: "FragPoC transport (test)",
-                sub: "Routes through the FragPoC test server. Applies on next reconnect.",
+                sub: "Routes through a FragPoC endpoint. Applies on next reconnect.",
                 isLast: true
             ) {
                 Toggle("FragPoC transport (test)", isOn: $fragPoCTransportEnabled)
@@ -484,6 +489,75 @@ struct SettingsView: View {
         }
     }
 
+
+    /// Separate FragPoC endpoint URI. Empty keeps the legacy built-in sync2
+    /// test server; a custom URI lets us point iOS at ai-archive.ru:443 or any
+    /// future FragPoC load-balanced edge without abusing the tamizdat:// H2 URL.
+    private var fragPoCServerCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "server.rack",
+                             bg: theme.blueDim, fg: theme.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("FragPoC server")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text(FragPoCConfigStore.summaryLabel(for: fragPoCConfigDraft))
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                TextField("fragpoc://<shortid>@ai-archive.ru:443?secure=1&ports=443", text: $fragPoCConfigDraft, axis: .vertical)
+                    .lineLimit(2...5)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                if let fragPoCConfigError {
+                    Text(fragPoCConfigError)
+                        .font(.geist(.regular, size: 11))
+                        .foregroundStyle(theme.red)
+                }
+
+                HStack(spacing: 8) {
+                    Button(action: saveFragPoCConfig) {
+                        Text("Save")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: resetFragPoCConfig) {
+                        Text("Legacy")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Text("Leave empty for the built-in legacy endpoint. Put ports=443,80 in the URI when the edge only exposes public 80/443.")
+                    .font(.geist(.regular, size: 11))
+                    .foregroundStyle(theme.textDim)
+            }
+        }
+    }
+
     /// IPA-D38: FragPoC port-mode picker — One port / 80+443 / Multi-port,
     /// each with an editable port list. Element 0 of the list is the base
     /// server port; the rest form the dynamic dial pool the FragPoC client
@@ -498,7 +572,7 @@ struct SettingsView: View {
                         Text("Port mode")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("How FragPoC spreads dials across server ports")
+                        Text("Legacy/test port pool; custom URI ports= overrides this")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
@@ -557,7 +631,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Applies on next reconnect.")
+                Text("Legacy/test pool. Custom fragpoc:// without ports= uses only the URI port.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }
@@ -806,6 +880,30 @@ struct SettingsView: View {
         pingURL = PingURLPreferences.url
         pingURLDraft = pingURL
         Task { await VPNProfileStore.shared.refreshPingURL() }
+    }
+
+
+    private func saveFragPoCConfig() {
+        let trimmed = fragPoCConfigDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            guard let components = URLComponents(string: trimmed),
+                  components.scheme == "fragpoc",
+                  components.host?.isEmpty == false else {
+                fragPoCConfigError = "Use fragpoc://<shortid>@host:port?secure=1"
+                return
+            }
+        }
+        fragPoCConfigError = nil
+        FragPoCConfigStore.configBlob = trimmed
+        fragPoCConfigDraft = trimmed
+        Task { await VPNProfileStore.shared.refreshSamizdatClient() }
+    }
+
+    private func resetFragPoCConfig() {
+        fragPoCConfigDraft = ""
+        fragPoCConfigError = nil
+        FragPoCConfigStore.configBlob = ""
+        Task { await VPNProfileStore.shared.refreshSamizdatClient() }
     }
 
     /// Switches the FragPoC port mode. Commits any unsaved edits to the

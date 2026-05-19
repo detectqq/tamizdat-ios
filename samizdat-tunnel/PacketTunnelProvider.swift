@@ -96,6 +96,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var combinedConfigBlob: String = ""
     private var primaryBlob: String = ""
     private var backupBlob: String?
+    private var fragPoCConfigBlob: String = ""
 
     // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
     // that flips to backup when TSPU whitelist mode is detected and
@@ -132,6 +133,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
+        let fragPoCConfigBlob = (proto.providerConfiguration?["fragpocConfigBlob"] as? String) ?? FragPoCConfigStore.configBlob
+        self.fragPoCConfigBlob = fragPoCConfigBlob
 
         // IPA-P: split the combined blob (which carries an optional
         // &backup=base64url(...) query param) into per-endpoint URLs.
@@ -149,7 +152,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // cross-process sandbox issue and the listener can never get
         // host-app-suspended out from under us.
         appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: activeBlob, log: appendExtLog) {
+        if !Self.startInProcessSocks(configBlob: activeBlob, fragPoCConfigBlob: fragPoCConfigBlob, log: appendExtLog) {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
@@ -185,7 +188,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
     /// run inside this extension process. Returns true on success.
-    private static func startInProcessSocks(configBlob: String, log: (String) -> Void) -> Bool {
+    private static func startInProcessSocks(configBlob: String, fragPoCConfigBlob: String, log: (String) -> Void) -> Bool {
         // Mirror Go-shim logs to the App Group file so the bridge sees them
         // alongside extension logs.
         if let containerURL = FileManager.default.containerURL(
@@ -226,6 +229,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SocksstubSetNotificationCallback(NotificationBridge.shared)
         let useFragPoC = FragPoCTransportStore.enabled
         SocksstubSetTransport(useFragPoC ? "fragpoc" : "h2")
+        SocksstubSetFragPoCConfig(fragPoCConfigBlob)
         // Push the FragPoC UDP toggle — takes effect immediately, no
         // reconnect needed. Default is true (UDP forwarding on).
         SocksstubSetFragPoCUDP(FragPoCUDPStore.enabled)
@@ -236,6 +240,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let fragPoCPortsCSV = FragPoCPortConfigStore.activePortsCSV
         SocksstubSetFragPoCPorts(fragPoCPortsCSV)
         if useFragPoC {
+            let fragPoCServer = FragPoCConfigStore.summaryLabel(for: fragPoCConfigBlob)
+            log("info: fragpoc server = \(fragPoCServer)")
             log("info: fragpoc port mode = \(FragPoCPortConfigStore.mode.rawValue), ports = \(fragPoCPortsCSV)")
         }
         var cfgErr: NSError?
@@ -382,6 +388,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             defer { self.isRewiring = false }
+            let fragBlob = FragPoCConfigStore.configBlob
+            self.fragPoCConfigBlob = fragBlob
+            SocksstubSetFragPoCConfig(fragBlob)
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {

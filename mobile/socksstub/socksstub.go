@@ -166,6 +166,7 @@ type runtimeState struct {
 	transport        atomic.Value // string
 	fragpocPorts     atomic.Value // []int — base server port + dynamic dial pool
 	fragpocHintPorts atomic.Value // []int — last server-confirmed ports, survives rewire
+	fragpocConfig    atomic.Value // string — optional fragpoc:// endpoint URI
 	fragpocUDP       atomic.Bool  // true = forward UDP through FragPoC; false = drop
 }
 
@@ -419,15 +420,12 @@ func ConnectionsTotal() int64 {
 // happens once, lazily, on the first dial — instead of every dial.
 func SetSamizdatConfig(blob string) error {
 	if currentTransport() == "fragpoc" {
-		var fpShortID [fragpoc.ShortIDLen]byte
-		sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-		copy(fpShortID[:], sidBytes)
-		// Port list comes from the iOS "Port mode" UI via SetFragPoCPorts:
-		// element 0 is the base server port, the rest form the dynamic dial
-		// pool the FragPoC client rotates across. An unset list falls back
-		// to the IPA-D37 hardcoded set (base 31503 + pool 31510-31560), so
-		// an untouched install dials byte-identically to D37.
-		fpPorts := fragpocPortList()
+		fpCfg, err := currentFragPoCServerConfig()
+		if err != nil {
+			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig fragpoc config: %v", err))
+			return err
+		}
+		fpPorts := append([]int(nil), fpCfg.Ports...)
 		fpBasePort := fpPorts[0]
 		initialPorts := fpPorts
 		if v := rt.fragpocHintPorts.Load(); v != nil {
@@ -436,11 +434,11 @@ func SetSamizdatConfig(blob string) error {
 			}
 		}
 		fpPool := append([]int(nil), initialPorts[1:]...)
-		fpServerAddr := fmt.Sprintf("sync2.detectqq.dpdns.org:%d", fpBasePort)
+		fpServerAddr := net.JoinHostPort(fpCfg.ServerHost, strconv.Itoa(fpBasePort))
 		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
 			ServerAddr:      fpServerAddr,
-			ShortID:         fpShortID,
-			Secure:          true,
+			ShortID:         fpCfg.ShortID,
+			Secure:          fpCfg.Secure,
 			DynamicPortPool: fpPool,
 			MetricsLog: func(line string) {
 				rt.appendLog(line)
@@ -950,6 +948,196 @@ func currentTransport() string {
 	return v
 }
 
+const (
+	legacyFragPoCHost       = "sync2.detectqq.dpdns.org"
+	legacyFragPoCShortIDHex = "751e8938b0e0dbda"
+)
+
+type fragpocServerConfig struct {
+	ServerHost string
+	ServerPort int
+	Ports      []int
+	ShortID    [fragpoc.ShortIDLen]byte
+	Secure     bool
+	FromURI    bool
+}
+
+// SetFragPoCConfig stores the optional FragPoC endpoint URI for the next
+// SetSamizdatConfig call. Empty string preserves the historical hardcoded
+// sync2 test endpoint. Accepted URI forms:
+//
+//	fragpoc://<shortid>@host:443?secure=1&ports=443,80
+//	fragpoc://host:443?shortid=<shortid>&secure=1&ports=443,80
+//
+// `ports=` is optional. When absent on a custom URI, the client uses only the
+// URI port; this avoids accidentally carrying the legacy 315xx dynamic pool to
+// a 443-only load-balanced endpoint. Exported for gomobile as
+// SocksstubSetFragPoCConfig.
+func SetFragPoCConfig(blob string) {
+	trimmed := strings.TrimSpace(blob)
+	rt.fragpocConfig.Store(trimmed)
+	// A server/port change invalidates server-confirmed dynamic ports from the
+	// previous endpoint. Store an empty slice (not nil; atomic.Value forbids nil)
+	// so the next client build starts from the fresh config ports.
+	rt.fragpocHintPorts.Store([]int{})
+	if trimmed == "" {
+		rt.appendLog("info: fragpoc config = legacy built-in endpoint")
+		return
+	}
+	cfg, err := parseFragPoCURL(trimmed)
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("warn: fragpoc config parse: %v", err))
+		return
+	}
+	pool := len(cfg.Ports) - 1
+	if pool < 0 {
+		pool = 0
+	}
+	rt.appendLog(fmt.Sprintf("info: fragpoc config = %s (+%d port(s), secure=%v)",
+		net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort)), pool, cfg.Secure))
+}
+
+func currentFragPoCConfigBlob() string {
+	v, _ := rt.fragpocConfig.Load().(string)
+	return strings.TrimSpace(v)
+}
+
+func currentFragPoCServerConfig() (*fragpocServerConfig, error) {
+	blob := currentFragPoCConfigBlob()
+	if blob == "" {
+		return legacyFragPoCServerConfig()
+	}
+	cfg, err := parseFragPoCURL(blob)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.Ports) == 0 {
+		cfg.Ports = []int{cfg.ServerPort}
+	}
+	return cfg, nil
+}
+
+func legacyFragPoCServerConfig() (*fragpocServerConfig, error) {
+	shortID, err := parseFragPoCShortIDHex(legacyFragPoCShortIDHex)
+	if err != nil {
+		return nil, err
+	}
+	ports := fragpocPortList()
+	return &fragpocServerConfig{
+		ServerHost: legacyFragPoCHost,
+		ServerPort: ports[0],
+		Ports:      append([]int(nil), ports...),
+		ShortID:    shortID,
+		Secure:     true,
+	}, nil
+}
+
+func parseFragPoCURL(blob string) (*fragpocServerConfig, error) {
+	u, err := url.Parse(strings.TrimSpace(blob))
+	if err != nil {
+		return nil, fmt.Errorf("not a URL: %w", err)
+	}
+	if u.Scheme != "fragpoc" {
+		return nil, fmt.Errorf("scheme must be fragpoc:// (got %q)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, errors.New("missing host")
+	}
+	port := 443
+	if rawPort := u.Port(); rawPort != "" {
+		p, err := strconv.Atoi(rawPort)
+		if err != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("invalid port %q", rawPort)
+		}
+		port = p
+	}
+	q := u.Query()
+	shortHex := ""
+	if u.User != nil {
+		shortHex = strings.TrimSpace(u.User.Username())
+	}
+	if shortHex == "" {
+		shortHex = strings.TrimSpace(q.Get("shortid"))
+	}
+	if shortHex == "" {
+		shortHex = strings.TrimSpace(q.Get("sid"))
+	}
+	shortID, err := parseFragPoCShortIDHex(shortHex)
+	if err != nil {
+		return nil, err
+	}
+	secure := true
+	if raw := strings.TrimSpace(q.Get("secure")); raw != "" {
+		secure, err = parseFragPoCBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("secure: %w", err)
+		}
+	}
+	if raw := strings.TrimSpace(q.Get("plain")); raw != "" {
+		plain, err := parseFragPoCBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("plain: %w", err)
+		}
+		if plain {
+			secure = false
+		}
+	}
+	ports := parsePortList(q.Get("ports"))
+	if len(ports) > 0 {
+		ports = normalizeFragPoCPortsWithBase(port, ports)
+	}
+	return &fragpocServerConfig{
+		ServerHost: host,
+		ServerPort: port,
+		Ports:      ports,
+		ShortID:    shortID,
+		Secure:     secure,
+		FromURI:    true,
+	}, nil
+}
+
+func parseFragPoCShortIDHex(raw string) ([fragpoc.ShortIDLen]byte, error) {
+	var out [fragpoc.ShortIDLen]byte
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return out, errors.New("missing shortid (use userinfo or shortid=)")
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != fragpoc.ShortIDLen {
+		return out, errors.New("shortid must be 16 hex chars")
+	}
+	copy(out[:], decoded)
+	return out, nil
+}
+
+func parseFragPoCBool(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true, nil
+	case "0", "false", "no", "n", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("must be true/false or 1/0 (got %q)", raw)
+	}
+}
+
+func normalizeFragPoCPortsWithBase(base int, ports []int) []int {
+	seen := map[int]struct{}{base: {}}
+	out := []int{base}
+	for _, p := range ports {
+		if p < 1 || p > 65535 {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
 // SetFragPoCPorts sets the FragPoC server port list from a comma-separated
 // string (gomobile exposes it as SocksstubSetFragPoCPorts). The first parsed
 // port is the base server port; the rest become the dynamic dial pool the
@@ -978,6 +1166,7 @@ func SetFragPoCPorts(csv string) {
 		return
 	}
 	rt.fragpocPorts.Store(ports)
+	rt.fragpocHintPorts.Store([]int{})
 	rt.appendLog(fmt.Sprintf("info: fragpoc ports set — base=%d pool=%d total=%d", ports[0], len(ports)-1, len(ports)))
 }
 
@@ -1007,20 +1196,15 @@ func ensurePortsHinted(ports []int) {
 	if len(ports) == 0 {
 		return
 	}
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
-	const fpHost = "sync2.detectqq.dpdns.org"
-	// Always connect to the known base port (from fragpocPortList) for the
-	// OpPortHint control message. The `ports` argument is what we ask the
-	// server to OPEN — not where to connect. The server's FragPoC listener
-	// is on the base port (default 31503).
-	basePort := fragpocPortList()[0]
-	fpServerAddr := fmt.Sprintf("%s:%d", fpHost, basePort)
+	fpCfg, err := currentFragPoCServerConfig()
+	if err != nil {
+		rt.appendLog(fmt.Sprintf("warn: ensurePortsHinted config: %v", err))
+		return
+	}
 	client, err := fragpoc.NewClient(fragpoc.ClientConfig{
-		ServerAddr: fpServerAddr,
-		ShortID:    fpShortID,
-		Secure:     true,
+		ServerAddr: net.JoinHostPort(fpCfg.ServerHost, strconv.Itoa(fpCfg.Ports[0])),
+		ShortID:    fpCfg.ShortID,
+		Secure:     fpCfg.Secure,
 	})
 	if err != nil {
 		rt.appendLog(fmt.Sprintf("warn: ensurePortsHinted client: %v", err))
@@ -1051,10 +1235,11 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 		MS   int64  `json:"ms"`
 		Err  string `json:"err,omitempty"`
 	}
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
-	const fpHost = "sync2.detectqq.dpdns.org"
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		out, _ := json.Marshal([]portResult{{Err: cfgErr.Error()}})
+		return string(out)
+	}
 
 	seen := make(map[int]struct{})
 	ports := make([]int, 0, 8)
@@ -1084,7 +1269,7 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 			start := time.Now()
-			probeErr := fragpoc.ProbePort(ctx, fpHost, port, fpShortID)
+			probeErr := fragpoc.ProbePort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
 			res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
 			if probeErr != nil {
 				res.Err = probeErr.Error()
@@ -1114,17 +1299,18 @@ func ProbeOnePort(port int) string {
 		MS   int64  `json:"ms"`
 		Err  string `json:"err,omitempty"`
 	}
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
-	const fpHost = "sync2.detectqq.dpdns.org"
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		out, _ := json.Marshal(portResult{Port: port, Err: cfgErr.Error()})
+		return string(out)
+	}
 
 	ensurePortsHinted([]int{port})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	start := time.Now()
-	probeErr := fragpoc.ProbePort(ctx, fpHost, port, fpShortID)
+	probeErr := fragpoc.ProbePort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
 	res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
 	if probeErr != nil {
 		res.Err = probeErr.Error()
@@ -1149,11 +1335,12 @@ func ProbeMaxPayload(port int) string {
 		Attempts int    `json:"attempts"`
 		Err      string `json:"err,omitempty"`
 	}
-	const fpHost = "sync2.detectqq.dpdns.org"
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
-	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		out, _ := json.Marshal(result{Port: port, Err: cfgErr.Error()})
+		return string(out)
+	}
+	staticKey := fragpoc.DeriveSecureStaticKey(fpCfg.ShortID)
 
 	ensurePortsHinted([]int{port})
 
@@ -1167,7 +1354,7 @@ func ProbeMaxPayload(port int) string {
 	for size := 10; size <= 1500; size += 10 {
 		attempts++
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		err := probeWithPayloadSize(ctx, fpHost, port, fpShortID, staticKey, size)
+		err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size)
 		cancel()
 		if err != nil {
 			lastErr = fmt.Sprintf("failed at %d bytes: %v", size, err)
@@ -1258,10 +1445,11 @@ func ProbeMaxConns(portsCSV string) string {
 		Err     string         `json:"err,omitempty"`
 	}
 
-	const fpHost = "sync2.detectqq.dpdns.org"
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		out, _ := json.Marshal(result{Err: cfgErr.Error()})
+		return string(out)
+	}
 
 	ports := parsePortList(portsCSV)
 	if len(ports) == 0 {
@@ -1289,7 +1477,7 @@ func ProbeMaxConns(portsCSV string) string {
 		portIdx++
 
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		conn, err := openAndHold(ctx, fpHost, port, fpShortID)
+		conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
 		cancel()
 		if err != nil {
 			lastErr = fmt.Sprintf("port %d, conn #%d: %v", port, total+1, err)
@@ -1380,17 +1568,18 @@ func ProbePayloadStep(port int, size int) string {
 		OK   bool   `json:"ok"`
 		Err  string `json:"err,omitempty"`
 	}
-	const fpHost = "sync2.detectqq.dpdns.org"
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
-	staticKey := fragpoc.DeriveSecureStaticKey(fpShortID)
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		out, _ := json.Marshal(result{Port: port, Size: size, Err: cfgErr.Error()})
+		return string(out)
+	}
+	staticKey := fragpoc.DeriveSecureStaticKey(fpCfg.ShortID)
 
 	ensurePortsHinted([]int{port})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	err := probeWithPayloadSize(ctx, fpHost, port, fpShortID, staticKey, size)
+	err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size)
 	res := result{Port: port, Size: size, OK: err == nil}
 	if err != nil {
 		res.Err = err.Error()
@@ -1462,13 +1651,23 @@ func MaxConnsOpenOne(port int) string {
 	currentTotal := len(mcSession.conns)
 	mcSession.mu.Unlock()
 
-	const fpHost = "sync2.detectqq.dpdns.org"
-	var fpShortID [fragpoc.ShortIDLen]byte
-	sidBytes, _ := hex.DecodeString("751e8938b0e0dbda")
-	copy(fpShortID[:], sidBytes)
+	fpCfg, cfgErr := currentFragPoCServerConfig()
+	if cfgErr != nil {
+		mcSession.mu.Lock()
+		defer mcSession.mu.Unlock()
+		out, _ := json.Marshal(result{
+			Port:      port,
+			OK:        false,
+			Err:       cfgErr.Error(),
+			Total:     len(mcSession.conns),
+			PortCount: mcSession.perPort[strconv.Itoa(port)],
+			PerPort:   cloneMap(mcSession.perPort),
+		})
+		return string(out)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	conn, err := openAndHold(ctx, fpHost, port, fpShortID)
+	conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
 	cancel()
 
 	mcSession.mu.Lock()
