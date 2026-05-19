@@ -106,6 +106,9 @@ type Client struct {
 	stopMetrics        chan struct{}
 	openConns          atomic.Int64
 	openConnsPeak      atomic.Int64
+	openConnsTotal     atomic.Uint64
+	opTokensTotal      atomic.Uint64
+	downPollsTotal     atomic.Uint64
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -199,11 +202,16 @@ func (c *Client) metricsLoop() {
 }
 
 type PortStats struct {
-	DialPorts  int   // active ports in the dynamic rotation window
-	PoolPorts  int   // total ports available (full pool including inactive)
-	OpenConns  int64 // TCP connections open right now
-	OpTokens   int   // op-token slots currently in use (out of cap)
-	OpTokenCap int   // total op-token capacity
+	DialPorts      int    // active ports in the dynamic rotation window
+	PoolPorts      int    // total ports available (full pool including inactive)
+	OpenConns      int64  // TCP connections open right now
+	OpenConnsTotal uint64 // short-lived TCP dials since client start
+	OpTokens       int    // op-token slots currently in use (out of cap)
+	OpTokenCap     int    // total op-token capacity
+	OpTokensTotal  uint64 // non-DOWN operation tokens acquired since client start
+	DownTokens     int    // DOWN-poll token slots currently in use
+	DownTokenCap   int    // total DOWN-poll token capacity
+	DownPollsTotal uint64 // DOWN-poll tokens acquired since client start
 }
 
 func (c *Client) PortStats() PortStats {
@@ -220,12 +228,23 @@ func (c *Client) PortStats() PortStats {
 		used = len(c.opTokens)
 		capT = cap(c.opTokens)
 	}
+	downUsed := 0
+	downCap := 0
+	if c.downTokens != nil {
+		downUsed = len(c.downTokens)
+		downCap = cap(c.downTokens)
+	}
 	return PortStats{
-		DialPorts:  dp,
-		PoolPorts:  pool,
-		OpenConns:  c.openConns.Load(),
-		OpTokens:   used,
-		OpTokenCap: capT,
+		DialPorts:      dp,
+		PoolPorts:      pool,
+		OpenConns:      c.openConns.Load(),
+		OpenConnsTotal: c.openConnsTotal.Load(),
+		OpTokens:       used,
+		OpTokenCap:     capT,
+		OpTokensTotal:  c.opTokensTotal.Load(),
+		DownTokens:     downUsed,
+		DownTokenCap:   downCap,
+		DownPollsTotal: c.downPollsTotal.Load(),
 	}
 }
 
@@ -588,6 +607,7 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 		_ = tcp.SetLinger(0)
 	}
 	n := c.openConns.Add(1)
+	c.openConnsTotal.Add(1)
 	for {
 		peak := c.openConnsPeak.Load()
 		if n <= peak || c.openConnsPeak.CompareAndSwap(peak, n) {
@@ -775,6 +795,7 @@ func (c *Client) acquireOpToken(ctx context.Context) error {
 	}
 	select {
 	case pool <- struct{}{}:
+		c.opTokensTotal.Add(1)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -798,6 +819,7 @@ func (c *Client) acquireDownToken(ctx context.Context) error {
 	}
 	select {
 	case c.downTokens <- struct{}{}:
+		c.downPollsTotal.Add(1)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

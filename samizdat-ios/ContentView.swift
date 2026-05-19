@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 /// IPA-D22: Home screen — full SwiftUI rewrite per the 2026 design
@@ -554,7 +555,11 @@ struct ContentView: View {
         let poolPorts = stats?.poolPorts ?? 0
         let openConns = stats?.openConns ?? 0
         let opTokens = stats?.opTokens ?? 0
-        let opTokenCap = stats?.opTokenCap ?? 0
+        let tcpDialsTotal = stats?.tcpDialsTotal ?? 0
+        let totalOps = (stats?.opTokensTotal ?? 0) + (stats?.downPollsTotal ?? 0)
+        let liveTokens = opTokens + (stats?.downTokens ?? 0)
+        let liveSuffix = (openConns > 0 || liveTokens > 0) ? " · live \(openConns)c/\(liveTokens)t" : ""
+        let activityValue = max(tcpDialsTotal, totalOps)
 
         return CardContainer(padding: 0) {
             DesignRow(
@@ -562,14 +567,14 @@ struct ContentView: View {
                                bg: theme.blueDim, fg: theme.blue),
                 title: "FragPoC · \(mode.label)",
                 sub: isOnline && stats != nil
-                    ? "\(dialPorts)/\(poolPorts) port\(poolPorts == 1 ? "" : "s") · \(openConns) conn · tokens \(opTokens)/\(opTokenCap)"
+                    ? "\(dialPorts)/\(poolPorts) port\(poolPorts == 1 ? "" : "s") · \(tcpDialsTotal) dials · \(totalOps) ops\(liveSuffix)"
                     : "Offline",
                 isLast: true
             ) {
                 if isOnline && stats != nil {
-                    Text("\(openConns)")
+                    Text("\(activityValue)")
                         .font(.geistMono(.bold, size: 16))
-                        .foregroundStyle(openConns > 0 ? theme.mint : theme.textDim)
+                        .foregroundStyle(activityValue > 0 ? theme.mint : theme.textDim)
                 } else {
                     Text("—")
                         .font(.geistMono(.bold, size: 16))
@@ -585,6 +590,11 @@ struct ContentView: View {
         let openConns: Int
         let opTokens: Int
         let opTokenCap: Int
+        let tcpDialsTotal: Int
+        let opTokensTotal: Int
+        let downPollsTotal: Int
+        let downTokens: Int
+        let downTokenCap: Int
     }
 
     private func parseFragPoCStats(_ json: String) -> FragPoCRuntimeStats? {
@@ -592,12 +602,23 @@ struct ContentView: View {
         guard let data = json.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
+        func statInt(_ key: String) -> Int {
+            if let i = dict[key] as? Int { return i }
+            if let n = dict[key] as? NSNumber { return n.intValue }
+            if let s = dict[key] as? String, let i = Int(s) { return i }
+            return 0
+        }
         return FragPoCRuntimeStats(
-            dialPorts: dict["dialPorts"] as? Int ?? 0,
-            poolPorts: dict["poolPorts"] as? Int ?? 0,
-            openConns: dict["openConns"] as? Int ?? 0,
-            opTokens: dict["opTokens"] as? Int ?? 0,
-            opTokenCap: dict["opTokenCap"] as? Int ?? 0
+            dialPorts: statInt("dialPorts"),
+            poolPorts: statInt("poolPorts"),
+            openConns: statInt("openConns"),
+            opTokens: statInt("opTokens"),
+            opTokenCap: statInt("opTokenCap"),
+            tcpDialsTotal: statInt("tcpDialsTotal"),
+            opTokensTotal: statInt("opTokensTotal"),
+            downPollsTotal: statInt("downPollsTotal"),
+            downTokens: statInt("downTokens"),
+            downTokenCap: statInt("downTokenCap")
         )
     }
 
