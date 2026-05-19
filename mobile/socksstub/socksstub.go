@@ -426,15 +426,46 @@ func SetSamizdatConfig(blob string) error {
 			return err
 		}
 		fpPorts := append([]int(nil), fpCfg.Ports...)
+		if len(fpPorts) == 0 {
+			fpPorts = []int{fpCfg.ServerPort}
+		}
 		fpBasePort := fpPorts[0]
-		initialPorts := fpPorts
+		confirmedPorts := fpPorts
 		if v := rt.fragpocHintPorts.Load(); v != nil {
 			if cached, ok := v.([]int); ok && len(cached) > 0 && cached[0] == fpBasePort {
-				initialPorts = append([]int(nil), cached...)
+				confirmedPorts = append([]int(nil), cached...)
 			}
 		}
-		fpPool := append([]int(nil), initialPorts[1:]...)
 		fpServerAddr := net.JoinHostPort(fpCfg.ServerHost, strconv.Itoa(fpBasePort))
+
+		// Send OpPortHint with a short-lived base-port client first. The
+		// long-lived runtime client must be built from the server-confirmed
+		// list, otherwise iOS can keep rotating through stale/refused ports
+		// (for example 80/8080 or dynamic ports the edge did not bind), which
+		// looks like random Safari hangs under LTE.
+		if hintClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
+			ServerAddr: fpServerAddr,
+			ShortID:    fpCfg.ShortID,
+			Secure:     fpCfg.Secure,
+		}); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: port hint client init failed: %v (using configured pool)", err))
+		} else {
+			hintCtx, hintCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			openPorts, hintErr := hintClient.SendPortHint(hintCtx, fpPorts)
+			hintCancel()
+			_ = hintClient.Close()
+			if hintErr != nil {
+				rt.appendLog(fmt.Sprintf("warn: port hint failed: %v (using cached/configured pool)", hintErr))
+			} else if len(openPorts) > 0 {
+				confirmedPorts = append([]int(nil), openPorts...)
+				rt.fragpocHintPorts.Store(append([]int(nil), openPorts...))
+				rt.appendLog(fmt.Sprintf("info: server confirmed %d open port(s): %v", len(openPorts), openPorts))
+			} else {
+				rt.appendLog("warn: port hint returned no ports (using cached/configured pool)")
+			}
+		}
+
+		fpPool := append([]int(nil), confirmedPorts[1:]...)
 		fpClient, err := fragpoc.NewClient(fragpoc.ClientConfig{
 			ServerAddr:      fpServerAddr,
 			ShortID:         fpCfg.ShortID,
@@ -447,19 +478,6 @@ func SetSamizdatConfig(blob string) error {
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("error: SetSamizdatConfig fragpoc.NewClient: %v", err))
 			return err
-		}
-
-		// Send OpPortHint: tell the server which ports the client wants,
-		// server opens them and responds with the actually-open list.
-		// Best-effort — failure just means we keep the client-side pool.
-		hintCtx, hintCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		openPorts, hintErr := fpClient.SendPortHint(hintCtx, fpPorts)
-		hintCancel()
-		if hintErr != nil {
-			rt.appendLog(fmt.Sprintf("warn: port hint failed: %v (keeping client-side pool)", hintErr))
-		} else {
-			rt.fragpocHintPorts.Store(append([]int(nil), openPorts...))
-			rt.appendLog(fmt.Sprintf("info: server confirmed %d open port(s): %v", len(openPorts), openPorts))
 		}
 
 		wrapper := &fragpocUpstreamClient{Client: fpClient}

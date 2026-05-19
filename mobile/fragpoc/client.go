@@ -392,17 +392,23 @@ func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte,
 		return downResult{}, err
 	}
 	defer conn.Close()
-	if _, err := conn.Write(req); err != nil {
-		return downResult{}, err
-	}
 	if c.config.Secure {
 		reqPlain := make([]byte, 4+2+padLen)
 		binary.BigEndian.PutUint32(reqPlain[:4], ack)
 		binary.BigEndian.PutUint16(reqPlain[4:6], uint16(padLen))
 		fillDownRequestPadding(reqPlain[6:], sid)
-		if _, err := writeSecureBody(conn, secureKey, secureRequestAD(OpDownSecure, sid[:]), reqPlain); err != nil {
+
+		var framed bytes.Buffer
+		framed.Grow(len(req) + secureNonceLen + 2 + len(reqPlain) + secureOverhead)
+		_, _ = framed.Write(req)
+		if _, err := writeSecureBody(&framed, secureKey, secureRequestAD(OpDownSecure, sid[:]), reqPlain); err != nil {
 			return downResult{}, err
 		}
+		if _, err := conn.Write(framed.Bytes()); err != nil {
+			return downResult{}, err
+		}
+	} else if _, err := conn.Write(req); err != nil {
+		return downResult{}, err
 	}
 	applyDeadlineFromContext(conn, ctx)
 	var plain []byte
