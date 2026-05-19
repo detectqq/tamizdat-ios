@@ -23,8 +23,8 @@ import Network
 ///   - IPv4 ICMP type 8, code 0
 ///   - IPv6 ICMPv6 type 128, code 0
 ///   - identifier: we set 0; the kernel rewrites it to a per-socket value
-///     for SOCK_DGRAM ICMP, so we can't depend on it. Match by sequence
-///     number instead.
+///     for SOCK_DGRAM ICMP. When Darwin exposes that value via getsockname,
+///     match it as defense-in-depth; sequence remains the portable guard.
 ///   - sequence: monotonic per-pinger, lets us match the right reply
 ///     when several are in flight (we always cancel before re-issuing
 ///     in WhitelistDetector, but be safe).
@@ -65,6 +65,7 @@ final class ICMPPinger {
     private var fd: Int32 = -1
     private var didSettle = false
     private var sequence: UInt16 = 0
+    private var echoIdentifier: UInt16?
     private var startedAt: Date = Date()
     private var completion: ((Bool, TimeInterval) -> Void)?
 
@@ -104,6 +105,7 @@ final class ICMPPinger {
         self.startedAt = Date()
         self.didSettle = false
         self.sequence = Self.allocSequence()
+        self.echoIdentifier = nil
 
         // Resolve target → (sockaddr, isV6).
         let resolved: (sockaddr_storage, Bool)?
@@ -159,6 +161,7 @@ final class ICMPPinger {
             settle(success: false)
             return
         }
+        self.echoIdentifier = Self.socketEchoIdentifier(fd: s, isV6: isV6)
 
         // Listen for reply via a DispatchSource read.
         let src = DispatchSource.makeReadSource(fileDescriptor: s, queue: queue)
@@ -178,18 +181,52 @@ final class ICMPPinger {
 
     private func onSocketReadable(isV6: Bool) {
         guard fd >= 0 else { return }
-        var buf = [UInt8](repeating: 0, count: 1500)
-        var from = sockaddr_storage()
-        var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let n = buf.withUnsafeMutableBufferPointer { bptr -> Int in
-            withUnsafeMutablePointer(to: &from) { ptr -> Int in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa -> Int in
-                    return Darwin.recvfrom(fd, bptr.baseAddress, bptr.count, 0, sa, &fromLen)
+        while fd >= 0 {
+            var buf = [UInt8](repeating: 0, count: 1500)
+            var from = sockaddr_storage()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let n = buf.withUnsafeMutableBufferPointer { bptr -> Int in
+                withUnsafeMutablePointer(to: &from) { ptr -> Int in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa -> Int in
+                        return Darwin.recvfrom(fd, bptr.baseAddress, bptr.count, 0, sa, &fromLen)
+                    }
                 }
             }
-        }
-        if n <= 0 { return }
 
+            if n <= 0 {
+                if n < 0 {
+                    let e = errno
+                    if e == EINTR { continue }
+                    if e == EWOULDBLOCK || e == EAGAIN { return }
+                }
+                return
+            }
+
+            guard let reply = Self.parseEchoReply(buf, count: n, isV6: isV6) else {
+                // Wrong ICMP type/code, truncated packet, or parse failure.
+                // Keep draining this read wakeup so one stale datagram from
+                // a recently closed ping socket cannot hide the real reply
+                // queued behind it.
+                continue
+            }
+            if let expected = echoIdentifier, reply.identifier != expected {
+                continue
+            }
+            if reply.sequence != sequence {
+                continue
+            }
+
+            settle(success: true)
+            return
+        }
+    }
+
+    private struct EchoReply {
+        let identifier: UInt16
+        let sequence: UInt16
+    }
+
+    private static func parseEchoReply(_ buf: [UInt8], count n: Int, isV6: Bool) -> EchoReply? {
         // IPA-D31 fix (per hermes analysis 2026-05-13): Darwin's
         // SOCK_DGRAM IPv4 ICMP socket does NOT strip the IPv4 header
         // — replies arrive as a full IPv4 packet starting with 0x45...
@@ -203,33 +240,30 @@ final class ICMPPinger {
         // XNU bsd/netinet/ip_icmp.c (IP_STRIPHDR not set by default).
         let icmpOffset: Int
         if isV6 {
-            if n < 8 { return }
+            if n < 8 { return nil }
             icmpOffset = 0
         } else {
-            if n < 20 + 8 { return }
+            if n < 20 + 8 { return nil }
             let firstByte = buf[0]
             let version = firstByte >> 4
             let ihl = Int(firstByte & 0x0f) * 4
-            if version != 4 { return }
-            if ihl < 20 { return }
-            if n < ihl + 8 { return }
+            if version != 4 { return nil }
+            if ihl < 20 { return nil }
+            if n < ihl + 8 { return nil }
             // buf[9] is the IPv4 protocol field — must be ICMP (1).
-            if buf[9] != UInt8(IPPROTO_ICMP) { return }
+            if buf[9] != UInt8(IPPROTO_ICMP) { return nil }
             icmpOffset = ihl
         }
 
         let type = buf[icmpOffset]
         let code = buf[icmpOffset + 1]
         let expectReply: UInt8 = isV6 ? 129 : 0
-        if type != expectReply { return }
-        if code != 0 { return }
-        // Bytes 6-7 (relative to ICMP header) are the sequence number,
-        // big-endian. Match against ours; identifier (bytes 4-5) may
-        // be rewritten by kernel on Darwin too so we don't match it.
-        let seq = (UInt16(buf[icmpOffset + 6]) << 8) | UInt16(buf[icmpOffset + 7])
-        if seq != sequence { return }
+        if type != expectReply { return nil }
+        if code != 0 { return nil }
 
-        settle(success: true)
+        let identifier = (UInt16(buf[icmpOffset + 4]) << 8) | UInt16(buf[icmpOffset + 5])
+        let sequence = (UInt16(buf[icmpOffset + 6]) << 8) | UInt16(buf[icmpOffset + 7])
+        return EchoReply(identifier: identifier, sequence: sequence)
     }
 
     private func settle(success: Bool) {
@@ -237,14 +271,66 @@ final class ICMPPinger {
         didSettle = true
         let elapsed = Date().timeIntervalSince(startedAt)
         timeoutWork?.cancel(); timeoutWork = nil
+        drainSocketBeforeClose()
         dispatchSource?.cancel(); dispatchSource = nil
         if fd >= 0 {
             close(fd)
             fd = -1
         }
+        echoIdentifier = nil
         let cb = completion
         completion = nil
         cb?(success, elapsed)
+    }
+
+    private func drainSocketBeforeClose() {
+        guard fd >= 0 else { return }
+        while true {
+            var buf = [UInt8](repeating: 0, count: 1500)
+            var from = sockaddr_storage()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let n = buf.withUnsafeMutableBufferPointer { bptr -> Int in
+                withUnsafeMutablePointer(to: &from) { ptr -> Int in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa -> Int in
+                        return Darwin.recvfrom(fd, bptr.baseAddress, bptr.count, 0, sa, &fromLen)
+                    }
+                }
+            }
+            if n <= 0 {
+                if n < 0 && errno == EINTR { continue }
+                return
+            }
+        }
+    }
+
+    private static func socketEchoIdentifier(fd: Int32, isV6: Bool) -> UInt16? {
+        var storage = sockaddr_storage()
+        var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let rc = withUnsafeMutablePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.getsockname(fd, sa, &len)
+            }
+        }
+        guard rc == 0 else { return nil }
+        if isV6 {
+            var addr = sockaddr_in6()
+            withUnsafePointer(to: &storage) { sptr in
+                sptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { src in
+                    addr = src.pointee
+                }
+            }
+            let id = UInt16(bigEndian: addr.sin6_port)
+            return id == 0 ? nil : id
+        } else {
+            var addr = sockaddr_in()
+            withUnsafePointer(to: &storage) { sptr in
+                sptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { src in
+                    addr = src.pointee
+                }
+            }
+            let id = UInt16(bigEndian: addr.sin_port)
+            return id == 0 ? nil : id
+        }
     }
 
     // MARK: – Packet construction
