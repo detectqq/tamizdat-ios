@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// IPA-D28: WhitelistMonitor — runs in the MAIN APP while the VPN is
 /// disconnected so the App Group `WhitelistStatusStore.activeEndpoint`
@@ -74,7 +75,19 @@ final class WhitelistMonitor: ObservableObject {
 
         async let testOK = probeHost(testHost)
         async let whitelistOK = probeHost(whitelistHost)
-        let (t, w) = await (testOK, whitelistOK)
+        var (t, w) = await (testOK, whitelistOK)
+
+        // D59 FIX: TCP fallback when both ICMP probes fail. Matches
+        // the extension's WhitelistDetector behaviour (D25). Many
+        // networks (Russian carriers, corporate Wi-Fi, hotel networks)
+        // block ICMP echo but allow TCP 443. Without this fallback the
+        // main-app monitor falsely reports "no network" while the user
+        // clearly has connectivity.
+        if !t && !w {
+            async let tcpTestOK = tcpProbe(host: testHost)
+            async let tcpWhitelistOK = tcpProbe(host: whitelistHost)
+            (t, w) = await (tcpTestOK, tcpWhitelistOK)
+        }
 
         // Same decision matrix as extension's WhitelistDetector. We
         // write `current` and `activeEndpoint` so the extension's
@@ -124,6 +137,43 @@ final class WhitelistMonitor: ObservableObject {
             pingers.append(pinger)
             pinger.ping(timeout: Self.probeTimeout) { ok, _ in
                 cont.resume(returning: ok)
+            }
+        }
+    }
+
+    /// D59: TCP-connect fallback probe to `host:443`. Returns true if
+    /// the TCP handshake completes within `probeTimeout`. Used when ICMP
+    /// fails — many networks block ICMP but allow TCP 443.
+    private func tcpProbe(host: String) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let params: NWParameters = .tcp
+            // Pin to IPv4 — matches the extension's fallback behaviour.
+            if let ipOpts = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+                ipOpts.version = .v4
+            }
+            // Serial queue so stateUpdateHandler + timeout never race
+            // on the `settled` flag (avoids double-resume crash).
+            let probeQ = DispatchQueue(label: "com.anarki.samizdat.monitor.tcp-probe")
+            let conn = NWConnection(host: NWEndpoint.Host(host), port: 443, using: params)
+            var settled = false
+            let settle: (Bool) -> Void = { ok in
+                guard !settled else { return }
+                settled = true
+                conn.cancel()
+                cont.resume(returning: ok)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:      settle(true)
+                case .failed:     settle(false)
+                case .cancelled:  settle(false)
+                default:          break
+                }
+            }
+            conn.start(queue: probeQ)
+            // Timeout — same budget as ICMP probe.
+            probeQ.asyncAfter(deadline: .now() + Self.probeTimeout) {
+                settle(false)
             }
         }
     }

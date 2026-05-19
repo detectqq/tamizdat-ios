@@ -101,8 +101,13 @@ final class WhitelistDetector {
             self.activePingers.removeAll()
             for c in self.activeTCPConns { c.cancel() }
             self.activeTCPConns.removeAll()
-            WhitelistStatusStore.current = .unknown
-            self.log("info: WhitelistDetector stopped")
+            // D59 FIX: do NOT reset WhitelistStatusStore.current here.
+            // The last-known detection result should persist so the UI
+            // keeps showing "Whitelist active" / "Free internet" across
+            // VPN connect/disconnect cycles. The main-app WhitelistMonitor
+            // picks up when the extension stops; the 200s stale-check in
+            // ContentView.refreshWhitelistStatus() handles truly stale data.
+            self.log("info: WhitelistDetector stopped (status preserved)")
         }
     }
 
