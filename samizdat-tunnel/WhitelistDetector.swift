@@ -198,24 +198,24 @@ final class WhitelistDetector {
 
         parallelProbe { [weak self] testOK, whitelistOK in
             guard let self else { return }
-            // IPA-D25: if BOTH ICMP probes failed, try a TCP-connect
-            // fallback to port 443 against the same two targets via
-            // the same physical-interface pinning. Russian ISPs,
-            // corporate Wi-Fi, hotel/cafe networks commonly block
-            // ICMP echo replies — TCP 443 is the universally-
-            // permitted outbound port. If TCP also fails, the
-            // network is genuinely unreachable.
+            // D63 FIX: when BOTH ICMP probes fail, TCP fallback only
+            // determines "network alive vs truly offline". TCP 443
+            // passes through TSPU even under whitelist (carrier blocks
+            // ICMP but allows TCP), so feeding TCP into the full
+            // decision matrix caused false .clearAll on devices where
+            // ICMP was flaky to both hosts. Now: if TCP confirms
+            // network is alive, keep the current status/endpoint
+            // unchanged; only declare .noNetwork if TCP also fails.
             if !testOK && !whitelistOK {
                 self.tcpFallbackProbe { [weak self] tcpTestOK, tcpWhitelistOK in
                     guard let self else { return }
-                    let outcome: Outcome
-                    switch (tcpTestOK, tcpWhitelistOK) {
-                    case (true,  true):  outcome = .clearAll
-                    case (false, true):  outcome = .whitelistOn
-                    case (true,  false): outcome = .whitelistMisconfigured
-                    case (false, false): outcome = .noNetwork
+                    if !tcpTestOK && !tcpWhitelistOK {
+                        self.handleOutcome(.noNetwork)
+                    } else {
+                        // Network alive but ICMP blocked to both hosts.
+                        // Keep current status + endpoint unchanged.
+                        self.log("info: detector: both ICMP failed but TCP alive — keeping current verdict")
                     }
-                    self.handleOutcome(outcome)
                     self.scheduleNextProbe(after: cadence)
                 }
                 return

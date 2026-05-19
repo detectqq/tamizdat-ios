@@ -77,18 +77,6 @@ final class WhitelistMonitor: ObservableObject {
         async let whitelistOK = probeHost(whitelistHost)
         var (t, w) = await (testOK, whitelistOK)
 
-        // D59 FIX: TCP fallback when both ICMP probes fail. Matches
-        // the extension's WhitelistDetector behaviour (D25). Many
-        // networks (Russian carriers, corporate Wi-Fi, hotel networks)
-        // block ICMP echo but allow TCP 443. Without this fallback the
-        // main-app monitor falsely reports "no network" while the user
-        // clearly has connectivity.
-        if !t && !w {
-            async let tcpTestOK = tcpProbe(host: testHost)
-            async let tcpWhitelistOK = tcpProbe(host: whitelistHost)
-            (t, w) = await (tcpTestOK, tcpWhitelistOK)
-        }
-
         // Same decision matrix as extension's WhitelistDetector. We
         // write `current` and `activeEndpoint` so the extension's
         // startTunnel picks the right blob immediately on next connect.
@@ -104,9 +92,25 @@ final class WhitelistMonitor: ObservableObject {
             // on Yandex). Keep current activeEndpoint; mark status.
             WhitelistStatusStore.current = .unknown
         case (false, false):
-            // Both unreachable — phone has no internet at all (lift,
-            // metro, plane). Mark as such; don't switch endpoint.
-            WhitelistStatusStore.current = .noNetwork
+            // Both ICMP unreachable. Use TCP fallback ONLY to distinguish
+            // "no network" from "ICMP blocked but network alive". D63 FIX:
+            // TCP 443 passes through TSPU even under whitelist (carrier
+            // blocks ICMP but not TCP), so feeding TCP results into the
+            // full decision matrix caused false "Free internet" on devices
+            // where ICMP was flaky to both hosts. Now TCP only answers
+            // "is the network alive?" — if yes, keep the previous status
+            // instead of flipping to the wrong endpoint.
+            async let tcpTestOK = tcpProbe(host: testHost)
+            async let tcpWhitelistOK = tcpProbe(host: whitelistHost)
+            let (tcpT, tcpW) = await (tcpTestOK, tcpWhitelistOK)
+            if !tcpT && !tcpW {
+                // Both TCP also fail — genuinely offline.
+                WhitelistStatusStore.current = .noNetwork
+            }
+            // else: network alive but ICMP blocked to both hosts.
+            // Keep current status + activeEndpoint unchanged — the last
+            // decisive ICMP cycle's verdict stands. Don't write .off or
+            // .detected based on TCP alone.
         }
     }
 
