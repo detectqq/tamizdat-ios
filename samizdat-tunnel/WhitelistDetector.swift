@@ -207,16 +207,35 @@ final class WhitelistDetector {
             // network is alive, keep the current status/endpoint
             // unchanged; only declare .noNetwork if TCP also fails.
             if !testOK && !whitelistOK {
-                self.tcpFallbackProbe { [weak self] tcpTestOK, tcpWhitelistOK in
+                // D65: HTTP fallback first — goes through DPI, can
+                // differentiate whitelist from free (unlike TCP which
+                // just checks handshake). Falls to TCP only if HTTP
+                // also fails for both hosts.
+                self.httpFallbackProbe { [weak self] httpTestOK, httpWhitelistOK in
                     guard let self else { return }
-                    if !tcpTestOK && !tcpWhitelistOK {
-                        self.handleOutcome(.noNetwork)
-                    } else {
-                        // Network alive but ICMP blocked to both hosts.
-                        // Keep current status + endpoint unchanged.
-                        self.log("info: detector: both ICMP failed but TCP alive — keeping current verdict")
+                    switch (httpTestOK, httpWhitelistOK) {
+                    case (true, true):
+                        self.handleOutcome(.clearAll)
+                        self.scheduleNextProbe(after: cadence)
+                    case (false, true):
+                        self.handleOutcome(.whitelistOn)
+                        self.scheduleNextProbe(after: cadence)
+                    case (true, false):
+                        self.handleOutcome(.whitelistMisconfigured)
+                        self.scheduleNextProbe(after: cadence)
+                    case (false, false):
+                        // Both HTTP also failed. TCP only for
+                        // "no network" vs "hosts don't serve HTTP".
+                        self.tcpFallbackProbe { [weak self] tcpTestOK, tcpWhitelistOK in
+                            guard let self else { return }
+                            if !tcpTestOK && !tcpWhitelistOK {
+                                self.handleOutcome(.noNetwork)
+                            } else {
+                                self.log("info: detector: ICMP+HTTP failed but TCP alive — keeping current verdict")
+                            }
+                            self.scheduleNextProbe(after: cadence)
+                        }
                     }
-                    self.scheduleNextProbe(after: cadence)
                 }
                 return
             }
@@ -396,6 +415,78 @@ final class WhitelistDetector {
         }
     }
 
+    /// D65: HTTP HEAD fallback probe to both targets in parallel.
+    /// URLSession requests go through carrier DPI — under TSPU whitelist,
+    /// DPI inspects HTTP data and blocks non-whitelisted destinations.
+    /// Unlike raw TCP handshake (which passes through DPI), HTTP sends
+    /// actual data that DPI can filter.
+    ///
+    /// Note: from the extension, URLSession traffic exits via the system
+    /// default route (not our own utun) because NEPacketTunnelProvider's
+    /// excludedRoutes already exclude probe target IPs.
+    private func httpFallbackProbe(completion: @escaping (_ testOK: Bool, _ whitelistOK: Bool) -> Void) {
+        let tHost = self.testHost
+        let wHost = self.whitelistHost
+        var testRes: Bool?
+        var whitelistRes: Bool?
+        let group = DispatchGroup()
+        group.enter()
+        group.enter()
+
+        runHTTPProbe(host: tHost) { [weak self] ok in
+            self?.queue.async {
+                self?.log("info: detector HTTP fallback testHost=\(tHost) → \(ok ? "ok" : "fail")")
+                testRes = ok
+                group.leave()
+            }
+        }
+        runHTTPProbe(host: wHost) { [weak self] ok in
+            self?.queue.async {
+                self?.log("info: detector HTTP fallback whitelistHost=\(wHost) → \(ok ? "ok" : "fail")")
+                whitelistRes = ok
+                group.leave()
+            }
+        }
+
+        group.notify(queue: queue) {
+            completion(testRes ?? false, whitelistRes ?? false)
+        }
+    }
+
+    /// Single HTTP HEAD probe to `http://<host>/`. Settles with true if
+    /// any HTTP response is received, false on timeout/error. Redirects
+    /// are NOT followed — the first response confirms DPI reachability.
+    private func runHTTPProbe(host: String,
+                              completion: @escaping (_ ok: Bool) -> Void) {
+        let urlHost = host.contains(":") ? "[\(host)]" : host
+        guard let url = URL(string: "http://\(urlHost)/") else {
+            completion(false)
+            return
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = Self.tcpFallbackTimeout
+        config.timeoutIntervalForResource = Self.tcpFallbackTimeout + 1
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let delegate = DetectorHTTPProbeDelegate()
+        let session = URLSession(configuration: config,
+                                 delegate: delegate,
+                                 delegateQueue: nil)
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = Self.tcpFallbackTimeout
+
+        log("info: detector HTTP fallback \(host) starting")
+        let task = session.dataTask(with: request) { [weak self] _, response, error in
+            let ok = error == nil && response != nil
+            self?.queue.async {
+                self?.log("info: detector HTTP fallback \(host) settled \(ok ? "ok" : "fail")")
+                session.invalidateAndCancel()
+                completion(ok)
+            }
+        }
+        task.resume()
+    }
+
     /// Parses `"8.8.8.8"` or `"google.com"` into the corresponding
     /// ICMPPinger.Target. The pinger itself does the IP-literal
     /// detection — but we forward a typed enum so the intent is clear.
@@ -499,5 +590,19 @@ final class WhitelistDetector {
                 self?.log("info: notification posted (\(endpoint.rawValue))")
             }
         }
+    }
+}
+
+/// Stops URLSession from following HTTP redirects. Used by
+/// `WhitelistDetector.runHTTPProbe` so we detect reachability from the
+/// FIRST HTTP response — the redirect target might be on a different
+/// (blocked) domain.
+private final class DetectorHTTPProbeDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }

@@ -34,6 +34,7 @@ final class WhitelistMonitor: ObservableObject {
     // backgrounding).
     // D45: cadence now user-configurable via WhitelistProbePreferences.
     private static let probeTimeout: TimeInterval = 2
+    private static let httpTimeout: TimeInterval = 3
     private static var cycleInterval: TimeInterval {
         TimeInterval(WhitelistProbePreferences.probeInterval)
     }
@@ -92,25 +93,37 @@ final class WhitelistMonitor: ObservableObject {
             // on Yandex). Keep current activeEndpoint; mark status.
             WhitelistStatusStore.current = .unknown
         case (false, false):
-            // Both ICMP unreachable. Use TCP fallback ONLY to distinguish
-            // "no network" from "ICMP blocked but network alive". D63 FIX:
-            // TCP 443 passes through TSPU even under whitelist (carrier
-            // blocks ICMP but not TCP), so feeding TCP results into the
-            // full decision matrix caused false "Free internet" on devices
-            // where ICMP was flaky to both hosts. Now TCP only answers
-            // "is the network alive?" — if yes, keep the previous status
-            // instead of flipping to the wrong endpoint.
-            async let tcpTestOK = tcpProbe(host: testHost)
-            async let tcpWhitelistOK = tcpProbe(host: whitelistHost)
-            let (tcpT, tcpW) = await (tcpTestOK, tcpWhitelistOK)
-            if !tcpT && !tcpW {
-                // Both TCP also fail — genuinely offline.
-                WhitelistStatusStore.current = .noNetwork
+            // D65: Both ICMP unreachable — ICMPPinger may not work from
+            // the app sandbox on some devices (observed on iPhone 16 Pro
+            // Max). Fall back to HTTP: URLSession HEAD requests go through
+            // carrier DPI. Under TSPU whitelist, DPI inspects HTTP data
+            // and blocks non-whitelisted destinations — unlike raw TCP
+            // handshake which passes through (D63). HTTP results feed into
+            // the FULL decision matrix, not just "network alive?" check.
+            async let httpTestOK = httpProbe(host: testHost)
+            async let httpWhitelistOK = httpProbe(host: whitelistHost)
+            let (httpT, httpW) = await (httpTestOK, httpWhitelistOK)
+            switch (httpT, httpW) {
+            case (true, true):
+                WhitelistStatusStore.current = .off
+                WhitelistStatusStore.activeEndpoint = .primary
+            case (false, true):
+                WhitelistStatusStore.current = .detected
+                WhitelistStatusStore.activeEndpoint = .backup
+            case (true, false):
+                WhitelistStatusStore.current = .unknown
+            case (false, false):
+                // Both HTTP also failed. TCP fallback ONLY to distinguish
+                // "no network" from "hosts don't serve HTTP on port 80".
+                async let tcpTestOK = tcpProbe(host: testHost)
+                async let tcpWhitelistOK = tcpProbe(host: whitelistHost)
+                let (tcpT, tcpW) = await (tcpTestOK, tcpWhitelistOK)
+                if !tcpT && !tcpW {
+                    WhitelistStatusStore.current = .noNetwork
+                }
+                // else: network alive but both ICMP + HTTP failed.
+                // Keep current status + endpoint unchanged.
             }
-            // else: network alive but ICMP blocked to both hosts.
-            // Keep current status + activeEndpoint unchanged — the last
-            // decisive ICMP cycle's verdict stands. Don't write .off or
-            // .detected based on TCP alone.
         }
     }
 
@@ -182,10 +195,64 @@ final class WhitelistMonitor: ObservableObject {
         }
     }
 
+    /// D65: HTTP HEAD fallback probe to `http://<host>/`. URLSession
+    /// requests go through carrier DPI — under TSPU whitelist mode, DPI
+    /// inspects HTTP data and blocks non-whitelisted destinations. Unlike
+    /// a raw TCP handshake (which passes through DPI because it doesn't
+    /// carry inspectable payload), HTTP sends an actual request that DPI
+    /// can filter.
+    ///
+    /// Returns true if any HTTP response is received within `httpTimeout`.
+    /// Redirect-following is disabled — the first response (even 3xx)
+    /// confirms the host is reachable through DPI.
+    private func httpProbe(host: String) async -> Bool {
+        // IPv6 addresses need brackets in URLs.
+        let urlHost = host.contains(":") ? "[\(host)]" : host
+        guard let url = URL(string: "http://\(urlHost)/") else { return false }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = Self.httpTimeout
+        config.timeoutIntervalForResource = Self.httpTimeout + 1
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        // Don't follow redirects — the first response is enough to
+        // confirm the host is reachable through DPI. Redirect targets
+        // might live on different (blocked) domains.
+        let delegate = WhitelistHTTPProbeDelegate()
+        let session = URLSession(configuration: config,
+                                 delegate: delegate,
+                                 delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = Self.httpTimeout
+
+        do {
+            let (_, _) = try await session.data(for: request)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private static func looksLikeIPLiteral(_ s: String) -> Bool {
         if s.contains(":") { return true }   // IPv6
         let parts = s.split(separator: ".")
         guard parts.count == 4 else { return false }
         return parts.allSatisfy { UInt($0).map { $0 <= 255 } ?? false }
+    }
+}
+
+/// Stops URLSession from following HTTP redirects. Used by
+/// `WhitelistMonitor.httpProbe` so we detect reachability from the
+/// FIRST HTTP response — the redirect target might be on a different
+/// (blocked) domain.
+private final class WhitelistHTTPProbeDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }
