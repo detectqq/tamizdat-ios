@@ -105,6 +105,34 @@ enum FragPoCConfigStore {
         let port = components.port ?? 443
         return "\(host):\(port)"
     }
+
+    /// Public FragPoC ports declared by a custom `fragpoc://` endpoint URI.
+    ///
+    /// A 443/80 HAProxy edge such as ai-archive advertises its real reachable
+    /// ports in the URI (`?ports=443,80`). The old Settings "Port mode" store
+    /// still defaults to the lab 315xx pool, so diagnostics must prefer the URI
+    /// when it is present; otherwise the UI probes unrelated ports and reports
+    /// everything blocked even though the endpoint is healthy.
+    static func configuredPorts(for blob: String = configBlob) -> [Int]? {
+        let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let components = URLComponents(string: trimmed),
+              components.scheme == "fragpoc",
+              let host = components.host,
+              !host.isEmpty else { return nil }
+
+        let base = components.port ?? 443
+        let rawPorts = components.queryItems?.first(where: { $0.name == "ports" })?.value ?? ""
+        let parsed = FragPoCPortConfigStore.parsePorts(rawPorts)
+
+        var seen = Set<Int>([base])
+        var ports = [base]
+        for port in parsed where !seen.contains(port) {
+            seen.insert(port)
+            ports.append(port)
+        }
+        return ports
+    }
 }
 
 /// FragPoC UDP toggle. When disabled, the FragPoC transport drops all UDP
@@ -230,10 +258,22 @@ enum FragPoCPortConfigStore {
     /// the rest form the dynamic dial pool.
     static var activePorts: [Int] { ports(for: mode) }
 
+    /// Effective port list for the current endpoint. Custom FragPoC URIs win
+    /// over the manual lab port-mode store, so diagnostics and runtime sync use
+    /// ai-archive's `?ports=443,80` instead of stale default 315xx lab ports.
+    static var effectiveActivePorts: [Int] {
+        FragPoCConfigStore.configuredPorts() ?? activePorts
+    }
+
     /// Comma-separated `activePorts` — the wire format passed to
     /// SocksstubSetFragPoCPorts.
     static var activePortsCSV: String {
         activePorts.map(String.init).joined(separator: ",")
+    }
+
+    /// Comma-separated effective endpoint ports.
+    static var effectiveActivePortsCSV: String {
+        effectiveActivePorts.map(String.init).joined(separator: ",")
     }
 
     private static func read(_ key: String) -> [Int]? {

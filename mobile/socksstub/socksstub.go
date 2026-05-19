@@ -1269,7 +1269,7 @@ func RunFragPoCSmokeTest(portsCSV string) string {
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 			start := time.Now()
-			probeErr := fragpoc.ProbePort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
+			probeErr := probeFragPoCPort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, fpCfg.Secure)
 			res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
 			if probeErr != nil {
 				res.Err = probeErr.Error()
@@ -1310,7 +1310,7 @@ func ProbeOnePort(port int) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	start := time.Now()
-	probeErr := fragpoc.ProbePort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
+	probeErr := probeFragPoCPort(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, fpCfg.Secure)
 	res := portResult{Port: port, OK: probeErr == nil, MS: time.Since(start).Milliseconds()}
 	if probeErr != nil {
 		res.Err = probeErr.Error()
@@ -1320,6 +1320,13 @@ func ProbeOnePort(port int) string {
 		return "{}"
 	}
 	return string(out)
+}
+
+func probeFragPoCPort(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, secure bool) error {
+	if secure {
+		return fragpoc.ProbePort(ctx, host, port, shortID)
+	}
+	return probePlainOpen(ctx, host, port, shortID, []byte("fragpoc-smoke.invalid:80"))
 }
 
 // ProbeMaxPayload probes a single port to find the maximum TCP payload size
@@ -1354,7 +1361,7 @@ func ProbeMaxPayload(port int) string {
 	for size := 10; size <= 1500; size += 10 {
 		attempts++
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size)
+		err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size, fpCfg.Secure)
 		cancel()
 		if err != nil {
 			lastErr = fmt.Sprintf("failed at %d bytes: %v", size, err)
@@ -1375,7 +1382,7 @@ func ProbeMaxPayload(port int) string {
 // to exactly `size` bytes. The server will attempt to resolve the destination
 // and fail, but we still get AckOK + SID back — proving the payload traversed
 // the network path intact.
-func probeWithPayloadSize(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, staticKey [32]byte, size int) error {
+func probeWithPayloadSize(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, staticKey [32]byte, size int, secure bool) error {
 	timeout := 4 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
 		if d := time.Until(deadline); d > 0 && d < timeout {
@@ -1407,18 +1414,21 @@ func probeWithPayloadSize(ctx context.Context, host string, port int, shortID [f
 
 	reqPlain := make([]byte, len(dest)+1)
 	copy(reqPlain, dest)
+	if !secure {
+		return probePlainOpen(ctx, host, port, shortID, []byte(dest))
+	}
 	nonce, err := fragpoc.NewSecureNonce()
 	if err != nil {
 		return err
 	}
-	prefix := make([]byte, 1+fragpoc.ShortIDLen)
-	prefix[0] = fragpoc.OpOpenSecure
-	copy(prefix[1:], shortID[:])
-	if _, err := conn.Write(prefix); err != nil {
+	prefix := fragpoc.SecureOpenPrefix(shortID)
+	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
+	var req bytes.Buffer
+	_, _ = req.Write(prefix)
+	if err := fragpoc.WriteSecureBodyWithNonce(&req, staticKey, reqAD, nonce[:], reqPlain); err != nil {
 		return err
 	}
-	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
-	if err := fragpoc.WriteSecureBodyWithNonce(conn, staticKey, reqAD, nonce[:], reqPlain); err != nil {
+	if _, err := conn.Write(req.Bytes()); err != nil {
 		return err
 	}
 	respAD := fragpoc.SecureResponseAD(fragpoc.OpOpenSecure, shortID[:])
@@ -1427,6 +1437,40 @@ func probeWithPayloadSize(ctx context.Context, host string, port int, shortID [f
 		return err
 	}
 	if len(resp) < 1 || resp[0] != fragpoc.AckOK {
+		return fmt.Errorf("server rejected payload: ack=%d", resp[0])
+	}
+	return nil
+}
+
+func probePlainOpen(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, destination []byte) error {
+	timeout := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(deadline); d > 0 && d < timeout {
+			timeout = d
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	fragpoc.ApplyDeadlineFromContext(conn, ctx)
+	req := make([]byte, 1+fragpoc.ShortIDLen+len(destination)+1)
+	req[0] = fragpoc.OpOpen
+	copy(req[1:1+fragpoc.ShortIDLen], shortID[:])
+	copy(req[1+fragpoc.ShortIDLen:], destination)
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+	resp := make([]byte, 1+fragpoc.SIDLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return err
+	}
+	if resp[0] != fragpoc.AckOK {
 		return fmt.Errorf("server rejected payload: ack=%d", resp[0])
 	}
 	return nil
@@ -1477,7 +1521,7 @@ func ProbeMaxConns(portsCSV string) string {
 		portIdx++
 
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
+		conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, fpCfg.Secure)
 		cancel()
 		if err != nil {
 			lastErr = fmt.Sprintf("port %d, conn #%d: %v", port, total+1, err)
@@ -1505,7 +1549,7 @@ func ProbeMaxConns(portsCSV string) string {
 // openAndHold dials a FragPoC port, performs OpOpenSecure, and returns the
 // raw TCP connection WITHOUT closing it. The caller holds it open to test
 // concurrent connection limits.
-func openAndHold(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte) (net.Conn, error) {
+func openAndHold(ctx context.Context, host string, port int, shortID [fragpoc.ShortIDLen]byte, secure bool) (net.Conn, error) {
 	timeout := 4 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
 		if d := time.Until(deadline); d > 0 && d < timeout {
@@ -1528,15 +1572,15 @@ func openAndHold(ctx context.Context, host string, port int, shortID [fragpoc.Sh
 		conn.Close()
 		return nil, err
 	}
-	prefix := make([]byte, 1+fragpoc.ShortIDLen)
-	prefix[0] = fragpoc.OpOpenSecure
-	copy(prefix[1:], shortID[:])
-	if _, err := conn.Write(prefix); err != nil {
+	prefix := fragpoc.SecureOpenPrefix(shortID)
+	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
+	var req bytes.Buffer
+	_, _ = req.Write(prefix)
+	if err := fragpoc.WriteSecureBodyWithNonce(&req, staticKey, reqAD, nonce[:], reqPlain); err != nil {
 		conn.Close()
 		return nil, err
 	}
-	reqAD := fragpoc.SecureRequestAD(fragpoc.OpOpenSecure, shortID[:])
-	if err := fragpoc.WriteSecureBodyWithNonce(conn, staticKey, reqAD, nonce[:], reqPlain); err != nil {
+	if _, err := conn.Write(req.Bytes()); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -1579,7 +1623,7 @@ func ProbePayloadStep(port int, size int) string {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size)
+	err := probeWithPayloadSize(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, staticKey, size, fpCfg.Secure)
 	res := result{Port: port, Size: size, OK: err == nil}
 	if err != nil {
 		res.Err = err.Error()
@@ -1667,7 +1711,7 @@ func MaxConnsOpenOne(port int) string {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID)
+	conn, err := openAndHold(ctx, fpCfg.ServerHost, port, fpCfg.ShortID, fpCfg.Secure)
 	cancel()
 
 	mcSession.mu.Lock()

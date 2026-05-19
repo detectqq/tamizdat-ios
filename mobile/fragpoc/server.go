@@ -128,13 +128,13 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) {
 		s.handleDown(conn)
 	case OpClose:
 		s.handleClose(conn)
-	case OpOpenSecure:
+	case OpOpenSecure, OpOpenSecureCompat:
 		s.handleOpenSecure(ctx, conn)
-	case OpUpSecure:
+	case OpUpSecure, OpUpSecureCompat:
 		s.handleUpSecure(conn)
-	case OpDownSecure:
+	case OpDownSecure, OpDownSecureCompat:
 		s.handleDownSecure(conn)
-	case OpCloseSecure:
+	case OpCloseSecure, OpCloseSecureCompat:
 		s.handleCloseSecure(conn)
 	default:
 		_, _ = conn.Write([]byte{AckErr})
@@ -151,7 +151,16 @@ func (s *Server) handleOpen(ctx context.Context, conn net.Conn) {
 		_, _ = conn.Write([]byte{AckErr})
 		return
 	}
-	destination, err := readNULString(conn, s.destinationLimit)
+	var first [1]byte
+	if _, err := io.ReadFull(conn, first[:]); err != nil {
+		_, _ = conn.Write([]byte{AckErr})
+		return
+	}
+	if first[0] == secureOpenMarker {
+		s.handleOpenSecureBody(ctx, conn, shortID)
+		return
+	}
+	destination, err := readNULStringWithPrefix(conn, first[0], s.destinationLimit)
 	if err != nil || destination == "" {
 		_, _ = conn.Write([]byte{AckErr})
 		return
@@ -190,6 +199,10 @@ func (s *Server) handleOpenSecure(ctx context.Context, conn net.Conn) {
 	if _, err := io.ReadFull(conn, shortID[:]); err != nil {
 		return
 	}
+	s.handleOpenSecureBody(ctx, conn, shortID)
+}
+
+func (s *Server) handleOpenSecureBody(ctx context.Context, conn net.Conn, shortID [ShortIDLen]byte) {
 	staticKey := deriveSecureStaticKey(shortID)
 	respAD := secureResponseAD(OpOpenSecure, shortID[:])
 	plain, openNonce, err := readSecureBody(conn, staticKey, secureRequestAD(OpOpenSecure, shortID[:]), s.destinationLimit+1)
@@ -244,6 +257,10 @@ func (s *Server) handleUp(conn net.Conn) {
 	if !ok {
 		return
 	}
+	if sess.secure {
+		s.handleUpSecureSession(conn, sess)
+		return
+	}
 	var hdr [2]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		_, _ = conn.Write([]byte{AckErr})
@@ -277,6 +294,10 @@ func (s *Server) handleUpSecure(conn net.Conn) {
 	if !ok {
 		return
 	}
+	s.handleUpSecureSession(conn, sess)
+}
+
+func (s *Server) handleUpSecureSession(conn net.Conn, sess *session) {
 	respAD := secureResponseAD(OpUpSecure, sess.sid[:])
 	writeErr := func() {
 		_, _ = writeSecureBody(conn, sess.secureKey, respAD, []byte{AckErr})
@@ -309,6 +330,10 @@ func (s *Server) handleDown(conn net.Conn) {
 	if !ok {
 		return
 	}
+	if sess.secure {
+		s.handleDownSecureSession(conn, sess)
+		return
+	}
 	ack, ok := readDownRequest(conn)
 	if !ok {
 		_, _ = conn.Write([]byte{AckErr})
@@ -322,6 +347,10 @@ func (s *Server) handleDownSecure(conn net.Conn) {
 	if !ok {
 		return
 	}
+	s.handleDownSecureSession(conn, sess)
+}
+
+func (s *Server) handleDownSecureSession(conn net.Conn, sess *session) {
 	respAD := secureResponseAD(OpDownSecure, sess.sid[:])
 	writeErr := func() {
 		_, _ = writeSecureBody(conn, sess.secureKey, respAD, []byte{AckErr})
@@ -468,6 +497,10 @@ func (s *Server) handleClose(conn net.Conn) {
 		_, _ = conn.Write([]byte{AckErr})
 		return
 	}
+	if sess := s.getSession(sid); sess != nil && sess.secure {
+		s.handleCloseSecureSession(conn, sess)
+		return
+	}
 	if sess := s.deleteSession(sid); sess != nil {
 		sess.close()
 	}
@@ -479,6 +512,10 @@ func (s *Server) handleCloseSecure(conn net.Conn) {
 	if !ok {
 		return
 	}
+	s.handleCloseSecureSession(conn, sess)
+}
+
+func (s *Server) handleCloseSecureSession(conn net.Conn, sess *session) {
 	respAD := secureResponseAD(OpCloseSecure, sess.sid[:])
 	if _, _, err := readSecureBody(conn, sess.secureKey, secureRequestAD(OpCloseSecure, sess.sid[:]), 0); err != nil {
 		_, _ = writeSecureBody(conn, sess.secureKey, respAD, []byte{AckErr})
@@ -500,10 +537,6 @@ func (s *Server) readSession(conn net.Conn) (*session, bool) {
 	}
 	sess := s.getSession(sid)
 	if sess == nil {
-		_, _ = conn.Write([]byte{AckErr})
-		return nil, false
-	}
-	if sess.secure {
 		_, _ = conn.Write([]byte{AckErr})
 		return nil, false
 	}
@@ -607,10 +640,21 @@ func (s *session) close() {
 }
 
 func readNULString(r io.Reader, limit int) (string, error) {
+	var first [1]byte
+	if _, err := io.ReadFull(r, first[:]); err != nil {
+		return "", err
+	}
+	return readNULStringWithPrefix(r, first[0], limit)
+}
+
+func readNULStringWithPrefix(r io.Reader, first byte, limit int) (string, error) {
 	if limit <= 0 {
 		limit = 512
 	}
-	buf := make([]byte, 0, 64)
+	if first == 0 {
+		return "", nil
+	}
+	buf := []byte{first}
 	var b [1]byte
 	for len(buf) <= limit {
 		if _, err := io.ReadFull(r, b[:]); err != nil {

@@ -11,20 +11,30 @@ import (
 )
 
 const (
+	// Canonical secure opcodes. Kept for AD derivation and backward-compatible servers.
 	OpOpenSecure  byte = 0x81
 	OpUpSecure    byte = 0x82
 	OpDownSecure  byte = 0x83
 	OpCloseSecure byte = 0x84
 
-	secureOverhead = chacha20poly1305.Overhead
-	secureNonceLen = chacha20poly1305.NonceSize
+	// Historical low-byte aliases accepted by servers. New clients instead reuse
+	// the plain opcode bytes (0x01..0x04) for secure sessions because the LTE path
+	// under test stalls even on 0x06, while AEAD AD still uses canonical opcodes.
+	OpOpenSecureCompat  byte = 0x06
+	OpUpSecureCompat    byte = 0x07
+	OpDownSecureCompat  byte = 0x08
+	OpCloseSecureCompat byte = 0x09
+
+	secureOverhead        = chacha20poly1305.Overhead
+	secureNonceLen        = chacha20poly1305.NonceSize
+	secureOpenMarker byte = '!'
 )
 
 func isSecureOp(op byte) bool {
-	return op >= OpOpenSecure && op <= OpCloseSecure
+	return (op >= OpOpenSecure && op <= OpCloseSecure) || (op >= OpOpenSecureCompat && op <= OpCloseSecureCompat)
 }
 
-func plainOpForSecure(op byte) byte {
+func secureWireOp(op byte) byte {
 	switch op {
 	case OpOpenSecure:
 		return OpOpen
@@ -33,6 +43,21 @@ func plainOpForSecure(op byte) byte {
 	case OpDownSecure:
 		return OpDown
 	case OpCloseSecure:
+		return OpClose
+	default:
+		return op
+	}
+}
+
+func plainOpForSecure(op byte) byte {
+	switch op {
+	case OpOpenSecure, OpOpenSecureCompat:
+		return OpOpen
+	case OpUpSecure, OpUpSecureCompat:
+		return OpUp
+	case OpDownSecure, OpDownSecureCompat:
+		return OpDown
+	case OpCloseSecure, OpCloseSecureCompat:
 		return OpClose
 	default:
 		return op

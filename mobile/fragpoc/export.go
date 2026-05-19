@@ -43,3 +43,11 @@ func ReadSecureBody(r io.Reader, key [32]byte, ad []byte, plaintextLimit int) ([
 func ApplyDeadlineFromContext(conn net.Conn, ctx context.Context) {
 	applyDeadlineFromContext(conn, ctx)
 }
+
+func SecureOpenPrefix(shortID [ShortIDLen]byte) []byte {
+	prefix := make([]byte, 1+ShortIDLen+1)
+	prefix[0] = secureWireOp(OpOpenSecure)
+	copy(prefix[1:1+ShortIDLen], shortID[:])
+	prefix[1+ShortIDLen] = secureOpenMarker
+	return prefix
+}

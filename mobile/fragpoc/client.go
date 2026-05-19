@@ -1,6 +1,7 @@
 package fragpoc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -309,9 +310,10 @@ func (c *Client) openSecure(ctx context.Context, destination string) (openResult
 	if err != nil {
 		return openResult{}, err
 	}
-	req := make([]byte, 1+ShortIDLen)
-	req[0] = OpOpenSecure
-	copy(req[1:], c.config.ShortID[:])
+	req := make([]byte, 1+ShortIDLen+1)
+	req[0] = secureWireOp(OpOpenSecure)
+	copy(req[1:1+ShortIDLen], c.config.ShortID[:])
+	req[1+ShortIDLen] = secureOpenMarker
 	resp, err := c.exchangeSecure(ctx, req, staticKey, secureRequestAD(OpOpenSecure, c.config.ShortID[:]), secureResponseAD(OpOpenSecure, c.config.ShortID[:]), reqPlain, 1+SIDLen, nonce[:])
 	if err != nil {
 		return openResult{}, err
@@ -333,7 +335,7 @@ func (c *Client) sendUp(ctx context.Context, sid [SIDLen]byte, secureKey [32]byt
 		binary.BigEndian.PutUint16(reqPlain[:2], uint16(len(p)))
 		copy(reqPlain[2:], p)
 		req := make([]byte, 1+SIDLen)
-		req[0] = OpUpSecure
+		req[0] = secureWireOp(OpUpSecure)
 		copy(req[1:], sid[:])
 		resp, err := c.exchangeSecure(ctx, req, secureKey, secureRequestAD(OpUpSecure, sid[:]), secureResponseAD(OpUpSecure, sid[:]), reqPlain, 1, nil)
 		if err != nil {
@@ -375,7 +377,7 @@ func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte,
 	var req []byte
 	if c.config.Secure {
 		req = make([]byte, 1+SIDLen)
-		req[0] = OpDownSecure
+		req[0] = secureWireOp(OpDownSecure)
 		copy(req[1:], sid[:])
 	} else {
 		req = make([]byte, 1+SIDLen+4+2+padLen)
@@ -490,7 +492,7 @@ func fillDownRequestPadding(p []byte, sid [SIDLen]byte) {
 func (c *Client) closeSession(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte) error {
 	if c.config.Secure {
 		req := make([]byte, 1+SIDLen)
-		req[0] = OpCloseSecure
+		req[0] = secureWireOp(OpCloseSecure)
 		copy(req[1:], sid[:])
 		resp, err := c.exchangeSecure(ctx, req, secureKey, secureRequestAD(OpCloseSecure, sid[:]), secureResponseAD(OpCloseSecure, sid[:]), nil, 1, nil)
 		if err != nil {
@@ -524,14 +526,17 @@ func (c *Client) exchangeSecure(ctx context.Context, prefix []byte, key [32]byte
 		return nil, err
 	}
 	defer conn.Close()
-	if _, err := conn.Write(prefix); err != nil {
-		return nil, err
-	}
+	var req bytes.Buffer
+	req.Grow(len(prefix) + secureNonceLen + 2 + len(reqPlain) + secureOverhead)
+	_, _ = req.Write(prefix)
 	if nonce != nil {
-		if err := writeSecureBodyWithNonce(conn, key, reqAD, nonce, reqPlain); err != nil {
+		if err := writeSecureBodyWithNonce(&req, key, reqAD, nonce, reqPlain); err != nil {
 			return nil, err
 		}
-	} else if _, err := writeSecureBody(conn, key, reqAD, reqPlain); err != nil {
+	} else if _, err := writeSecureBody(&req, key, reqAD, reqPlain); err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(req.Bytes()); err != nil {
 		return nil, err
 	}
 	applyDeadlineFromContext(conn, ctx)
@@ -1164,13 +1169,17 @@ func ProbePort(ctx context.Context, host string, port int, shortID [ShortIDLen]b
 	if err != nil {
 		return err
 	}
-	prefix := make([]byte, 1+ShortIDLen)
-	prefix[0] = OpOpenSecure
-	copy(prefix[1:], shortID[:])
-	if _, err := conn.Write(prefix); err != nil {
+	prefix := make([]byte, 1+ShortIDLen+1)
+	prefix[0] = secureWireOp(OpOpenSecure)
+	copy(prefix[1:1+ShortIDLen], shortID[:])
+	prefix[1+ShortIDLen] = secureOpenMarker
+	var req bytes.Buffer
+	req.Grow(len(prefix) + secureNonceLen + 2 + len(reqPlain) + secureOverhead)
+	_, _ = req.Write(prefix)
+	if err := writeSecureBodyWithNonce(&req, staticKey, secureRequestAD(OpOpenSecure, shortID[:]), nonce[:], reqPlain); err != nil {
 		return err
 	}
-	if err := writeSecureBodyWithNonce(conn, staticKey, secureRequestAD(OpOpenSecure, shortID[:]), nonce[:], reqPlain); err != nil {
+	if _, err := conn.Write(req.Bytes()); err != nil {
 		return err
 	}
 	resp, _, err := readSecureBody(conn, staticKey, secureResponseAD(OpOpenSecure, shortID[:]), 1+SIDLen)

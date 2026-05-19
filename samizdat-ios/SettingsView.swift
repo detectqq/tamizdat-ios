@@ -913,6 +913,7 @@ struct SettingsView: View {
 
     private func syncFragPoCConfigToAppRuntime() {
         SocksstubSetFragPoCConfig(FragPoCConfigStore.configBlob)
+        SocksstubSetFragPoCPorts(FragPoCPortConfigStore.effectiveActivePortsCSV)
     }
 
     /// Switches the FragPoC port mode. Commits any unsaved edits to the
@@ -952,8 +953,9 @@ struct SettingsView: View {
         smokeRunning = true
         syncFragPoCConfigToAppRuntime()
 
-        // Parse the active port list and seed every port as pending (yellow).
-        let ports = FragPoCPortConfigStore.activePorts
+        // Parse the effective endpoint port list and seed every port as pending
+        // (yellow). Custom fragpoc:// URIs override the legacy lab port mode.
+        let ports = FragPoCPortConfigStore.effectiveActivePorts
         smokeResults = ports.map { SmokePortResult(port: $0, status: .pending, ms: 0) }
 
         // Launch all probes concurrently. Each probe calls the per-port Go
@@ -1121,7 +1123,7 @@ struct SettingsView: View {
         guard !payloadRunning else { return }
         payloadRunning = true
         syncFragPoCConfigToAppRuntime()
-        let port = FragPoCPortConfigStore.activePorts.first ?? 443
+        let port = FragPoCPortConfigStore.effectiveActivePorts.first ?? 443
         payloadProgress = PayloadProgress(port: port)
 
         for size in stride(from: 10, through: 1500, by: 10) {
@@ -1290,8 +1292,8 @@ struct SettingsView: View {
         maxConnsRunning = true
         syncFragPoCConfigToAppRuntime()
 
-        let activePorts = FragPoCPortConfigStore.activePorts
-        let csv = FragPoCPortConfigStore.activePortsCSV
+        let activePorts = FragPoCPortConfigStore.effectiveActivePorts
+        let csv = FragPoCPortConfigStore.effectiveActivePortsCSV
         maxConnsProgress = MaxConnsProgress(
             ports: activePorts.map { MaxConnsPortRow(port: $0) }
         )
