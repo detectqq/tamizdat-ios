@@ -1011,7 +1011,14 @@ func currentFragPoCServerConfig() (*fragpocServerConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.Ports) == 0 {
+	if ports := configuredFragPoCPortList(); len(ports) > 0 {
+		// Settings "Port mode" is the authoritative client-side control for
+		// OpPortHint. The custom fragpoc:// URI selects endpoint/shortID/secure;
+		// the client still asks the server to open and probe the selected port
+		// list. If the URI base port is not already present, prepend it so the
+		// first control connection has a stable endpoint.
+		cfg.Ports = normalizeFragPoCPortsWithBase(cfg.ServerPort, ports)
+	} else if len(cfg.Ports) == 0 {
 		cfg.Ports = []int{cfg.ServerPort}
 	}
 	return cfg, nil
@@ -1175,10 +1182,8 @@ func SetFragPoCPorts(csv string) {
 // unset value falls back to the IPA-D37 hardcoded set (base 31503 + dynamic
 // pool 31510-31560). The returned slice always has at least one element.
 func fragpocPortList() []int {
-	if v := rt.fragpocPorts.Load(); v != nil {
-		if ports, ok := v.([]int); ok && len(ports) > 0 {
-			return ports
-		}
+	if ports := configuredFragPoCPortList(); len(ports) > 0 {
+		return ports
 	}
 	ports := make([]int, 0, 52)
 	ports = append(ports, 31503)
@@ -1186,6 +1191,15 @@ func fragpocPortList() []int {
 		ports = append(ports, p)
 	}
 	return ports
+}
+
+func configuredFragPoCPortList() []int {
+	if v := rt.fragpocPorts.Load(); v != nil {
+		if ports, ok := v.([]int); ok && len(ports) > 0 {
+			return append([]int(nil), ports...)
+		}
+	}
+	return nil
 }
 
 // ensurePortsHinted sends OpPortHint to the server with the given ports so

@@ -510,7 +510,7 @@ struct SettingsView: View {
                     Spacer()
                 }
 
-                TextField("fragpoc://<shortid>@ai-archive.ru:443?secure=1&ports=443", text: $fragPoCConfigDraft, axis: .vertical)
+                TextField("fragpoc://<shortid>@ai-archive.ru:31503?secure=1", text: $fragPoCConfigDraft, axis: .vertical)
                     .lineLimit(2...5)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
@@ -551,7 +551,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Leave empty for the built-in legacy endpoint. Put ports=443,80 in the URI when the edge only exposes public 80/443.")
+                Text("Leave empty for the built-in legacy endpoint. Port mode below controls which server ports are requested/opened and probed.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }
@@ -572,7 +572,7 @@ struct SettingsView: View {
                         Text("Port mode")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("Legacy/test port pool; custom URI ports= overrides this")
+                        Text("Client-requested server ports for open/probe tests")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
@@ -631,7 +631,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Legacy/test pool. Custom fragpoc:// without ports= uses only the URI port.")
+                Text("The client asks the server to open these ports, then probes them. Red can mean carrier/firewall/path block.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }
@@ -913,7 +913,7 @@ struct SettingsView: View {
 
     private func syncFragPoCConfigToAppRuntime() {
         SocksstubSetFragPoCConfig(FragPoCConfigStore.configBlob)
-        SocksstubSetFragPoCPorts(FragPoCPortConfigStore.effectiveActivePortsCSV)
+        SocksstubSetFragPoCPorts(FragPoCPortConfigStore.activePortsCSV)
     }
 
     /// Switches the FragPoC port mode. Commits any unsaved edits to the
@@ -953,9 +953,10 @@ struct SettingsView: View {
         smokeRunning = true
         syncFragPoCConfigToAppRuntime()
 
-        // Parse the effective endpoint port list and seed every port as pending
-        // (yellow). Custom fragpoc:// URIs override the legacy lab port mode.
-        let ports = FragPoCPortConfigStore.effectiveActivePorts
+        // Parse the client-controlled active port list and seed every port as
+        // pending (yellow). The Go side sends OpPortHint so the server opens
+        // these ports before probes run.
+        let ports = FragPoCPortConfigStore.activePorts
         smokeResults = ports.map { SmokePortResult(port: $0, status: .pending, ms: 0) }
 
         // Launch all probes concurrently. Each probe calls the per-port Go
@@ -1123,7 +1124,7 @@ struct SettingsView: View {
         guard !payloadRunning else { return }
         payloadRunning = true
         syncFragPoCConfigToAppRuntime()
-        let port = FragPoCPortConfigStore.effectiveActivePorts.first ?? 443
+        let port = FragPoCPortConfigStore.activePorts.first ?? 443
         payloadProgress = PayloadProgress(port: port)
 
         for size in stride(from: 10, through: 1500, by: 10) {
@@ -1292,8 +1293,8 @@ struct SettingsView: View {
         maxConnsRunning = true
         syncFragPoCConfigToAppRuntime()
 
-        let activePorts = FragPoCPortConfigStore.effectiveActivePorts
-        let csv = FragPoCPortConfigStore.effectiveActivePortsCSV
+        let activePorts = FragPoCPortConfigStore.activePorts
+        let csv = FragPoCPortConfigStore.activePortsCSV
         maxConnsProgress = MaxConnsProgress(
             ports: activePorts.map { MaxConnsPortRow(port: $0) }
         )

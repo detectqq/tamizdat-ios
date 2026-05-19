@@ -337,6 +337,46 @@ func TestFragPoCRuntimeConfigUsesCustomURI(t *testing.T) {
 	}
 }
 
+func TestFragPoCRuntimeConfigPrefersClientPortList(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	sid := strings.Repeat("b", 16)
+	SetFragPoCConfig("fragpoc://" + sid + "@ai-archive.ru:31503?secure=1&ports=443,80")
+	SetFragPoCPorts("31503,31510,31511")
+	cfg, err := currentFragPoCServerConfig()
+	if err != nil {
+		t.Fatalf("current config: %v", err)
+	}
+	want := []int{31503, 31510, 31511}
+	if len(cfg.Ports) != len(want) {
+		t.Fatalf("ports = %v, want %v", cfg.Ports, want)
+	}
+	for i := range want {
+		if cfg.Ports[i] != want[i] {
+			t.Fatalf("ports = %v, want %v", cfg.Ports, want)
+		}
+	}
+}
+
+func TestFragPoCRuntimeConfigPrependsURIBaseToClientPortList(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	sid := strings.Repeat("b", 16)
+	SetFragPoCConfig("fragpoc://" + sid + "@ai-archive.ru:31503?secure=1")
+	SetFragPoCPorts("31510,31511")
+	cfg, err := currentFragPoCServerConfig()
+	if err != nil {
+		t.Fatalf("current config: %v", err)
+	}
+	want := []int{31503, 31510, 31511}
+	if len(cfg.Ports) != len(want) {
+		t.Fatalf("ports = %v, want %v", cfg.Ports, want)
+	}
+	for i := range want {
+		if cfg.Ports[i] != want[i] {
+			t.Fatalf("ports = %v, want %v", cfg.Ports, want)
+		}
+	}
+}
+
 // TestConcurrentDials covers a small fan-out so we know the listener and
 // per-connection goroutines do not deadlock under concurrency.
 func TestConcurrentDials(t *testing.T) {
