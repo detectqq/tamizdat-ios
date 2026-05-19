@@ -12,7 +12,7 @@ import Foundation
 enum PingURLPreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let key = "tamizdat.pingProbeURL"
-    static let defaultURL = "http://www.gstatic.com/generate_204"
+    static let defaultURL = "https://ya.ru"
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)

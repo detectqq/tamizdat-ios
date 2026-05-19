@@ -25,8 +25,8 @@ enum WhitelistProbePreferences {
 
     static let defaultTestHost = "8.8.8.8"
     static let defaultWhitelistHost = "77.88.8.8"
-    static let defaultSuccessesNeeded = 2
-    static let defaultProbeInterval = 3
+    static let defaultSuccessesNeeded = 6
+    static let defaultProbeInterval = 1
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
