@@ -266,7 +266,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         autoRewireBridge = nil
         whitelistDetector?.stop()
         whitelistDetector = nil
-        WhitelistStatusStore.reset()
+        // D61 FIX: do NOT call WhitelistStatusStore.reset() here.
+        // reset() wipes activeEndpoint → defaults to .primary → Mode
+        // tile flips from "Whitelist" to "Main" on every disconnect,
+        // even though the network is still whitelist-filtered. The
+        // main-app WhitelistMonitor resumes on disconnect and writes
+        // fresh values; the 200s stale-check handles truly stale data.
         pathMonitor.cancel()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
