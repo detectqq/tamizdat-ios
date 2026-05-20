@@ -19,11 +19,15 @@ const (
 
 	SIDLen          = 12
 	ShortIDLen      = 8
+	// MaxPayload is the hard protocol ceiling. The iOS LTE profile below uses a
+	// smaller default (DefaultMaxPayload) so fresh short-TCP replies stay below
+	// carrier paths that blackhole >~256B downstream payloads.
 	MaxPayload      = 480
+	DefaultMaxPayload = 220
 	MaxUpPayload    = 640 // UP payload ceiling; client sends randomised <=620-byte chunks
 	DownRequestSize = 500
-	DefaultWorkers  = 120
-	MaxWorkers      = 200
+	DefaultWorkers  = 96
+	MaxWorkers      = 120
 
 	UDPDestinationPrefix = "udp:"
 
@@ -42,7 +46,7 @@ type DialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 
 func maxPayload(n int) int {
 	if n <= 0 || n > MaxPayload {
-		return MaxPayload
+		return DefaultMaxPayload
 	}
 	return n
 }
@@ -91,7 +95,10 @@ func downWindowCount(workers int) int {
 	if workers <= 16 {
 		return 4
 	}
-	return 6
+	if workers <= 48 {
+		return 16
+	}
+	return 48
 }
 
 func connectTimeout(d time.Duration) time.Duration {

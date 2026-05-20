@@ -109,12 +109,13 @@ func (c *fragpocUpstreamClient) RTTProbeSnapshot() samizdat.RTTProbeStats {
 	return samizdat.RTTProbeStats{LiteP50Ms: -1, BulkP50Ms: -1, LastMs: -1}
 }
 
-// DialUDP overrides the embedded Client.DialUDP to gate on the runtime
-// UDP toggle. When UDP is disabled, returns an error so hev drops the
-// flow — DNS falls back to the system resolver, QUIC downgrades to TCP.
+// DialUDP overrides the embedded Client.DialUDP to gate on the runtime UDP
+// toggle. In the default emergency LTE profile, non-DNS UDP is refused so QUIC
+// and background chatter cannot burn scarce FragPoC short-TCP operation slots;
+// UDP :53 is still allowed so full-tunnel DNS does not fail closed.
 func (c *fragpocUpstreamClient) DialUDP(ctx context.Context, addr string) (net.PacketConn, error) {
-	if !fragpocUDPEnabled() {
-		return nil, errors.New("fragpoc: UDP forwarding disabled")
+	if !fragpocUDPAllowed(addr) {
+		return nil, errors.New("fragpoc: UDP forwarding disabled except DNS")
 	}
 	return c.Client.DialUDP(ctx, addr)
 }
@@ -179,8 +180,9 @@ type runtimeState struct {
 var rt = &runtimeState{logsMax: 500}
 
 func init() {
-	// Default: UDP forwarding enabled.
-	rt.fragpocUDP.Store(true)
+	// Default emergency LTE profile: DNS-only UDP. SetFragPoCUDP(true) enables
+	// full UDP forwarding explicitly; false still allows UDP :53.
+	rt.fragpocUDP.Store(false)
 }
 
 // flowState is registered for every active SOCKS5 flow. The registry
@@ -476,6 +478,8 @@ func SetSamizdatConfig(blob string) error {
 			ServerAddr:      fpServerAddr,
 			ShortID:         fpCfg.ShortID,
 			Secure:          fpCfg.Secure,
+			MaxPayload:      fragpoc.DefaultMaxPayload,
+			Workers:         fragpoc.DefaultWorkers,
 			DynamicPortPool: fpPool,
 			MetricsLog: func(line string) {
 				rt.appendLog(line)
@@ -950,18 +954,27 @@ func SetTransport(t string) {
 	rt.appendLog(fmt.Sprintf("info: transport = %s (next client build will use this)", transport))
 }
 
-// SetFragPoCUDP enables or disables UDP forwarding through the FragPoC
-// transport. When disabled, DialUDP on the FragPoC client returns an error
-// so hev falls back to the system resolver for DNS and QUIC downgrades to
-// TCP. Default: true (UDP forwarding is on). Takes effect immediately —
-// no reconnect needed. Exported for gomobile as SocksstubSetFragPoCUDP.
+// SetFragPoCUDP enables or disables full UDP forwarding through the FragPoC
+// transport. When disabled, DNS UDP (:53) is still forwarded but non-DNS UDP is
+// refused, forcing QUIC/realtime/background UDP to fall back or drop instead of
+// consuming the emergency short-TCP budget. Default: false (DNS-only). Takes
+// effect immediately — no reconnect needed. Exported for gomobile as
+// SocksstubSetFragPoCUDP.
 func SetFragPoCUDP(enabled bool) {
 	rt.fragpocUDP.Store(enabled)
-	rt.appendLog(fmt.Sprintf("info: fragpoc UDP = %v", enabled))
+	if enabled {
+		rt.appendLog("info: fragpoc UDP = full")
+	} else {
+		rt.appendLog("info: fragpoc UDP = DNS-only")
+	}
 }
 
-func fragpocUDPEnabled() bool {
-	return rt.fragpocUDP.Load()
+func fragpocUDPAllowed(addr string) bool {
+	if rt.fragpocUDP.Load() {
+		return true
+	}
+	_, port, err := net.SplitHostPort(addr)
+	return err == nil && port == "53"
 }
 
 func currentTransport() string {

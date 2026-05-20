@@ -475,15 +475,14 @@ func (c *Client) down(ctx context.Context, sid [SIDLen]byte, secureKey [32]byte,
 
 // downRequestPadMin and downRequestPadMax bound the randomised DOWN poll
 // request padding. The DOWN poll is the highest-frequency FragPoC op and its
-// request was a fixed size — the protocol's strongest size fingerprint.
-// Randomising the pad length per request breaks that signature. The max
-// keeps the secure request plaintext (6 + padLen) within the server's
-// DownRequestSize acceptance ceiling, so this needs no server-side change:
-// the server reads the pad length from the frame and skips exactly that many
-// bytes.
+// request used to be a large fixed-size fingerprint. On the restricted
+// iPhone/LTE hotspot profile from 2026-05-20, however, even moderately large
+// client request payloads caused retransmit/ACK trouble. Keep a tiny jittered
+// pad instead: enough to avoid a single exact length, but small enough that
+// secure DOWN polls stay below ~100 bytes on the wire.
 const (
-	downRequestPadMin = 128
-	downRequestPadMax = 480
+	downRequestPadMin = 0
+	downRequestPadMax = 48
 )
 
 // downRequestPaddingLen returns a random padding length for a DOWN poll

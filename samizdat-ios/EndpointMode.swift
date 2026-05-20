@@ -110,10 +110,9 @@ enum FragPoCConfigStore {
 
 }
 
-/// FragPoC UDP toggle. When disabled, the FragPoC transport drops all UDP
-/// flows (DNS, QUIC, etc.) instead of tunnelling them over TCP. Useful to
-/// reduce op-token pressure — DNS falls back to the system resolver and
-/// QUIC downgrades to HTTP/2 through the TCP tunnel.
+/// FragPoC UDP toggle. When disabled, FragPoC runs in DNS-only UDP mode:
+/// UDP :53 is still tunnelled so full-tunnel DNS keeps working, while QUIC
+/// and other background UDP are refused to reduce op-token pressure.
 enum FragPoCUDPStore {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let key = "fragpocUDPEnabled"
@@ -122,9 +121,10 @@ enum FragPoCUDPStore {
         UserDefaults(suiteName: appGroupID)
     }
 
-    /// Defaults to true — UDP forwarding is on unless explicitly disabled.
+    /// Defaults to false — emergency LTE profile is DNS-only UDP unless the
+    /// operator explicitly enables full UDP forwarding.
     static var enabled: Bool {
-        get { defaults?.bool(forKey: key) ?? true }
+        get { defaults?.bool(forKey: key) ?? false }
         set { defaults?.set(newValue, forKey: key) }
     }
 }
