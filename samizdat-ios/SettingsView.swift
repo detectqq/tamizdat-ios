@@ -41,6 +41,9 @@ struct SettingsView: View {
     // either the full URL or just the hash into this field. The hash is
     // persisted in App Group UserDefaults so the NE can also see it.
     @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
+    @State private var vkPeerAddrDraft: String = VKCredsPreferences.peerAddr
+    @State private var vkConnectPasswordDraft: String = VKCredsPreferences.connectPassword
+    @State private var endpointTurnMode: EndpointTurnMode = EndpointTurnMode.current
     @State private var vkCallHashFeedback: String = ""
 
     // IPA-D23: whitelist-detection probe targets.
@@ -235,6 +238,51 @@ struct SettingsView: View {
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
 
+                Text("Сервер (peer)")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("46.8.19.173:5000", text: $vkPeerAddrDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveVKTurnPreferences() }
+                    .onChange(of: vkPeerAddrDraft) { _, _ in saveVKTurnPreferences() }
+
+                Text("Пароль подключения")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                SecureField("wgturn server password", text: $vkConnectPasswordDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveVKTurnPreferences() }
+                    .onChange(of: vkConnectPasswordDraft) { _, _ in saveVKTurnPreferences() }
+
+                HStack(spacing: 10) {
+                    Text("TURN upstream:")
+                        .font(.geist(.medium, size: 12))
+                        .foregroundStyle(theme.textMuted)
+                    Picker("TURN upstream", selection: $endpointTurnMode) {
+                        Text("Off").tag(EndpointTurnMode.off)
+                        Text("VK").tag(EndpointTurnMode.vk)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: endpointTurnMode) { _, newValue in
+                        EndpointTurnMode.current = newValue
+                    }
+                }
+
                 if !vkCallHashFeedback.isEmpty {
                     Text(vkCallHashFeedback)
                         .font(.geistMono(.regular, size: 11))
@@ -296,7 +344,18 @@ struct SettingsView: View {
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    private func saveVKTurnPreferences() {
+        let peer = vkPeerAddrDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        VKCredsPreferences.peerAddr = peer
+        VKCredsPreferences.connectPassword = vkConnectPasswordDraft
+        EndpointTurnMode.current = endpointTurnMode
+        if vkPeerAddrDraft != peer {
+            vkPeerAddrDraft = peer
+        }
+    }
+
     private func saveVKHash() {
+        saveVKTurnPreferences()
         let hash = Self.normalizeVKHash(vkCallHashDraft)
         guard !hash.isEmpty else {
             vkCallHashFeedback = "Хеш пуст"

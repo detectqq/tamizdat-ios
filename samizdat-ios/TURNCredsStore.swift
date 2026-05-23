@@ -43,6 +43,32 @@ struct VKTURNCredentials: Codable, Equatable {
     }
 }
 
+func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
+    struct LogShape: Encodable {
+        let username: String
+        let password: String
+        let turn_servers: [String]
+        let lifetime_sec: Int
+    }
+
+    let shape = LogShape(
+        username: creds.username,
+        password: creds.password,
+        turn_servers: creds.turnURLs,
+        lifetime_sec: Int(creds.lifetime)
+    )
+
+    do {
+        let data = try JSONEncoder().encode(shape)
+        guard let json = String(data: data, encoding: .utf8) else {
+            return "<encode-failed: non-utf8 JSON>"
+        }
+        return json
+    } catch {
+        return "<encode-failed: \(error)>"
+    }
+}
+
 /// Singleton helper around the App Group UserDefaults.
 ///
 /// Concurrency: UserDefaults is itself thread-safe and we only do
@@ -159,6 +185,8 @@ enum VKCredsPreferences {
     private static let primaryHashKey = "tamizdat.vkCallHash"
     private static let secondaryHashKey = "tamizdat.vkCallHashSecondary"
     private static let deviceIDKey = "tamizdat.vkDeviceID"
+    private static let peerAddrKey = "tamizdat.vkPeerAddr"
+    private static let connectPasswordKey = "tamizdat.vkConnectPassword"
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
@@ -177,6 +205,16 @@ enum VKCredsPreferences {
         set { defaults?.set(newValue ?? "", forKey: secondaryHashKey) }
     }
 
+    static var peerAddr: String {
+        get { defaults?.string(forKey: peerAddrKey) ?? "" }
+        set { defaults?.set(newValue, forKey: peerAddrKey) }
+    }
+
+    static var connectPassword: String {
+        get { defaults?.string(forKey: connectPasswordKey) ?? "" }
+        set { defaults?.set(newValue, forKey: connectPasswordKey) }
+    }
+
     /// Stable per-install UUID — lazy-initialised on first read so the
     /// extension and the main app see the same value through the App
     /// Group store.
@@ -193,6 +231,32 @@ enum VKCredsPreferences {
     /// otherwise.
     static var isConfigured: Bool {
         !primaryCallHash.isEmpty
+    }
+}
+
+enum EndpointTurnMode: String, CaseIterable, Identifiable {
+    case off
+    case vk
+
+    var id: String { rawValue }
+
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let key = "tamizdat.endpointTurnMode"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    static var current: EndpointTurnMode {
+        get {
+            guard let raw = defaults?.string(forKey: key),
+                  let mode = EndpointTurnMode(rawValue: raw)
+            else { return .off }
+            return mode
+        }
+        set {
+            defaults?.set(newValue.rawValue, forKey: key)
+        }
     }
 }
 
