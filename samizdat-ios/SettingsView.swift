@@ -35,6 +35,14 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
 
+    // VK TURN call-hash field. The hash is the slug after `/join/` in a
+    // VK call invite URL (e.g. `https://vk.ru/call/join/<HASH>`). The
+    // user creates a group call in VK, copies the invite link, pastes
+    // either the full URL or just the hash into this field. The hash is
+    // persisted in App Group UserDefaults so the NE can also see it.
+    @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
+    @State private var vkCallHashFeedback: String = ""
+
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
@@ -85,6 +93,12 @@ struct SettingsView: View {
                         SectionLabel(text: "Configuration")
                             .padding(.top, 22)
                         configurationCard
+                            .padding(.horizontal, 16)
+
+                        // ── VK TURN ──────────────────────────────
+                        SectionLabel(text: "VK TURN")
+                            .padding(.top, 22)
+                        vkTurnCard
                             .padding(.horizontal, 16)
 
                         // ── Ping probe ───────────────────────────
@@ -180,6 +194,111 @@ struct SettingsView: View {
                 .onTapGesture { openSystemSettings() }
             }
         }
+    }
+
+    // VK TURN card: lets the operator paste a VK call-invite hash. The
+    // hash is required by VKCredsClient / TURNCredsRefresher to begin
+    // the 5-step VK API flow; if it is empty, refresh silently no-ops.
+    //
+    // To obtain a hash: open VK in a browser or app, create a group call,
+    // copy the invitation link (https://vk.ru/call/join/<HASH>) and paste
+    // either the full URL or just the slug here.
+    //
+    // Donor caveat (amurcanov/proxy-turn-vk-android README): when leaving
+    // the call, choose "just leave" — not "end for everyone" — otherwise
+    // the hash dies and refresh starts failing with VKCredsError.deadHash.
+    private var vkTurnCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "phone.connection",
+                             bg: theme.mintDim, fg: theme.mint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Call invite hash")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("VK → group → call → invite link → slug after /join/")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                TextField("https://vk.ru/call/join/...", text: $vkCallHashDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { saveVKHash() }
+
+                if !vkCallHashFeedback.isEmpty {
+                    Text(vkCallHashFeedback)
+                        .font(.geistMono(.regular, size: 11))
+                        .foregroundStyle(theme.textDim)
+                }
+
+                HStack(spacing: 8) {
+                    Button(action: saveVKHash) {
+                        Text("Save & refresh")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: clearVKHash) {
+                        Text("Clear")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    /// Strip wrapping whitespace and (if present) the `/call/join/`
+    /// prefix so the user can paste either a full invite URL or a bare
+    /// hash. Trailing query / fragment is dropped as well.
+    private static func normalizeVKHash(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let range = s.range(of: "/call/join/") {
+            s = String(s[range.upperBound...])
+        }
+        if let q = s.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            s = String(s[..<q])
+        }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func saveVKHash() {
+        let hash = Self.normalizeVKHash(vkCallHashDraft)
+        guard !hash.isEmpty else {
+            vkCallHashFeedback = "Хеш пуст"
+            return
+        }
+        VKCredsPreferences.primaryCallHash = hash
+        vkCallHashDraft = hash
+        vkCallHashFeedback = "Сохранено: \(hash). Запускаю обновление..."
+        TURNCredsRefresher.shared.forceRefresh()
+    }
+
+    private func clearVKHash() {
+        VKCredsPreferences.primaryCallHash = ""
+        vkCallHashDraft = ""
+        vkCallHashFeedback = "Очищено"
+        TURNCredsStore.shared.clear()
     }
 
     private var configurationCard: some View {
