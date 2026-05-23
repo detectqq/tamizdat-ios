@@ -234,7 +234,6 @@ struct SettingsView: View {
                     .padding(.vertical, 11)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { saveVKHash() }
 
                 if !vkCallHashFeedback.isEmpty {
                     Text(vkCallHashFeedback)

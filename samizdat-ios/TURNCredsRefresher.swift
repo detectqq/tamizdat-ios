@@ -41,6 +41,10 @@ final class TURNCredsRefresher: ObservableObject {
     /// quick succession.
     private var inFlight: Task<Void, Never>?
 
+    /// Last successful App Group credentials write in this process.
+    /// Used to debounce accidental immediate `forceRefresh` replays.
+    private var lastSaveAt: Date?
+
     /// Manual-fallback handoff: when the auto solver throws
     /// `.sliderRequired`, we open the sheet and `await` this
     /// continuation. The sheet calls `resolveManual(token:)` to
@@ -80,6 +84,11 @@ final class TURNCredsRefresher: ObservableObject {
     /// for "Refresh now" UI affordances; currently unused but kept
     /// public so a future Settings row can call it.
     func forceRefresh() {
+        if let elapsedMs = millisecondsSinceLastSave,
+           elapsedMs < Int(Self.forceRefreshDebounceAfterSave * 1000) {
+            TURNLog.warn("turncreds", "forceRefresh debounced (\(elapsedMs) ms since last save)")
+            return
+        }
         TURNLog.info("turncreds", "forceRefresh called")
         guard !isRefreshing else {
             TURNLog.warn("turncreds", "forceRefresh: skipped — isRefreshing is true")
@@ -117,6 +126,16 @@ final class TURNCredsRefresher: ObservableObject {
     /// Sized generously: per-request timeout is 20s, max 5 retries +
     /// up to 45s captcha solve = ~145s worst case. 180s gives slack.
     private static let watchdogTimeout: TimeInterval = 180
+
+    /// Belt-and-suspenders guard: after a successful save, any
+    /// `forceRefresh` replay within this window is programmatic noise
+    /// (not a human tap) and would burn another VK captcha session.
+    private static let forceRefreshDebounceAfterSave: TimeInterval = 2
+
+    private var millisecondsSinceLastSave: Int? {
+        guard let lastSaveAt else { return nil }
+        return Int(Date().timeIntervalSince(lastSaveAt) * 1000)
+    }
 
     private func startRefresh() {
         inFlight?.cancel()
@@ -160,6 +179,7 @@ final class TURNCredsRefresher: ObservableObject {
                 }
                 TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
+                self.lastSaveAt = Date()
                 self.lastError = nil
             } catch {
                 let msg: String
