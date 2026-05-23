@@ -60,9 +60,19 @@ final class TURNCredsRefresher: ObservableObject {
     /// on scenePhase.active. Idempotent — if a refresh is in progress
     /// or creds are still fresh, this returns immediately.
     func refreshIfNeeded() {
-        guard !isRefreshing else { return }
-        guard VKCredsPreferences.isConfigured else { return }
-        guard TURNCredsStore.shared.needsRefresh else { return }
+        TURNLog.info("turncreds", "refreshIfNeeded called")
+        guard !isRefreshing else {
+            TURNLog.warn("turncreds", "refreshIfNeeded: skipped — isRefreshing is true")
+            return
+        }
+        guard VKCredsPreferences.isConfigured else {
+            TURNLog.warn("turncreds", "refreshIfNeeded: skipped — isConfigured is false")
+            return
+        }
+        guard TURNCredsStore.shared.needsRefresh else {
+            TURNLog.warn("turncreds", "refreshIfNeeded: skipped — needsRefresh is false")
+            return
+        }
         startRefresh()
     }
 
@@ -70,14 +80,22 @@ final class TURNCredsRefresher: ObservableObject {
     /// for "Refresh now" UI affordances; currently unused but kept
     /// public so a future Settings row can call it.
     func forceRefresh() {
-        guard !isRefreshing else { return }
-        guard VKCredsPreferences.isConfigured else { return }
+        TURNLog.info("turncreds", "forceRefresh called")
+        guard !isRefreshing else {
+            TURNLog.warn("turncreds", "forceRefresh: skipped — isRefreshing is true")
+            return
+        }
+        guard VKCredsPreferences.isConfigured else {
+            TURNLog.warn("turncreds", "forceRefresh: skipped — isConfigured is false")
+            return
+        }
         startRefresh()
     }
 
     /// Called by `ManualCaptchaSheet.onSuccess` — hands the user-
     /// solved token back to the in-flight refresh task.
     func resolveManual(token: String) {
+        TURNLog.info("turncreds", "manual token resolved (length=\(token.count))")
         manualChallenge = nil
         manualContinuation?.resume(returning: token)
         manualContinuation = nil
@@ -85,6 +103,7 @@ final class TURNCredsRefresher: ObservableObject {
 
     /// Called by `ManualCaptchaSheet.onCancel` — aborts the refresh.
     func cancelManual() {
+        TURNLog.warn("turncreds", "manual captcha cancelled by user")
         manualChallenge = nil
         manualContinuation?.resume(throwing: CaptchaError.cancelled)
         manualContinuation = nil
@@ -96,6 +115,7 @@ final class TURNCredsRefresher: ObservableObject {
         inFlight?.cancel()
         isRefreshing = true
         lastError = nil
+        TURNLog.info("turncreds", "starting refresh task")
 
         inFlight = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -109,9 +129,12 @@ final class TURNCredsRefresher: ObservableObject {
                     secondaryHash: VKCredsPreferences.secondaryCallHash,
                     deviceID: VKCredsPreferences.deviceID
                 )
+                let hashPrefix = String(VKCredsPreferences.primaryCallHash.prefix(8))
+                TURNLog.info("turncreds", "config built (hash=\(hashPrefix)...)")
                 let client = VKCredsClient(config: config,
                                             captchaSolver: ChainedCaptchaSolver(refresher: self))
                 let creds = try await client.fetchCredentials()
+                TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
                 self.lastError = nil
             } catch {
@@ -123,6 +146,7 @@ final class TURNCredsRefresher: ObservableObject {
                 } else {
                     msg = error.localizedDescription
                 }
+                TURNLog.error("turncreds", "refresh failed: \(msg)")
                 self.lastError = msg
             }
         }
@@ -132,7 +156,8 @@ final class TURNCredsRefresher: ObservableObject {
     /// (or cancels). Called by `ChainedCaptchaSolver` below when the
     /// auto solver bails with `.sliderRequired`.
     fileprivate func awaitManual(redirectURI: URL, sessionToken: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+        TURNLog.info("turncreds", "manual captcha requested (host=\(redirectURI.host ?? "<unknown>"))")
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             self.manualContinuation = cont
             self.manualChallenge = ManualChallenge(
                 redirectURI: redirectURI,

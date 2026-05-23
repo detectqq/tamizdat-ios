@@ -137,6 +137,7 @@ actor CaptchaWebViewManager {
         inFlight = true
         defer { inFlight = false }
 
+        TURNLog.info("captcha", "auto-solve started (host=\(redirectURI.host ?? "<unknown>"))")
         let token = sessionToken.isEmpty ? "<empty>" : "\(sessionToken.prefix(8))..."
         log.info("solve start: redirect=\(redirectURI.absoluteString, privacy: .public) session=\(token, privacy: .public)")
 
@@ -155,11 +156,22 @@ actor CaptchaWebViewManager {
                 return first
             }
             log.info("solve ok: token=\(result.count, privacy: .public)chars")
+            TURNLog.info("captcha", "success_token received (length=\(result.count))")
             return result
+        } catch CaptchaError.timeout {
+            TURNLog.error("captcha", "auto-solve timed out")
+            log.error("solve failed: \(CaptchaError.timeout.localizedDescription, privacy: .public)")
+            throw CaptchaError.timeout
+        } catch CaptchaError.sliderRequired {
+            TURNLog.warn("captcha", "slider detected, falling back to manual")
+            log.error("solve failed: \(CaptchaError.sliderRequired.localizedDescription, privacy: .public)")
+            throw CaptchaError.sliderRequired
         } catch let err as CaptchaError {
+            TURNLog.error("captcha", "auto-solve failed: \(err.localizedDescription)")
             log.error("solve failed: \(err.localizedDescription, privacy: .public)")
             throw err
         } catch {
+            TURNLog.error("captcha", "auto-solve failed: \(error.localizedDescription)")
             log.error("solve failed: \(error.localizedDescription, privacy: .public)")
             throw error
         }
@@ -220,6 +232,7 @@ private final class SolveSession {
         let chrome = Self.pick(from: CaptchaWebViewManager.chromeBuilds)
         let userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(chrome) Safari/537.36"
         log.info("fingerprint: \(Int(vw))x\(Int(vh)), Chrome/\(chrome, privacy: .public)")
+        TURNLog.info("captcha", "fingerprint: Chrome/\(chrome), viewport \(Int(vw))x\(Int(vh))")
 
         // Wire WKWebView config: data store is non-persistent so the
         // captcha solve leaves no cookies / storage on the device, and
@@ -314,6 +327,7 @@ private final class SolveSession {
             return
         }
         log.info("captcha page loaded; scheduling click")
+        TURNLog.info("captcha", "page loaded, waiting human-read delay")
         onStep?("Решаем капчу...")
 
         // 2.5-3.5 s "page read" before we even look at the DOM —
@@ -392,6 +406,7 @@ private final class SolveSession {
             let randX = left + width * (0.15 + Double.random(in: 0...0.7))
             let randY = top + height * (0.25 + Double.random(in: 0...0.5))
             self.log.info("click at (\(Int(randX)), \(Int(randY))) inside \(Int(width))x\(Int(height))")
+            TURNLog.info("captcha", "checkbox located at \(Int(randX)),\(Int(randY))")
 
             let thinkDelay = Double.random(in: CaptchaWebViewManager.thinkBeforeClickRange)
             onStep?("Кликаем...")
@@ -494,8 +509,11 @@ private final class SolveSession {
             guard let self else { return }
             if let error {
                 self.log.error("touch dispatch failed: \(error.localizedDescription, privacy: .public)")
+                TURNLog.error("captcha", "touch dispatch failed: \(error.localizedDescription)")
             } else {
-                self.log.info("touch dispatched: \((value as? String) ?? "?", privacy: .public)")
+                let result = (value as? String) ?? "?"
+                self.log.info("touch dispatched: \(result, privacy: .public)")
+                TURNLog.info("captcha", "touch dispatched, awaiting interceptor")
             }
         }
     }

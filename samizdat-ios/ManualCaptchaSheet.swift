@@ -97,6 +97,7 @@ struct ManualCaptchaSheet: View {
         }
         .preferredColorScheme(.dark)
         .onAppear {
+            TURNLog.info("captcha", "manual sheet presented")
             startTimeout()
         }
         .interactiveDismissDisabled(false)
@@ -109,6 +110,7 @@ struct ManualCaptchaSheet: View {
         switch event {
         case .success(let token):
             log.info("manual solve success (\(token.count) chars)")
+            TURNLog.info("captcha", "manual token captured (length=\(token.count))")
             hasResolved = true
             onSuccess(token)
             dismiss()
@@ -125,6 +127,7 @@ struct ManualCaptchaSheet: View {
         guard !hasResolved else { return }
         hasResolved = true
         log.info("manual cancelled by user")
+        TURNLog.warn("captcha", "manual sheet cancelled")
         onCancel()
         dismiss()
     }
@@ -135,6 +138,7 @@ struct ManualCaptchaSheet: View {
             guard !hasResolved else { return }
             hasResolved = true
             log.info("manual timeout (60s)")
+            TURNLog.warn("captcha", "manual sheet timed out")
             errorMessage = "Таймаут ввода капчи. Попробуйте ещё раз."
             // After 2 s for the user to read, cancel.
             try? await Task.sleep(nanoseconds: 2_000_000_000)

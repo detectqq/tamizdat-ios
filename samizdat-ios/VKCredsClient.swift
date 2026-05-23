@@ -206,9 +206,12 @@ actor VKCredsClient {
     /// configured `callHash` (and fall back once to `secondaryHash` if
     /// the primary returns dead-hash). Returns fully-populated creds.
     func fetchCredentials() async throws -> VKTURNCredentials {
+        let hashPrefix = String(config.callHash.prefix(8))
+        TURNLog.info("vkcreds", "fetchCredentials: starting (hash=\(hashPrefix)...)")
         do {
             return try await runWithRetries(hash: config.callHash)
         } catch VKCredsError.deadHash {
+            TURNLog.error("vkcreds", "fetchCredentials: primary hash is dead (hash=\(hashPrefix)...)")
             if let secondary = config.secondaryHash, !secondary.isEmpty {
                 log.warning("primary hash dead — trying secondary")
                 return try await runWithRetries(hash: secondary, maxAttempts: max(1, config.maxRetries - 2))
@@ -232,6 +235,7 @@ actor VKCredsClient {
                 lastError = error
                 let backoff = Self.backoff(for: error, attempt: attempt)
                 log.warning("attempt \(attempt + 1)/\(attempts) failed: \(error.localizedDescription, privacy: .public) — backoff \(backoff, format: .fixed(precision: 2))s")
+                TURNLog.info("vkcreds", "retry attempt \(attempt + 1)/\(attempts) after backoff \(String(format: "%.1f", backoff))s")
                 if attempt < attempts - 1 {
                     try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
                 }
@@ -260,6 +264,7 @@ actor VKCredsClient {
     /// outer retry loop decides whether to retry or bail.
     private func runOnce(hash: String) async throws -> VKTURNCredentials {
         // Step 1 — anonymous app token (seed for step 2)
+        TURNLog.info("vkcreds", "step 1: getAnonymToken (seed)")
         let step1 = "client_secret=\(config.appSecret)&client_id=\(config.appID)" +
                     "&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous" +
                     "&isApiOauthAnonymEnabled=false&version=1&app_id=\(config.appID)"
@@ -267,17 +272,21 @@ actor VKCredsClient {
                                      step: "1.getAnonymToken")
         try Self.assertNoError(r1, step: "1")
         let t1: String = try Self.requireString(r1, path: ["data", "access_token"], step: "1")
+        TURNLog.info("vkcreds", "step 1 ok")
 
         // Step 2 — payload-bound anon token (the one with messages
         // scope) — fed into step 3.
+        TURNLog.info("vkcreds", "step 2: getAnonymToken (payload-bound)")
         let step2 = "client_id=\(config.appID)&token_type=messages&payload=\(t1)" +
                     "&client_secret=\(config.appSecret)&version=1&app_id=\(config.appID)"
         let r2 = try await postJSON(step2, to: "https://login.vk.ru/?act=get_anonym_token",
                                      step: "2.getAnonymToken")
         try Self.assertNoError(r2, step: "2")
         let t3: String = try Self.requireString(r2, path: ["data", "access_token"], step: "2")
+        TURNLog.info("vkcreds", "step 2 ok")
 
         // Step 3 — getAnonymousToken; the captcha-prone step.
+        TURNLog.info("vkcreds", "step 3: getAnonymousToken (captcha-prone)")
         let nameEnc = Self.urlEncoded(config.profileName)
         let step3Base = "vk_join_link=https://vk.com/call/join/\(hash)" +
                         "&name=\(nameEnc)&access_token=\(t3)"
@@ -287,12 +296,16 @@ actor VKCredsClient {
 
         if let errBlock = r3["error"] as? [String: Any] {
             let code = Int((errBlock["error_code"] as? Double) ?? -1)
-            if code == 9000 || (errBlock["error_msg"] as? String ?? "").lowercased().contains("call not found") {
+            let errMsg = errBlock["error_msg"] as? String ?? ""
+            if code == 9000 || errMsg.lowercased().contains("call not found") {
+                TURNLog.error("vkcreds", "step 3: dead hash (code=\(code))")
                 throw VKCredsError.deadHash
             }
+            TURNLog.warn("vkcreds", "step 3: VK error error_code=\(code) error_msg=\(errMsg)")
             guard let challenge = VKCaptchaChallenge.decode(from: errBlock) else {
                 throw VKCredsError.vkError(step: "3", payload: errBlock)
             }
+            TURNLog.warn("vkcreds", "step 3: captcha required at step 3, dispatching to solver")
             log.info("captcha challenge sid=\(challenge.captchaSid, privacy: .public) ts=\(challenge.captchaTs, privacy: .public)")
             let successToken: String
             do {
@@ -304,6 +317,7 @@ actor VKCredsClient {
                 throw VKCredsError.captchaFailed(underlying: error)
             }
             // Re-issue step 3 with the success_token + captcha_sid.
+            TURNLog.info("vkcreds", "step 3-retry: reissuing with captcha solution")
             let attempt = challenge.captchaAttempt.isEmpty || challenge.captchaAttempt == "0"
                 ? "1" : challenge.captchaAttempt
             let tokEnc = Self.urlEncoded(successToken)
@@ -315,6 +329,8 @@ actor VKCredsClient {
                                      step: "3-retry.getAnonymousToken")
             if let errBlock2 = r3["error"] as? [String: Any] {
                 let code2 = Int((errBlock2["error_code"] as? Double) ?? -1)
+                let errMsg2 = errBlock2["error_msg"] as? String ?? ""
+                TURNLog.warn("vkcreds", "step 3-retry: VK error error_code=\(code2) error_msg=\(errMsg2)")
                 if code2 == 14 {
                     log.warning("VK still demands captcha after a successful solve — backing off")
                     try? await Task.sleep(nanoseconds: 30_000_000_000)
@@ -322,10 +338,14 @@ actor VKCredsClient {
                 }
                 throw VKCredsError.vkError(step: "3-retry", payload: errBlock2)
             }
+            TURNLog.info("vkcreds", "step 3-retry ok")
+        } else {
+            TURNLog.info("vkcreds", "step 3 ok (no captcha)")
         }
         let t4: String = try Self.requireString(r3, path: ["response", "token"], step: "3")
 
         // Step 4 — OK CDN auth.anonymLogin (session_key)
+        TURNLog.info("vkcreds", "step 4: auth.anonymLogin (OK CDN session)")
         let sessionData = "%7B%22version%22%3A2%2C%22device_id%22%3A%22\(config.deviceID)%22" +
                           "%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D"
         let step4 = "session_data=\(sessionData)&method=auth.anonymLogin&format=JSON&application_key=\(config.okAppKey)"
@@ -334,8 +354,10 @@ actor VKCredsClient {
                                      step: "4.anonymLogin")
         try Self.assertNoError(r4, step: "4")
         let t5: String = try Self.requireString(r4, path: ["session_key"], step: "4")
+        TURNLog.info("vkcreds", "step 4 ok")
 
         // Step 5 — vchat.joinConversationByLink. Returns turn_server.
+        TURNLog.info("vkcreds", "step 5: vchat.joinConversationByLink")
         let step5 = "joinLink=\(hash)&isVideo=false&protocolVersion=5" +
                     "&anonymToken=\(t4)&method=vchat.joinConversationByLink" +
                     "&format=JSON&application_key=\(config.okAppKey)&session_key=\(t5)"
@@ -346,6 +368,7 @@ actor VKCredsClient {
         guard let turnBlock = r5["turn_server"] as? [String: Any] else {
             throw VKCredsError.malformedResponse(step: "5", hint: "turn_server missing")
         }
+        TURNLog.info("vkcreds", "step 5 ok — turn_server received")
         return try Self.parseTurnBlock(turnBlock)
     }
 
