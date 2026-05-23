@@ -264,6 +264,21 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                // Emergency reset for the "stuck refresh" state. If a
+                // previous refresh wedged (network hang, WKWebView never
+                // completing) `isRefreshing` stays true forever and every
+                // subsequent Save just skips. This button cancels the
+                // in-flight Task and flips the flag back.
+                Button(action: resetRefreshState) {
+                    Text("Reset refresh state")
+                        .font(.geist(.semibold, size: 13))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(theme.amberDim)
+                        .foregroundStyle(theme.amber)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -299,6 +314,11 @@ struct SettingsView: View {
         vkCallHashDraft = ""
         vkCallHashFeedback = "Очищено"
         TURNCredsStore.shared.clear()
+    }
+
+    private func resetRefreshState() {
+        TURNCredsRefresher.shared.resetRefreshState()
+        vkCallHashFeedback = "Состояние refresh сброшено"
     }
 
     private var configurationCard: some View {

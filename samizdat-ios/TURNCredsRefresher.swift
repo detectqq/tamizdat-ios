@@ -111,6 +111,13 @@ final class TURNCredsRefresher: ObservableObject {
 
     // MARK: – Private
 
+    /// Overall watchdog: if the refresh hasn't completed in this many
+    /// seconds, the Task is cancelled so `isRefreshing` flips back to
+    /// false and the next Save attempt isn't dead in the water.
+    /// Sized generously: per-request timeout is 20s, max 5 retries +
+    /// up to 45s captcha solve = ~145s worst case. 180s gives slack.
+    private static let watchdogTimeout: TimeInterval = 180
+
     private func startRefresh() {
         inFlight?.cancel()
         isRefreshing = true
@@ -133,7 +140,24 @@ final class TURNCredsRefresher: ObservableObject {
                 TURNLog.info("turncreds", "config built (hash=\(hashPrefix)...)")
                 let client = VKCredsClient(config: config,
                                             captchaSolver: ChainedCaptchaSolver(refresher: self))
-                let creds = try await client.fetchCredentials()
+                // Race fetchCredentials against a watchdog so a wedged
+                // network call or stuck WKWebView can't lock the
+                // refresher into `isRefreshing=true` forever.
+                let creds = try await withThrowingTaskGroup(of: VKTURNCredentials.self) { group in
+                    group.addTask {
+                        try await client.fetchCredentials()
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: UInt64(Self.watchdogTimeout * 1_000_000_000))
+                        TURNLog.error("turncreds", "watchdog fired — refresh exceeded \(Int(Self.watchdogTimeout))s")
+                        throw VKCredsError.transport(step: "watchdog", underlying: CancellationError())
+                    }
+                    guard let first = try await group.next() else {
+                        throw CancellationError()
+                    }
+                    group.cancelAll()
+                    return first
+                }
                 TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
                 self.lastError = nil
@@ -150,6 +174,21 @@ final class TURNCredsRefresher: ObservableObject {
                 self.lastError = msg
             }
         }
+    }
+
+    /// Emergency reset for the "stuck refresh" state. Cancels the
+    /// in-flight Task (if any), drops the manual continuation, and
+    /// flips `isRefreshing` back to false so a subsequent forceRefresh
+    /// can start fresh. Exposed via Settings → VK TURN → Reset.
+    func resetRefreshState() {
+        TURNLog.warn("turncreds", "resetRefreshState called — cancelling in-flight task")
+        inFlight?.cancel()
+        inFlight = nil
+        manualContinuation?.resume(throwing: CaptchaError.cancelled)
+        manualContinuation = nil
+        manualChallenge = nil
+        isRefreshing = false
+        lastError = "Сброшено вручную"
     }
 
     /// Spawn a manual challenge and suspend until the user resolves
