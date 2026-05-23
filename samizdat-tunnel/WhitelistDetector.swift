@@ -83,6 +83,9 @@ final class WhitelistDetector {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopped = false
+            // Restore persisted counters so progress survives extension restart.
+            self.failbackSuccesses = WhitelistStatusStore.failbackSuccesses
+            self.whitelistSuccesses = WhitelistStatusStore.whitelistSuccessesExtension
             self.applyConfigLocked()
             self.scheduleNextProbe(after: 2)
             self.log("info: WhitelistDetector(ICMP) started — testHost=\(self.testHost) whitelistHost=\(self.whitelistHost)")
@@ -136,6 +139,8 @@ final class WhitelistDetector {
             if was != satisfied {
                 self.failbackSuccesses = 0
                 self.whitelistSuccesses = 0
+                WhitelistStatusStore.failbackSuccesses = 0
+                WhitelistStatusStore.whitelistSuccessesExtension = 0
                 if !satisfied {
                     WhitelistStatusStore.current = .noNetwork
                     self.log("info: detector paused (path unsatisfied)")
@@ -323,6 +328,11 @@ final class WhitelistDetector {
             whitelistSuccesses = 0
             WhitelistStatusStore.current = .noNetwork
         }
+
+        // Persist counters across extension lifecycle so they survive
+        // VPN reconnect / extension restart.
+        WhitelistStatusStore.failbackSuccesses = failbackSuccesses
+        WhitelistStatusStore.whitelistSuccessesExtension = whitelistSuccesses
     }
 
     private func applySwitch(to endpoint: EndpointMode) {

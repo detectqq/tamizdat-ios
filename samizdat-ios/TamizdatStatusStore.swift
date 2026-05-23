@@ -79,16 +79,11 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// to amber "Reconnecting…" during this window. 0 otherwise.
     let isRewiring: Int
 
-    /// D45: live FragPoC port stats from the Go runtime, as a raw JSON
-    /// string. Empty or "{}" when FragPoC is not the active transport.
-    let fragpocStats: String
-
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
         rttLiteMs: -1, rttBulkMs: -1,
         pingMs: -1, pingOK: false, pingFailed: false, pingURL: "",
-        rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
-        fragpocStats: ""
+        rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0
     )
 
     // IPA-D21: tolerate older extension JSON (pre-D21 lacks ping*
@@ -100,14 +95,12 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case realShape, lockedFlows, liteAlive, rttLiteMs, rttBulkMs
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
-        case fragpocStats
     }
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
          rttLiteMs: Int, rttBulkMs: Int,
          pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String,
-         rxBytes: Int64, txBytes: Int64, uptimeSec: Int64, isRewiring: Int,
-         fragpocStats: String = "") {
+         rxBytes: Int64, txBytes: Int64, uptimeSec: Int64, isRewiring: Int) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
         self.liteAlive = liteAlive
@@ -121,7 +114,6 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.txBytes = txBytes
         self.uptimeSec = uptimeSec
         self.isRewiring = isRewiring
-        self.fragpocStats = fragpocStats
     }
 
     init(from decoder: Decoder) throws {
@@ -139,7 +131,6 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.txBytes     = (try? c.decode(Int64.self,  forKey: .txBytes))     ?? 0
         self.uptimeSec   = (try? c.decode(Int64.self,  forKey: .uptimeSec))   ?? 0
         self.isRewiring  = (try? c.decode(Int.self,    forKey: .isRewiring))  ?? 0
-        self.fragpocStats = (try? c.decode(String.self, forKey: .fragpocStats)) ?? ""
     }
 }
 

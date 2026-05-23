@@ -164,14 +164,6 @@ struct ContentView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 4)
 
-                // D45: FragPoC port info — visible on the main screen
-                // when the FragPoC transport is enabled.
-                if FragPoCTransportStore.enabled {
-                    fragPoCPortInfo
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
-                }
-
                 // IPA-D25 fix5: row is always visible. The picker
                 // inside the row is gated on hasBackupConfigured —
                 // when no Whitelist endpoint configured, we show a
@@ -541,85 +533,6 @@ struct ContentView: View {
         case .off:        return isAutoMode ? "Free internet" : "Manual"
         case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
         }
-    }
-
-    // MARK: – FragPoC port info
-
-    /// D45: live FragPoC runtime stats card — shows actual port/connection
-    /// counts from the Go runtime via the status RPC, not just config.
-    private var fragPoCPortInfo: some View {
-        let stats = parseFragPoCStats(lampStore.snapshot.fragpocStats)
-        let mode = FragPoCPortConfigStore.mode
-        let isOnline = !lampStore.snapshot.realShape.isEmpty
-        let dialPorts = stats?.dialPorts ?? 0
-        let poolPorts = stats?.poolPorts ?? 0
-        let openConns = stats?.openConns ?? 0
-        let opTokens = stats?.opTokens ?? 0
-        let tcpDialsTotal = stats?.tcpDialsTotal ?? 0
-        let totalOps = (stats?.opTokensTotal ?? 0) + (stats?.downPollsTotal ?? 0)
-        let liveTokens = opTokens + (stats?.downTokens ?? 0)
-        let liveSuffix = (openConns > 0 || liveTokens > 0) ? " · live \(openConns)c/\(liveTokens)t" : ""
-        let activityValue = max(tcpDialsTotal, totalOps)
-
-        return CardContainer(padding: 0) {
-            DesignRow(
-                icon: IconCard(systemName: "network",
-                               bg: theme.blueDim, fg: theme.blue),
-                title: "FragPoC · \(mode.label)",
-                sub: isOnline && stats != nil
-                    ? "\(dialPorts)/\(poolPorts) port\(poolPorts == 1 ? "" : "s") · \(tcpDialsTotal) dials · \(totalOps) ops\(liveSuffix)"
-                    : "Offline",
-                isLast: true
-            ) {
-                if isOnline && stats != nil {
-                    Text("\(activityValue)")
-                        .font(.geistMono(.bold, size: 16))
-                        .foregroundStyle(activityValue > 0 ? theme.mint : theme.textDim)
-                } else {
-                    Text("—")
-                        .font(.geistMono(.bold, size: 16))
-                        .foregroundStyle(theme.textDim)
-                }
-            }
-        }
-    }
-
-    private struct FragPoCRuntimeStats {
-        let dialPorts: Int  // active ports in the dynamic rotation window
-        let poolPorts: Int  // total ports available in the pool
-        let openConns: Int
-        let opTokens: Int
-        let opTokenCap: Int
-        let tcpDialsTotal: Int
-        let opTokensTotal: Int
-        let downPollsTotal: Int
-        let downTokens: Int
-        let downTokenCap: Int
-    }
-
-    private func parseFragPoCStats(_ json: String) -> FragPoCRuntimeStats? {
-        guard !json.isEmpty, json != "{}" else { return nil }
-        guard let data = json.data(using: .utf8),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        func statInt(_ key: String) -> Int {
-            if let i = dict[key] as? Int { return i }
-            if let n = dict[key] as? NSNumber { return n.intValue }
-            if let s = dict[key] as? String, let i = Int(s) { return i }
-            return 0
-        }
-        return FragPoCRuntimeStats(
-            dialPorts: statInt("dialPorts"),
-            poolPorts: statInt("poolPorts"),
-            openConns: statInt("openConns"),
-            opTokens: statInt("opTokens"),
-            opTokenCap: statInt("opTokenCap"),
-            tcpDialsTotal: statInt("tcpDialsTotal"),
-            opTokensTotal: statInt("opTokensTotal"),
-            downPollsTotal: statInt("downPollsTotal"),
-            downTokens: statInt("downTokens"),
-            downTokenCap: statInt("downTokenCap")
-        )
     }
 
     // MARK: – Connect button

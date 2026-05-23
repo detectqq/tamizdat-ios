@@ -35,8 +35,9 @@ final class WhitelistMonitor: ObservableObject {
     /// Begin monitoring. Idempotent; no-op if already running.
     func start() {
         guard task == nil else { return }
-        whitelistCount = 0
-        freeCount = 0
+        // Restore persisted counters so progress survives start/stop cycles.
+        whitelistCount = WhitelistStatusStore.whitelistConsecutiveCount
+        freeCount = WhitelistStatusStore.freeConsecutiveCount
         task = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.runCycle()
@@ -110,6 +111,11 @@ final class WhitelistMonitor: ObservableObject {
             freeCount = 0
             WhitelistStatusStore.current = .noNetwork
         }
+
+        // Persist counters across app lifecycle (background/foreground,
+        // VPN state changes) so they survive start/stop resets.
+        WhitelistStatusStore.whitelistConsecutiveCount = whitelistCount
+        WhitelistStatusStore.freeConsecutiveCount = freeCount
     }
 
     // MARK: – ICMP probe

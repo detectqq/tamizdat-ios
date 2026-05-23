@@ -206,7 +206,6 @@ final class VPNProfileStore {
         var providerConfiguration: [String: String] = [
             "configBlob": configBlob,
             "engineConfigBlob": engineConfigBlob,
-            "fragpocConfigBlob": FragPoCConfigStore.configBlob,
         ]
         if let serverIP {
             providerConfiguration["serverIP"] = serverIP

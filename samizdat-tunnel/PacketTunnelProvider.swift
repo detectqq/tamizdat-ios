@@ -96,7 +96,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var combinedConfigBlob: String = ""
     private var primaryBlob: String = ""
     private var backupBlob: String?
-    private var fragPoCConfigBlob: String = ""
 
     // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
     // that flips to backup when TSPU whitelist mode is detected and
@@ -133,8 +132,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
-        let fragPoCConfigBlob = (proto.providerConfiguration?["fragpocConfigBlob"] as? String) ?? FragPoCConfigStore.configBlob
-        self.fragPoCConfigBlob = fragPoCConfigBlob
 
         // IPA-P: split the combined blob (which carries an optional
         // &backup=base64url(...) query param) into per-endpoint URLs.
@@ -152,7 +149,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // cross-process sandbox issue and the listener can never get
         // host-app-suspended out from under us.
         appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: activeBlob, fragPoCConfigBlob: fragPoCConfigBlob, log: appendExtLog) {
+        if !Self.startInProcessSocks(configBlob: activeBlob, log: appendExtLog) {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
@@ -188,7 +185,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
     /// run inside this extension process. Returns true on success.
-    private static func startInProcessSocks(configBlob: String, fragPoCConfigBlob: String, log: (String) -> Void) -> Bool {
+    private static func startInProcessSocks(configBlob: String, log: (String) -> Void) -> Bool {
         // Mirror Go-shim logs to the App Group file so the bridge sees them
         // alongside extension logs.
         if let containerURL = FileManager.default.containerURL(
@@ -227,23 +224,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // immediately after SetSamizdatConfig, so a user who is already
         // over-quota at connect time still gets the notification.
         SocksstubSetNotificationCallback(NotificationBridge.shared)
-        let useFragPoC = FragPoCTransportStore.enabled
-        SocksstubSetTransport(useFragPoC ? "fragpoc" : "h2")
-        SocksstubSetFragPoCConfig(fragPoCConfigBlob)
-        // Push the FragPoC UDP toggle — takes effect immediately, no
-        // reconnect needed. Default is true (UDP forwarding on).
-        SocksstubSetFragPoCUDP(FragPoCUDPStore.enabled)
-        // IPA-D38: push the FragPoC port list selected in the Settings
-        // "Port mode" card. socksstub uses element 0 as the base server
-        // port and the rest as the dynamic dial pool; ignored unless the
-        // FragPoC transport is enabled above.
-        let fragPoCPortsCSV = FragPoCPortConfigStore.activePortsCSV
-        SocksstubSetFragPoCPorts(fragPoCPortsCSV)
-        if useFragPoC {
-            let fragPoCServer = FragPoCConfigStore.summaryLabel(for: fragPoCConfigBlob)
-            log("info: fragpoc server = \(fragPoCServer)")
-            log("info: fragpoc port mode = \(FragPoCPortConfigStore.mode.rawValue), ports = \(fragPoCPortsCSV)")
-        }
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -393,9 +373,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             defer { self.isRewiring = false }
-            let fragBlob = FragPoCConfigStore.configBlob
-            self.fragPoCConfigBlob = fragBlob
-            SocksstubSetFragPoCConfig(fragBlob)
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
@@ -588,8 +565,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "txBytes":     Int64(tx_bytes),
                 "uptimeSec":   uptime,
                 "isRewiring":  self.isRewiring ? 1 : 0,
-                // D45: live FragPoC port stats — JSON string from Go runtime.
-                "fragpocStats": SocksstubFragPoCPortStats(),
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

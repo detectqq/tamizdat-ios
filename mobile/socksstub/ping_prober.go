@@ -43,7 +43,7 @@ import (
 
 // probeDialer is the minimal interface the ping prober needs from the
 // upstream client — just DialContext to route HTTP probes through the
-// tunnel. Both *samizdat.Client and *fragpocUpstreamClient satisfy it.
+// tunnel. Satisfied by *samizdat.Client.
 type probeDialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
