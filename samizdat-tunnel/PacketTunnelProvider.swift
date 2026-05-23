@@ -185,7 +185,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
     /// run inside this extension process. Returns true on success.
-    private static func startInProcessSocks(configBlob: String, log: (String) -> Void) -> Bool {
+    private static func startInProcessSocks(configBlob: String, log: @escaping (String) -> Void) -> Bool {
         // Mirror Go-shim logs to the App Group file so the bridge sees them
         // alongside extension logs.
         if let containerURL = FileManager.default.containerURL(
