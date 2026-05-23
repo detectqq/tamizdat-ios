@@ -2,54 +2,54 @@ import Foundation
 import Network
 import UserNotifications
 
-/// WhitelistDetector — periodic out-of-tunnel TCP probe cascade that
-/// decides whether the current network is in TSPU whitelist mode and
-/// flips the active samizdat endpoint accordingly.
+/// IPA-D23: ICMP-based whitelist detector (rewrite of the IPA-Q TCP
+/// cascade). Mirrors the operator's prod-proven 2-target design.
 ///
-/// Probe cascade per cycle (sequential, 3 s per step):
-///   1. TCP 1.1.1.1:443  (Cloudflare canary)
-///   2. TCP 8.8.8.8:443  (Google canary, only if step 1 failed)
-///   3. TCP 77.88.8.8:443 (Yandex DNS primary, only if 1 + 2 failed)
-///   4. TCP 77.88.8.1:443 (Yandex DNS secondary, only if 1+2+3 failed)
+/// Each cycle:
+///   - Ping `testHost`      (default 8.8.8.8) — should answer under free
+///                                              internet
+///   - Ping `whitelistHost` (default 77.88.8.8) — should answer even
+///                                                under TSPU whitelist mode
+///   Both pings fire in parallel, each with a 3 s timeout.
 ///
-/// Decisions:
-///   - any of 1..2 ✅                          → internet OK, status=.off
-///   - all of 1..2 ❌, any of 3..4 ✅         → WHITELIST, status=.detected
-///   - all 4 ❌                                → no network, status=.noNetwork
-///                                                (counters paused)
+/// Outcome decision matrix:
+///   testOK  + whitelistOK   → .clearAll              ENDPOINT = primary
+///   testFail + whitelistOK  → .whitelistOn           ENDPOINT = backup
+///   testOK  + whitelistFail → .whitelistMisconfigured (log warn, keep current)
+///   testFail + whitelistFail → .noNetwork            pause, no switch
 ///
-/// State machine guarantees:
-///   - hold-down 60 s between actual endpoint switches (anti-flap)
-///   - failback to primary requires 2 consecutive ✅ on canary 1+2
-///   - probes are SKIPPED entirely when NWPathMonitor reports
-///     unsatisfied path (counters reset on path-status flip)
-///   - low power mode → cadence ×3 (90 s normal, 180 s on-backup)
-///   - detector is started only when EndpointModeStore.current == .auto
+/// Preserved from the old IPA-Q implementation:
+///   - hold-down between actual endpoint switches (anti-flap)
+///   - WhitelistStatus writes to App Group for the main-app status badge
+///   - notePathChange(satisfied:) pauses on NWPath unsatisfied
+///   - Low-Power-Mode stretches cadence ×3
+///   - applyConfig() rebuilds targets after the user edits prefs
 ///
-/// All probe traffic is added to NEPacketTunnelNetworkSettings.excludedRoutes
-/// (1.1.1.1/32, 8.8.8.8/32, 77.88.8.0/24) so the probes really go via the
-/// underlying interface, not through our own samizdat tunnel.
+/// Dropped from IPA-Q:
+///   - 4-canary TCP cascade — replaced with 2 ICMP targets
+///   - "frozen" captive-portal heuristic — operator's simpler design
+///     surfaces the weird case as `.whitelistMisconfigured` instead
 final class WhitelistDetector {
 
-    // Tunables.
+    // Tunables (kept compatible with IPA-Q timings so battery profile
+    // is unchanged for users running auto-mode).
+    // IPA-D28 fix: 30s → 5s for near-instant detection. Detector runs
+    // inside the extension only when VPN is up, so battery is bounded
+    // by tunnel-active time. Hold-down (60s) still prevents endpoint
+    // thrashing on flapping networks.
     private static let probeTimeout: TimeInterval = 3
-    private static let normalCadence: TimeInterval = 30
-    private static let onBackupCadence: TimeInterval = 60
     private static let holdDownSeconds: TimeInterval = 60
-    private static let captiveFreezeSeconds: TimeInterval = 300
-    private static let failbackSuccessesNeeded: Int = 2
 
-    // Probe targets — kept in sync with excludedRoutes added by the
-    // PacketTunnelProvider so the underlying interface is actually used.
-    private struct Canary { let host: String; let port: NWEndpoint.Port }
-    private static let internetCanaries: [Canary] = [
-        Canary(host: "1.1.1.1", port: 443),
-        Canary(host: "8.8.8.8", port: 443),
-    ]
-    private static let ruCanaries: [Canary] = [
-        Canary(host: "77.88.8.8", port: 443), // Yandex DNS primary
-        Canary(host: "77.88.8.1", port: 443), // Yandex DNS secondary
-    ]
+    /// Read user-configured cadence; double it when on backup.
+    private static var normalCadence: TimeInterval {
+        TimeInterval(WhitelistProbePreferences.probeInterval)
+    }
+    private static var onBackupCadence: TimeInterval {
+        TimeInterval(WhitelistProbePreferences.probeInterval) * 2
+    }
+    private static var failbackSuccessesNeeded: Int {
+        WhitelistProbePreferences.successesNeeded
+    }
 
     // Hooks injected by PacketTunnelProvider.
     private let log: (String) -> Void
@@ -58,13 +58,16 @@ final class WhitelistDetector {
 
     private let queue = DispatchQueue(label: "com.anarki.samizdat-test.detector", qos: .utility)
     private var timer: DispatchSourceTimer?
-    private var pendingConn: NWConnection?
-    private var pendingTimeoutWork: DispatchWorkItem?
+    private var activePingers: [ICMPPinger] = []
+
+    // Targets (re-read on applyConfig). Stored on the detector's queue.
+    private var testHost: String = WhitelistProbePreferences.defaultTestHost
+    private var whitelistHost: String = WhitelistProbePreferences.defaultWhitelistHost
 
     // State.
     private var lastSwitchedAt = Date.distantPast
     private var failbackSuccesses = 0
-    private var captiveFreezeUntil = Date.distantPast
+    private var whitelistSuccesses = 0
     private var isPathSatisfied = true
     private var stopped = false
 
@@ -80,8 +83,12 @@ final class WhitelistDetector {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopped = false
-            self.scheduleNextProbe(after: 2) // first probe ~2 s after start
-            self.log("info: WhitelistDetector started")
+            // Restore persisted counters so progress survives extension restart.
+            self.failbackSuccesses = WhitelistStatusStore.failbackSuccesses
+            self.whitelistSuccesses = WhitelistStatusStore.whitelistSuccessesExtension
+            self.applyConfigLocked()
+            self.scheduleNextProbe(after: 2)
+            self.log("info: WhitelistDetector(ICMP) started — testHost=\(self.testHost) whitelistHost=\(self.whitelistHost)")
         }
     }
 
@@ -90,10 +97,35 @@ final class WhitelistDetector {
             guard let self else { return }
             self.stopped = true
             self.timer?.cancel(); self.timer = nil
-            self.pendingTimeoutWork?.cancel(); self.pendingTimeoutWork = nil
-            self.pendingConn?.cancel(); self.pendingConn = nil
-            WhitelistStatusStore.current = .unknown
-            self.log("info: WhitelistDetector stopped")
+            for p in self.activePingers { p.cancel() }
+            self.activePingers.removeAll()
+            // D59 FIX: do NOT reset WhitelistStatusStore.current here.
+            // The last-known detection result should persist so the UI
+            // keeps showing "Whitelist active" / "Free internet" across
+            // VPN connect/disconnect cycles. The main-app WhitelistMonitor
+            // picks up when the extension stops; the 200s stale-check in
+            // ContentView.refreshWhitelistStatus() handles truly stale data.
+            self.log("info: WhitelistDetector stopped (status preserved)")
+        }
+    }
+
+    /// Re-reads the user-configured target hosts from App Group
+    /// UserDefaults and adopts them for the next cycle. Called by
+    /// PacketTunnelProvider on the "refreshWhitelistProbes" provider
+    /// message.
+    func applyConfig() {
+        queue.async { [weak self] in
+            self?.applyConfigLocked()
+        }
+    }
+
+    private func applyConfigLocked() {
+        let t = WhitelistProbePreferences.testHost
+        let w = WhitelistProbePreferences.whitelistHost
+        if t != testHost || w != whitelistHost {
+            log("info: detector targets updated: testHost=\(t) whitelistHost=\(w)")
+            testHost = t
+            whitelistHost = w
         }
     }
 
@@ -106,10 +138,27 @@ final class WhitelistDetector {
             self.isPathSatisfied = satisfied
             if was != satisfied {
                 self.failbackSuccesses = 0
+                self.whitelistSuccesses = 0
+                WhitelistStatusStore.failbackSuccesses = 0
+                WhitelistStatusStore.whitelistSuccessesExtension = 0
                 if !satisfied {
                     WhitelistStatusStore.current = .noNetwork
                     self.log("info: detector paused (path unsatisfied)")
                 } else {
+                    // IPA-D25 BUG FIX: when path recovers, transition
+                    // status to `.unknown` ("Monitoring…") so the UI
+                    // doesn't stay stuck on stale "Paused — no network"
+                    // for the 30 s until the next probe cycle completes.
+                    //
+                    // Root cause we hit on D24: NEPacketTunnelProvider
+                    // sees a brief NWPath.unsatisfied window while the
+                    // tunnel routes are being plumbed at startTunnel
+                    // (this writes .noNetwork), then immediately a
+                    // .satisfied event when settings install completes.
+                    // The recovery branch used to ONLY log and not reset
+                    // the store → UI stayed on noNetwork for ~30 s while
+                    // tunnel was already fully functional.
+                    WhitelistStatusStore.current = .unknown
                     self.log("info: detector resumed (path satisfied)")
                 }
             }
@@ -132,189 +181,118 @@ final class WhitelistDetector {
     private func runCycle() {
         guard !stopped else { return }
 
-        // Auto mode required.
         guard EndpointModeStore.current == .auto else {
             log("info: detector cycle skip (mode=\(EndpointModeStore.current.rawValue))")
             scheduleNextProbe(after: Self.normalCadence)
             return
         }
-
-        // Path gate — skip cycle if no network.
         if !isPathSatisfied {
             log("info: detector cycle skip (path unsatisfied)")
             scheduleNextProbe(after: Self.normalCadence)
             return
         }
+        log("info: detector cycle start (testHost=\(testHost) whitelistHost=\(whitelistHost))")
 
-        // Captive freeze gate.
-        if Date() < captiveFreezeUntil {
-            log("info: detector cycle skip (captive-freeze active)")
-            scheduleNextProbe(after: 30)
-            return
-        }
-        log("info: detector cycle start")
-
-        // Cadence depends on current effective endpoint.
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
         let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
         let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
 
-        cascadeProbe { [weak self] outcome in
+        parallelProbe { [weak self] testOK, whitelistOK in
             guard let self else { return }
+            let outcome: Outcome
+            switch (testOK, whitelistOK) {
+            case (true,  true):  outcome = .clearAll
+            case (false, true):  outcome = .whitelistOn
+            case (true,  false): outcome = .whitelistMisconfigured
+            case (false, false): outcome = .noNetwork
+            }
             self.handleOutcome(outcome)
             self.scheduleNextProbe(after: cadence)
         }
     }
 
-    private enum CascadeOutcome: String {
-        case internetOK
-        case whitelistActive
+    private enum Outcome: String {
+        case clearAll
+        case whitelistOn
+        case whitelistMisconfigured
         case noNetwork
-        case captiveSuspected
     }
 
-    /// Walks the cascade in order, stopping on the first ✅ in steps 1..2
-    /// or the first ✅ in steps 3..4 after all of 1..2 failed. Calls
-    /// completion exactly once on the detector queue.
-    ///
-    /// IPA-Q.4: removed the captive-portal "both canaries <50 ms"
-    /// heuristic — it false-positived on regular home Wi-Fi where
-    /// 1.1.1.1/8.8.8.8 normally respond in 20-40 ms. Without a real
-    /// content-check (HTTP fetch of captive.apple.com/hotspot-detect.html)
-    /// we cannot reliably distinguish a captive portal from healthy
-    /// fast internet. We let it pass through as .internetOK; if there
-    /// IS a captive portal the user's actual flows will fail, the user
-    /// will know.
-    private func cascadeProbe(completion: @escaping (CascadeOutcome) -> Void) {
-        runOne(canaries: Self.internetCanaries, idx: 0) { [weak self] internetOK, _ in
+    /// Pings both targets SEQUENTIALLY (not in parallel). D65 fix:
+    /// two simultaneous SOCK_DGRAM ICMP sockets confuse the kernel's
+    /// reply demux on some devices — replies arrive at the wrong socket,
+    /// sequence mismatch, both timeout. Serializing avoids this.
+    /// Completion delivered on `queue`.
+    private func parallelProbe(completion: @escaping (_ testOK: Bool, _ whitelistOK: Bool) -> Void) {
+        let ifindex = pickPhysicalInterfaceIndex()
+        if ifindex == nil {
+            log("warn: detector probe — no physical interface available, pings will likely fail")
+        }
+
+        // Probe 1: testHost
+        let pingerTest = ICMPPinger(target: parseTarget(testHost),
+                                    interfaceIndex: ifindex)
+        activePingers = [pingerTest]
+        pingerTest.ping(timeout: Self.probeTimeout) { [weak self] testOK, testRTT in
             guard let self else { return }
-            if internetOK {
-                completion(.internetOK)
-                return
-            }
-            // Internet canaries all failed — try RU.
-            self.runOne(canaries: Self.ruCanaries, idx: 0) { ruOK, _ in
-                if ruOK {
-                    completion(.whitelistActive)
-                } else {
-                    completion(.noNetwork)
+            self.queue.async {
+                self.log("info: detector ping testHost=\(self.testHost) → \(testOK ? "ok" : "fail") in \(Int(testRTT*1000))ms")
+                self.activePingers.removeAll()
+
+                // Probe 2: whitelistHost (after testHost settles)
+                let pingerWL = ICMPPinger(target: self.parseTarget(self.whitelistHost),
+                                          interfaceIndex: ifindex)
+                self.activePingers = [pingerWL]
+                pingerWL.ping(timeout: Self.probeTimeout) { [weak self] wlOK, wlRTT in
+                    guard let self else { return }
+                    self.queue.async {
+                        self.log("info: detector ping whitelistHost=\(self.whitelistHost) → \(wlOK ? "ok" : "fail") in \(Int(wlRTT*1000))ms")
+                        self.activePingers.removeAll()
+                        completion(testOK, wlOK)
+                    }
                 }
             }
         }
     }
 
-    /// Probes a list of canaries sequentially; returns true on first
-    /// success. allSucceededFast = true if every probe returned in
-    /// <50 ms (captive-portal hint).
-    private func runOne(canaries: [Canary],
-                        idx: Int,
-                        fastSoFar: Bool = true,
-                        completion: @escaping (Bool, Bool) -> Void) {
-        if idx >= canaries.count {
-            completion(false, false)
-            return
-        }
-        let c = canaries[idx]
-        probeOnce(canary: c) { [weak self] ok, elapsed in
-            guard let self else { return }
-            if ok {
-                let stillFast = fastSoFar && elapsed < 0.050
-                completion(true, stillFast)
-                return
-            }
-            self.runOne(canaries: canaries, idx: idx + 1, fastSoFar: false, completion: completion)
-        }
+    /// Parses `"8.8.8.8"` or `"google.com"` into the corresponding
+    /// ICMPPinger.Target. The pinger itself does the IP-literal
+    /// detection — but we forward a typed enum so the intent is clear.
+    private func parseTarget(_ s: String) -> ICMPPinger.Target {
+        // Hostnames vs IPs: cheap check — does it have a letter? If
+        // it parses as an IP via inet_pton inside ICMPPinger then
+        // .ip() is functionally equivalent to .hostname(); we keep
+        // it as .hostname only when the string clearly is a name.
+        let isHostname = s.contains(where: { $0.isLetter || $0 == "-" })
+        return isHostname ? .hostname(s) : .ip(s)
     }
 
-    /// Single TCP-connect probe with timeout. Closes the connection as
-    /// soon as it transitions to .ready (we only need SYN/SYN-ACK to
-    /// confirm reachability, not data). Result delivered exactly once.
-    ///
-    /// CRITICAL: NEPacketTunnelProvider extensions own the utun, but
-    /// their OWN NWConnection objects still get routed via that utun
-    /// by default — excludedRoutes only apply to OTHER apps on the
-    /// device. To bypass our own tunnel we pin the connection to the
-    /// underlying physical interface via NWParameters.requiredInterfaceType.
-    /// Falls back to .tcp without binding if no underlying interface
-    /// is available (which is itself a no-network signal).
-    private func probeOnce(canary: Canary,
-                           completion: @escaping (_ ok: Bool, _ elapsed: TimeInterval) -> Void) {
-        let started = Date()
-        var didSettle = false
-        let label = "\(canary.host):\(canary.port.rawValue)"
-        let settle: (Bool, String) -> Void = { [weak self] ok, reason in
-            guard let self else { return }
-            if didSettle { return }
-            didSettle = true
-            self.pendingTimeoutWork?.cancel(); self.pendingTimeoutWork = nil
-            let conn = self.pendingConn
-            self.pendingConn = nil
-            conn?.cancel()
-            let elapsed = Date().timeIntervalSince(started)
-            self.log("info: detector probe \(label) → \(ok ? "ok" : "fail") in \(Int(elapsed*1000))ms (\(reason))")
-            completion(ok, elapsed)
-        }
-
-        // Build NWParameters that pin the connection to a real
-        // underlying interface so it bypasses our own utun. iOS
-        // routes the extension's own NWConnection through the tunnel
-        // by default unless we explicitly bind to wifi/cellular.
-        // We prefer wifi when up (faster, no cellular wakeup), fall
-        // through to cellular, then ethernet for the iPad case.
-        let params: NWParameters = .tcp
-        var pinned: String = "<default>"
-        if let path = pathProvider() {
-            if path.usesInterfaceType(.wifi) {
-                params.requiredInterfaceType = .wifi
-                pinned = "wifi"
-            } else if path.usesInterfaceType(.cellular) {
-                params.requiredInterfaceType = .cellular
-                pinned = "cellular"
-            } else if path.usesInterfaceType(.wiredEthernet) {
-                params.requiredInterfaceType = .wiredEthernet
-                pinned = "wired"
+    /// Returns the index of the first non-loopback, non-utun physical
+    /// interface on the current path. Used to scope the ping socket so
+    /// the packet actually leaves the device via Wi-Fi/cellular instead
+    /// of going back through our own utun.
+    private func pickPhysicalInterfaceIndex() -> UInt32? {
+        guard let path = pathProvider() else { return nil }
+        // Prefer wifi → cellular → wired.
+        let order: [NWInterface.InterfaceType] = [.wifi, .cellular, .wiredEthernet]
+        for kind in order {
+            if let iface = path.availableInterfaces.first(where: { $0.type == kind }) {
+                return UInt32(iface.index)
             }
         }
-        log("info: detector probe \(label) starting (pinned=\(pinned))")
-
-        let host = NWEndpoint.Host(canary.host)
-        let conn = NWConnection(host: host, port: canary.port, using: params)
-        pendingConn = conn
-
-        conn.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                settle(true, "ready")
-            case .failed(let err):
-                settle(false, "failed: \(err)")
-            case .cancelled:
-                settle(false, "cancelled")
-            case .waiting(let err):
-                // Waiting on a connectivity issue — let timeout decide,
-                // but log the reason so we can debug later.
-                self.log("info: detector probe \(label) waiting: \(err)")
-            default:
-                break
-            }
-        }
-        conn.start(queue: queue)
-
-        let timeoutWork = DispatchWorkItem { settle(false, "timeout") }
-        pendingTimeoutWork = timeoutWork
-        queue.asyncAfter(deadline: .now() + Self.probeTimeout, execute: timeoutWork)
+        return nil
     }
 
     // MARK: – decisions
 
-    private func handleOutcome(_ outcome: CascadeOutcome) {
+    private func handleOutcome(_ outcome: Outcome) {
         let now = Date()
         let inHoldDown = now.timeIntervalSince(lastSwitchedAt) < Self.holdDownSeconds
         log("info: detector cycle outcome=\(outcome.rawValue) holdDown=\(inHoldDown)")
 
         switch outcome {
-        case .internetOK:
-            // Internet reachable. If we're on backup, count failback
-            // successes; on N consecutive ✅, switch back to primary.
+        case .clearAll:
+            whitelistSuccesses = 0
             failbackSuccesses += 1
             if WhitelistStatusStore.activeEndpoint == .backup
                 && failbackSuccesses >= Self.failbackSuccessesNeeded
@@ -325,29 +303,36 @@ final class WhitelistDetector {
             }
             WhitelistStatusStore.current = .off
 
-        case .whitelistActive:
+        case .whitelistOn:
             failbackSuccesses = 0
-            if WhitelistStatusStore.activeEndpoint != .backup && !inHoldDown {
+            whitelistSuccesses += 1
+            if WhitelistStatusStore.activeEndpoint != .backup
+                && whitelistSuccesses >= Self.failbackSuccessesNeeded
+                && !inHoldDown {
                 log("warn: detector: WHITELIST ACTIVE — switching to backup")
                 applySwitch(to: .backup)
+                whitelistSuccesses = 0
             }
             WhitelistStatusStore.current = .detected
 
+        case .whitelistMisconfigured:
+            failbackSuccesses = 0
+            whitelistSuccesses = 0
+            log("warn: detector: whitelist target unreachable but test target OK — check whitelistHost setting")
+            // Paint the badge as "off" since internet is up; the warn
+            // line above is the operator signal.
+            WhitelistStatusStore.current = .off
+
         case .noNetwork:
             failbackSuccesses = 0
-            // Don't switch on transient network loss; just paint the
-            // badge gray so the user knows monitoring is live but
-            // currently has no signal.
+            whitelistSuccesses = 0
             WhitelistStatusStore.current = .noNetwork
-
-        case .captiveSuspected:
-            // IPA-Q.4: cascadeProbe no longer emits this — kept for
-            // forward-compat in case a proper captive-portal check
-            // (HTTP fetch of captive.apple.com) is added later.
-            captiveFreezeUntil = now.addingTimeInterval(Self.captiveFreezeSeconds)
-            log("warn: detector: captive portal suspected — freezing 300 s")
-            WhitelistStatusStore.current = .frozen
         }
+
+        // Persist counters across extension lifecycle so they survive
+        // VPN reconnect / extension restart.
+        WhitelistStatusStore.failbackSuccesses = failbackSuccesses
+        WhitelistStatusStore.whitelistSuccessesExtension = whitelistSuccesses
     }
 
     private func applySwitch(to endpoint: EndpointMode) {
@@ -357,8 +342,6 @@ final class WhitelistDetector {
         postSwitchNotification(to: endpoint)
     }
 
-    /// Posts a local notification announcing the switch. Gated on the
-    /// user's NotificationPreferences toggle — silent when off.
     private func postSwitchNotification(to endpoint: EndpointMode) {
         guard NotificationPreferences.enabled else { return }
         let content = UNMutableNotificationContent()

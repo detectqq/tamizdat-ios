@@ -1,14 +1,15 @@
 package tamizdat
 
 import (
+	"fmt"
 	"context"
-	"sync/atomic"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,7 +23,21 @@ const (
 	udpServerReadPoll    = 2 * time.Second // polling tick so ctx cancellation propagates
 )
 
-func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destination string) {
+func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destination string, flowID uint64) {
+	if s.realtime != nil && flowID != 0 {
+		clientAddr := "-"
+		if r != nil && r.RemoteAddr != "" {
+			clientAddr = r.RemoteAddr
+		}
+		closedFID := flowID
+		closedDst := destination
+		closedClient := clientAddr
+		defer func() {
+			s.realtime.Close(closedFID)
+			s.logShapeEvent(fmt.Sprintf("stream_close client=%s dst=%s proto=udp flowID=%d",
+				closedClient, closedDst, closedFID))
+		}()
+	}
 	// CRIT-0: validate destination + dial resolved IP -- defeats SSRF
 	// (private/loopback/cloud-metadata) and DNS-rebinding TOCTOU.
 	host, port, err := net.SplitHostPort(destination)
@@ -128,6 +143,9 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 				return
 			}
 			_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if s.realtime != nil && flowID != 0 {
+				s.realtime.observePacket(flowID, buf, DirOutbound)
+			}
 			if _, err := udpConn.Write(buf); err != nil {
 				s.logf("[samizdat-udp] dn-write %s: %v", destination, err)
 				return
@@ -167,6 +185,9 @@ func (s *Server) handleUDPCONNECT(w http.ResponseWriter, r *http.Request, destin
 		}
 		if n == 0 || n > udpServerMaxDatagram {
 			continue
+		}
+		if s.realtime != nil && flowID != 0 {
+			s.realtime.observePacket(flowID, rbuf[:n], DirInbound)
 		}
 		binary.BigEndian.PutUint16(hdr[:], uint16(n))
 		if _, err := w.Write(hdr[:]); err != nil {

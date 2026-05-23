@@ -117,13 +117,65 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("switchEndpoint")
     }
 
-    /// IPA-T: triggers extension to rebuild the samizdat client. Used
-    /// by the "Performance mode" toggle so flipping it immediately
+    /// Triggers extension to rebuild the samizdat client. Used by the
+    /// IPA-X V1/V2/V3 picker so flipping the variant immediately
     /// reflects in the live transport (the new client picks up
-    /// PerformancePreferences.gameOptimized when it constructs the
+    /// PoolVariantPreferences.current when it constructs the
     /// ClientConfig).
     func refreshSamizdatClient() async {
         _ = try? await sendProviderMessage("refreshSamizdatClient")
+    }
+
+    /// IPA-D21: poke the extension to re-read PingURLPreferences.url
+    /// from App Group UserDefaults and push it into the Go-side ping
+    /// prober (SocksstubSetPingProbeURL). Lightweight — does not
+    /// rebuild the samizdat client; the prober picks up the new URL
+    /// on its next 10 s tick.
+    func refreshPingURL() async {
+        _ = try? await sendProviderMessage("refreshPingURL")
+    }
+
+    /// IPA-D23: poke the extension to re-read the two
+    /// WhitelistProbePreferences (testHost + whitelistHost) and
+    /// rebuild the WhitelistDetector's probe targets. Detector picks
+    /// them up on the next cycle (≤30 s). NOTE: the excludedRoutes
+    /// in NEPacketTunnelNetworkSettings are NOT updated live by this
+    /// call — those changes require a tunnel reconnect. The UI shows
+    /// a disclaimer about that.
+    func refreshWhitelistProbes() async {
+        _ = try? await sendProviderMessage("refreshWhitelistProbes")
+    }
+
+    /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
+    /// the extension. Used by the main-screen lamp at 500 ms cadence.
+    /// Returns `.offline` on any failure (extension not running, RPC
+    /// timeout, JSON malformed) — caller renders this as "— offline —".
+    func fetchTamizdatStatus() async -> TamizdatStatusSnapshot {
+        guard let manager = await currentManager(),
+              let session = manager.connection as? NETunnelProviderSession else {
+            return .offline
+        }
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            break
+        default:
+            return .offline
+        }
+        let data = "status".data(using: .utf8) ?? Data()
+        let response: Data? = await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+            do {
+                try session.sendProviderMessage(data) { responseData in
+                    cont.resume(returning: responseData)
+                }
+            } catch {
+                cont.resume(returning: nil)
+            }
+        }
+        guard let response, !response.isEmpty else {
+            return .offline
+        }
+        let decoded = try? JSONDecoder().decode(TamizdatStatusSnapshot.self, from: response)
+        return decoded ?? .offline
     }
 
     @discardableResult

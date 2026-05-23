@@ -25,6 +25,47 @@ type CoverConfigBundle struct {
 	CoverTargets    []string   `json:"cover_targets,omitempty"`
 	CoverGapMinMS   int        `json:"cover_gap_min_ms,omitempty"`
 	CoverGapMaxMS   int        `json:"cover_gap_max_ms,omitempty"`
+
+	// Phase C iOS-notify (Stage 3, 2026-05-10): one-shot per-user message
+	// piggy-backed on the bundle. When set, the client SHOULD display it
+	// to the user once and dismiss. Server injects per-user when the
+	// caller's users.notification_pending=1 (quota_exhausted / expired /
+	// admin_message / admin_broadcast) and clears the pending flag after
+	// a successful body write. Empty in cached/global bundles.
+	Notification *NotificationEntry `json:"notification,omitempty"`
+
+	// TURNCreds carries VK TURN relay credentials obtained by the
+	// server's turncreds.Manager. Clients that support TURN-based
+	// transport use these to establish relay connections through VK
+	// infrastructure. Older clients silently ignore the field.
+	TURNCreds *TURNCredsEntry `json:"turn_creds,omitempty"`
+}
+
+// TURNCredsEntry carries TURN relay credentials for client-side TURN
+// transport. Lifetime is in seconds from the time the credentials
+// were issued by VK; clients should re-fetch the bundle before
+// lifetime expires to obtain fresh credentials.
+type TURNCredsEntry struct {
+	Username string   `json:"username"`
+	Password string   `json:"password"`
+	URLs     []string `json:"urls"`
+	Lifetime int      `json:"lifetime"`
+}
+
+// NotificationEntry is a one-shot user-facing message delivered via the
+// bundle (Phase C iOS-notify, Stage 3, 2026-05-10).
+//
+//   - Code:   machine-readable cause, e.g. "quota_exhausted", "expired",
+//             "admin_broadcast". Stable across versions.
+//   - Title:  short human-readable title for an OS-level banner.
+//   - Body:   longer free-form text, may be empty.
+//   - Locale: BCP-47 hint ("ru", "en", …) for the title/body the server
+//             picked. Client may ignore and pick by Code.
+type NotificationEntry struct {
+	Code   string `json:"code"`
+	Title  string `json:"title,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Locale string `json:"locale,omitempty"`
 }
 
 func LoadCoverConfig(path string) (*CoverConfigBundle, error) {
@@ -84,6 +125,11 @@ func (b *CoverConfigBundle) Validate(masqPool map[string]string, checkMasq bool)
 	for _, target := range b.CoverTargets {
 		if err := validateHostPort(target); err != nil {
 			return fmt.Errorf("cover config: cover_target %q: %w", target, err)
+		}
+	}
+	if b.Notification != nil {
+		if strings.TrimSpace(b.Notification.Code) == "" {
+			return fmt.Errorf("cover config: notification.code must be non-empty")
 		}
 	}
 	if b.CoverGapMinMS != 0 || b.CoverGapMaxMS != 0 {

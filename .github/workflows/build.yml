@@ -2,7 +2,7 @@ name: Build IPA
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   workflow_dispatch:
 
 jobs:
@@ -51,6 +51,7 @@ jobs:
           gomobile bind -v \
             -target=ios,iossimulator \
             -iosversion=17.0 \
+            -tags=with_low_memory \
             -o "${{ env.FRAMEWORK_OUT }}" \
             ./samizdat ./socksstub
           ls -la "${{ env.FRAMEWORK_OUT }}"
@@ -175,10 +176,24 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/tunnel-profile.plist
           rm -rf _inspect
 
+      - name: Compute versioned IPA name
+        id: ipa_name
+        # Match the operator's existing milestone naming convention
+        # (e.g. `Tamizdat-0.2.219-a511029-build-219.ipa`) so downloaded
+        # artifacts can be moved straight into the `samizdat-ios/ipa/
+        # milestones/` archive without renaming. Bundle MARKETING_VERSION
+        # is `0.2.<run>-<sha7>` per the Archive step above.
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Artifact will be: ${NAME}"
+          cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: samizdat-ios-ipa
-          path: ${{ env.EXPORT_PATH }}/samizdat-ios.ipa
+          name: ${{ steps.ipa_name.outputs.name }}
+          path: ${{ env.EXPORT_PATH }}/${{ steps.ipa_name.outputs.name }}.ipa
           if-no-files-found: error
           retention-days: 30

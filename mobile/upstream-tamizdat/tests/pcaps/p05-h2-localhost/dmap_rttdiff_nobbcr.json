@@ -1,0 +1,11 @@
+{
+  "artt_ms": 0.40149688720703125,
+  "artt_pairs": 10,
+  "label": "nobbcr-localhost",
+  "note": "TRTT=SYN/SYNACK median, ARTT=client-payload to next server-payload median; numerical localhost helper only",
+  "ok": true,
+  "rows": 35,
+  "rttdiff_ms": 0.38552284240722656,
+  "trtt_ms": 0.015974044799804688,
+  "trtt_pairs": 2
+}

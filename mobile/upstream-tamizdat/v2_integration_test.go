@@ -73,6 +73,9 @@ func newV2IntegrationClient(t *testing.T, dialer DialFunc, recorder *v2DestRecor
 	t.Cleanup(func() { _ = client.Close() })
 	client.pool.liteCloseMin = 30 * time.Millisecond
 	client.pool.liteCloseMax = 30 * time.Millisecond
+	// Test bypass: skip the 3-sec delay-spawn warm-up so V2 tests see the
+	// lite transport spawn instantly when realtime traffic arrives.
+	client.pool.liteSpawnDelay = 0
 	return client
 }
 

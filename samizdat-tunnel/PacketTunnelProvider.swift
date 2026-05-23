@@ -45,7 +45,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let socksPort: UInt16 = 18443
 
     private var swiftHeartbeatTimer: DispatchSourceTimer?
+    // IPA-D18: emit heartbeat log line only every 5 ticks (every ~150 s
+    // at the new 30 s cadence) to drop file-write rate from 3600/hour
+    // to ~24/hour. Pressure events are still logged immediately.
+    private var hbTick: Int = 0
     private var swiftLogHandle: FileHandle?
+    private var memPressureSrc: DispatchSourceMemoryPressure?
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
@@ -59,6 +64,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let pathMonitorQueue = DispatchQueue(label: "com.anarki.samizdat-test.path", qos: .utility)
     private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
     private var lastReconnectAt = Date.distantPast
+
+    // IPA-D22: timestamp when startTunnel completed (the SOCKS5 listener
+    // is up and we handed packets to hev). Surfaced in the "status" RPC
+    // as uptimeSec so the main-app Uptime stat tile can render m:ss /
+    // h:mm without keeping its own anchor.
+    private let tunnelStartedAtLock = OSAllocatedUnfairLock<Date?>(initialState: nil)
+    private var tunnelStartedAt: Date? {
+        get { tunnelStartedAtLock.withLock { $0 } }
+        set { tunnelStartedAtLock.withLock { $0 = newValue } }
+    }
+
+    // IPA-D22: 1 while rewireUpstream is mid-flight (SetSamizdatConfig
+    // call running on a background queue). Surfaced as `isRewiring` in
+    // the status RPC so the main-app shield can flip to amber
+    // "Reconnecting…" instantly without waiting for path-monitor
+    // settling. Read+written under runningState's same unfair lock for
+    // cheapness — concurrency model: one rewire at a time.
+    private let rewiringFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private var isRewiring: Bool {
+        get { rewiringFlag.withLock { $0 } }
+        set { rewiringFlag.withLock { $0 = newValue } }
+    }
 
     // IPA-P: dual-endpoint storage. The combined blob arrives in
     // providerConfiguration; we split it into primary + optional backup
@@ -75,6 +102,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // back to primary when it lifts.
     private var whitelistDetector: WhitelistDetector?
     private var lastPathSatisfied: Bool = true
+
+    // IPA-D26: bridge object retained while the tunnel is up so the
+    // Go-side rewire requester atomic.Value holds a valid pointer.
+    private var autoRewireBridge: AutoRewireBridge?
+
+    // IPA-A1: PacketBridge removed. We're back on the original
+    // "Path 3" architecture (Pattern 1 in the iOS proxy taxonomy):
+    // hev gets the raw utun file descriptor via KVO and reads/writes
+    // packets directly in C. No Swift in the data path. Same setup
+    // Shadowrocket / Surge / Tun2SocksKit use. Loss: per-flow
+    // NEFlowMetaData (app bundle-id) — the Tamizdat-App-Hint header
+    // (Tier 3 server classifier signal) is no longer sent. Server's
+    // Tier 1 (port whitelist for Roblox/AnyDesk/Discord/IANA-dynamic)
+    // and Tier 2 (cadence/jitter for RTP/opus) handle real workload
+    // without it.
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
@@ -111,6 +153,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
+
+        // IPA-D26: register the auto-rewire bridge so the Go-side ping
+        // prober can request a fresh client when it sees consecutive
+        // misses. Catches the case where wifi is dying but iOS hasn't
+        // yet failed over to LTE — system NWPath stays satisfied (or
+        // takes 15-30 s to flip), but the prober knows the upstream
+        // is unreachable RIGHT NOW. Throttled in Go to once per 15 s.
+        let rewireBridge = AutoRewireBridge { [weak self] in
+            guard let self else { return }
+            self.appendExtLog("info: auto-rewire fired by ping prober (consecutive fails)")
+            self.rewireUpstream()
+        }
+        // Stash a strong ref so the bridge isn't deallocated while Go
+        // holds it via atomic.Value.
+        self.autoRewireBridge = rewireBridge
+        SocksstubSetRewireRequester(rewireBridge)
 
         let settings = makeNetworkSettings(serverIP: serverIP)
         appendExtLog("info: applying packet tunnel network settings")
@@ -149,10 +207,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return false
             }
         }
-        // IPA-T: seed Go-side with the persisted "Performance mode" flag
-        // before building the client. The setter just stores the bit;
-        // SetSamizdatConfig below reads it when constructing ClientConfig.
-        SocksstubSetGameOptimizedMode(PerformancePreferences.gameOptimized)
+        // IPA-D22: pool variant picker deleted from the UI. V1 is the
+        // hardcoded shipping choice (matches what mobile/socksstub
+        // ships with). Setter is still called so the Go bridge has a
+        // consistent value if anything reads it back; semantically a
+        // no-op against the default.
+        SocksstubSetPoolVariant("v1")
+        // IPA-D21: push the configured real-internet ping probe URL into
+        // Go-side before the first client is built, so the prober's first
+        // tick fires against the user's chosen target. App-side updates
+        // (via SettingsView) are pushed live through the
+        // "refreshPingURL" provider message handled below.
+        SocksstubSetPingProbeURL(PingURLPreferences.url)
+        // Phase C iOS-notify (2026-05-10): register the bridge BEFORE the
+        // first samizdat client is built. The first bundle fetch happens
+        // immediately after SetSamizdatConfig, so a user who is already
+        // over-quota at connect time still gets the notification.
+        SocksstubSetNotificationCallback(NotificationBridge.shared)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -166,14 +237,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                              completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         isRunning = false
+        // IPA-D22: clear so the main-app Uptime tile flips to "—".
+        tunnelStartedAt = nil
+        isRewiring = false
         appendExtLog("info: PacketTunnelProvider stopTunnel reason=\(reason.rawValue)")
+        // IPA-D26: drop the auto-rewire bridge so it doesn't keep a
+        // strong reference to self after the tunnel is torn down.
+        autoRewireBridge = nil
         whitelistDetector?.stop()
         whitelistDetector = nil
-        WhitelistStatusStore.reset()
+        // D61 FIX: do NOT call WhitelistStatusStore.reset() here.
+        // reset() wipes activeEndpoint → defaults to .primary → Mode
+        // tile flips from "Whitelist" to "Main" on every disconnect,
+        // even though the network is still whitelist-filtered. The
+        // main-app WhitelistMonitor resumes on disconnect and writes
+        // fresh values; the 200s stale-check handles truly stale data.
         pathMonitor.cancel()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
+        stopBurstProtection()  // IPA-D2
         try? swiftLogHandle?.close()
         swiftLogHandle = nil
         completionHandler()
@@ -220,17 +303,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // Debounce: iOS can fire 3-4 path updates in a flap (interface
-        // appears, gets DHCP, gets IPv6, becomes default, …). 3 s is
-        // longer than typical flap settle but well below user patience.
-        let now = Date()
-        if now.timeIntervalSince(lastReconnectAt) < 3.0 {
-            appendExtLog("info: path change \(prev ?? "?") → \(kind) — debounced")
+        // IPA-D17: removed 3-second blanket debounce. sing-box-for-apple
+        // (ExtensionPlatformInterface.swift:260-271) calls onUpdate
+        // DefaultInterface synchronously from the path callback with no
+        // debounce; the same-kind early return above already coalesces
+        // satisfied→satisfied churn for free. The 3-s blanket was the
+        // reason users felt the WiFi-off → cellular-on switch hang for
+        // ~30-60 seconds: dead flows kept running until their per-stream
+        // read-timeout while we sat on the debounce.
+        //
+        // Skip rewire on .unsatisfied transitions — there is no upstream
+        // to dial through, and rebuilding a samizdat.Client now would
+        // just fail and waste the warm-up TLS handshake. The next
+        // .satisfied callback with a fresh interface kind fires a real
+        // rewire.
+        if !satisfied {
+            appendExtLog("info: path change \(prev ?? "?") → \(kind) — unsatisfied, deferring rewire to next satisfied path")
             return
         }
-        lastReconnectAt = now
+        lastReconnectAt = Date()
 
-        appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream")
+        appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream + force-closing stale flows")
         rewireUpstream()
     }
 
@@ -251,7 +344,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         } else {
             typeName = "other"
         }
-        let names = path.availableInterfaces.map { $0.name }.joined(separator: ",")
+        var seenNames = Set<String>()
+        let names = path.availableInterfaces.compactMap { iface -> String? in
+            let name = iface.name
+            guard !name.hasPrefix("utun"), seenNames.insert(name).inserted else {
+                return nil
+            }
+            return name
+        }.joined(separator: ",")
         return "\(typeName)[\(names)]"
     }
 
@@ -265,17 +365,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
+        // IPA-D22: flip the isRewiring flag so the main-app shield can
+        // render "Reconnecting…" instantly. Cleared in `defer` below.
+        isRewiring = true
         // Run off the path monitor queue to avoid serializing further
         // updates while we sit inside Go-side teardown.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            defer { self.isRewiring = false }
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
                 self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
-            } else {
-                self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+                return
             }
+            self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+
+            // IPA-D17: after the new client is in place, force-close
+            // every loopback SOCKS5 flow that hev opened over the OLD
+            // path. Apps see RST → reconnect immediately on the fresh
+            // client, instead of hanging on dead H/2 streams until
+            // per-stream read timeout (~30-60 s).
+            //
+            // Order matters: swap first, close flows second. Otherwise
+            // the close would race with retries that have nowhere to go.
+            //
+            // Reference patterns:
+            //   sing-box-for-apple: onUpdateDefaultInterface in libbox
+            //     causes the route NetworkManager to flush per-flow
+            //     DefaultMarker, propagating EOF to in-flight conns.
+            //   Shadowrocket: -[DLWPacketTunnelProvider closeAllTunnels]
+            //     (Ghidra @ 0x1000e43f4) walks 7 tunnel singletons.
+            //
+            // Our equivalent is the single SocksstubCloseAllFlows() over
+            // the unified flowRegistry — same effect, less ceremony.
+            let closed = SocksstubCloseAllFlows()
+            self.appendExtLog("info: rewire force-closed \(closed) stale flows")
         }
     }
 
@@ -370,14 +495,88 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
         case "refreshSamizdatClient":
-            // IPA-T: Performance-mode toggle changed in main-app UI.
-            // Push the new flag into Go-side then rebuild the client
-            // with the matching DisableDefaultSecurity setting.
-            let perf = PerformancePreferences.gameOptimized
-            appendExtLog("info: app requested samizdat refresh (performance mode = \(perf))")
-            SocksstubSetGameOptimizedMode(perf)
+            // IPA-D22: pool-variant UI deleted. Path retained for
+            // future cases where the app wants to force a samizdat
+            // client rebuild; pool variant is now hardcoded V1 in the
+            // setInProcessSocks bootstrap.
+            appendExtLog("info: app requested samizdat refresh")
+            SocksstubSetPoolVariant("v1")
             rewireUpstream()
             completionHandler?("refreshed".data(using: .utf8))
+        case "refreshPingURL":
+            // IPA-D21: SettingsView's ping-probe URL field changed in the
+            // main app. Re-read from App Group UserDefaults and push into
+            // Go-side. Prober picks it up on the next tick — no need to
+            // rebuild the samizdat client.
+            let url = PingURLPreferences.url
+            appendExtLog("info: app requested ping URL refresh → \(url)")
+            SocksstubSetPingProbeURL(url)
+            completionHandler?("pingURLRefreshed".data(using: .utf8))
+        case "refreshWhitelistProbes":
+            // IPA-D23: SettingsView's whitelist probe targets changed.
+            // Re-read prefs and tell the detector to adopt them. The
+            // excludedRoutes change requires a tunnel reconnect to take
+            // effect (we don't currently rebuild network settings live);
+            // the UI shows a disclaimer about that.
+            appendExtLog("info: app requested whitelist probes refresh → testHost=\(WhitelistProbePreferences.testHost) whitelistHost=\(WhitelistProbePreferences.whitelistHost)")
+            whitelistDetector?.applyConfig()
+            completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
+        case "status":
+            // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
+            // Snapshot is built from in-process Socksstub*() getters which
+            // read tamizdat.Client + ping-prober atomic state — no locks,
+            // no I/O. Field names must stay in sync with
+            // TamizdatStatusSnapshot in TamizdatStatusStore.swift.
+            //
+            // D21: rttBulk/rttLite/liteAlive/lockedFlows kept in the JSON
+            // (no harm) but no longer read on the Swift side — the lamp
+            // now uses the ping snapshot fields. Old fields will be
+            // dropped in a future cleanup commit once the v0.2.D21 IPA is
+            // rolled out and no skewed clients remain in the wild.
+            let pingSnap = SocksstubPingProbeSnapshot()
+            // IPA-D22: include hev cumulative byte counters + uptime so
+            // the main-app Data + Uptime stat tiles can render without
+            // any extra RPC. `hev_socks5_tunnel_stats` semantics on the
+            // iOS side: tx = packets/bytes from utun (app→remote), rx
+            // = packets/bytes back. We expose both as "rxBytes" and
+            // "txBytes"; the main app sums them for the Data tile and
+            // diffs them for the rate readout.
+            var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
+            hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
+            let uptime: Int64
+            if let started = self.tunnelStartedAt {
+                uptime = Int64(Date().timeIntervalSince(started))
+            } else {
+                uptime = 0
+            }
+            let payload: [String: Any] = [
+                "realShape":   SocksstubRealShapeMode(),
+                "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
+                "liteAlive":   Int(SocksstubLiteAlive()),
+                "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),
+                "rttBulkMs":   Int(SocksstubRTTBulkP50Ms()),
+                // IPA-D21 ping-prober fields.
+                "pingMs":      Int(pingSnap?.lastMs ?? -1),
+                "pingOK":      pingSnap?.ok ?? false,
+                "pingFailed":  pingSnap?.failed ?? false,
+                "pingURL":     pingSnap?.url ?? "",
+                // IPA-D22 stat-tile + reconnecting fields.
+                "rxBytes":     Int64(rx_bytes),
+                "txBytes":     Int64(tx_bytes),
+                "uptimeSec":   uptime,
+                "isRewiring":  self.isRewiring ? 1 : 0,
+                // VK TURN relay credential status. IPA-D65b: the main
+                // app now acquires creds itself via WKWebView captcha
+                // solving and writes them to App Group UserDefaults
+                // (`TURNCredsStore`). The extension only READS the
+                // cache here — no VK API touch from inside the NE.
+                // The legacy `SocksstubTURNCredsSnapshot()` is kept on
+                // the Go side as a no-op fallback for now but is no
+                // longer the source of truth.
+                "hasTURNCreds": TURNCredsStore.shared.isFresh,
+            ]
+            let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            completionHandler?(json)
         default:
             completionHandler?(Data())
         }
@@ -396,6 +595,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //     code paths, otherwise it silently drops packets.
         //   - connect-timeout 2 s (down from 5) — first DNS query
         //     should not stall 5 s on a brief startup race.
+        // IPA-A7: revert A4's hev YAML caps. The 2nd analyst's review
+        // identified A4's `tcp-buffer-size: 16 KiB` as the smoking gun
+        // for Go heap explosion in the A4 log: lwIP outbound buffer
+        // (16 KiB) was too small relative to Go h2 stream window
+        // (64 KiB), producing backpressure pile-up that pinned 200
+        // streams × ~100 KB = 20+ MiB of "released-but-stuck" Go state.
+        // A5 added pcs eviction but kept the YAML, so heap explosions
+        // continued under load.
+        //
+        // Back to defaults — let lwIP run with its standard 64 KiB
+        // tcp-buffer matched against Go's 64 KiB stream window. The
+        // pcs-map leak (the original A3 9-min YouTube cause) is still
+        // bounded by Phase A in IPA-A5.
+        //
+        // Only retained: task-stack-size 24 KiB (default 84 KiB,
+        // historic iOS budget choice — out of scope to revisit).
         let yaml = """
 tunnel:
   mtu: 1280
@@ -410,18 +625,25 @@ misc:
   task-stack-size: 24576
   log-level: 'info'
   connect-timeout: 2000
-  read-write-timeout: 60000
+  # IPA-D19: bump hev per-socket read/write idle from 60s to 5min.
+  # 60s killed AnyDesk after ~1 minute when the user paused typing on the
+  # HID side of its multi-TCP relay (only the video channel kept hev's read
+  # loop fed; HID went silent and tripped the deadline). 5 min matches sing-
+  # box's industry-standard UDPTimeout/TCPKeepAliveInitial constants
+  # (sing-box/constant/timeout.go:6,12). See diagnosis at
+  # /c/var-tmp/anydesk-diagnosis.md.
+  read-write-timeout: 300000
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
-        // IPA-H: utun fd discovery via NEPacketTunnelFlow KVO. The
-        // earlier "scan all fds" approach picks up the wrong utun on
-        // iOS 17+ when iCloud Private Relay or other system VPNs add
-        // utun interfaces — symptom in IPA-G: hev tx=0/0 forever
-        // because we hand it a fd that has no packets coming in.
-        // packetFlow.value(forKeyPath: "socket.fileDescriptor") is a
-        // private-API KVO read used by Tun2SocksKit, sing-box-for-
-        // apple, and every other production iOS proxy client.
+        // IPA-A1: direct utun fd handoff to hev. Same pattern as
+        // Tun2SocksKit, Shadowrocket, sing-box-with-hev configs etc.
+        // KVO `socket.fileDescriptor` is the well-known private API
+        // every shipping iOS proxy app uses — wireguard-apple,
+        // sing-box-for-apple, Tun2SocksKit. Apple has not deprecated it.
+        // Fallback fd-scanner kept as diagnostic for the rare case KVO
+        // returns nil (typically when iCloud Private Relay's utun
+        // shadows ours).
         let kvoFD = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
         let scanFD = Self.findTunnelFileDescriptor(log: { line in self.appendExtLog(line) }) ?? -1
         appendExtLog("info: utun fd kvo=\(kvoFD) scan=\(scanFD)")
@@ -449,9 +671,12 @@ misc:
         appendExtLog("info: SOCKS5 reachable; handing packets to hev")
 
         startSwiftHeartbeat()
+        startBurstProtection()  // IPA-D2
         startPathMonitor()
         startWhitelistDetectorIfNeeded()
         isRunning = true
+        // IPA-D22: anchor uptime for the main-app Uptime stat tile.
+        tunnelStartedAt = Date()
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
         // dedicated background queue.
@@ -518,6 +743,53 @@ misc:
         return best >= 0 ? best : nil
     }
 
+    /// IPA-D23: turn a user-entered probe target ("8.8.8.8" or "google.com")
+    /// into an IPv4 literal suitable for an NEIPv4Route /32 exclusion.
+    /// IP literals pass through unchanged. Hostnames are resolved via the
+    /// system resolver with a 2 s budget; failure returns nil and the
+    /// caller skips the route (the detector will then surface that probe
+    /// as a failure until the tunnel reconnects). IPv6 literals also
+    /// return nil — we don't currently expose IPv6 excludedRoutes (the
+    /// tunnel is v4-only by Phase 2.5 design).
+    private static func resolveProbeTargetIPv4(_ target: String, log: (String) -> Void) -> String? {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        // Already an IPv4 literal?
+        var v4 = in_addr()
+        if inet_pton(AF_INET, trimmed, &v4) == 1 {
+            return trimmed
+        }
+        // IPv6 literal — explicitly skip (v4-only tunnel, no v6 routes).
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, trimmed, &v6) == 1 {
+            log("info: probe target \(trimmed) is IPv6 literal — skipping v4 exclusion")
+            return nil
+        }
+        // Hostname — synchronous resolve with 2 s budget.
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        let sem = DispatchSemaphore(value: 0)
+        var found: String?
+        DispatchQueue.global(qos: .utility).async {
+            var res: UnsafeMutablePointer<addrinfo>?
+            defer { if let res = res { freeaddrinfo(res) } }
+            if getaddrinfo(trimmed, nil, &hints, &res) != 0 {
+                sem.signal(); return
+            }
+            if let head = res {
+                var addr = head.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    found = String(cString: buf)
+                }
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 2.0)
+        return found
+    }
+
     /// Best-effort TCP probe to see if the main app's SOCKS5 listener is up
     /// before we hand packets to hev. Avoids a 60-second hev timeout for
     /// each early flow when the app isn't running.
@@ -572,17 +844,35 @@ misc:
         // Critically: exclude 127.0.0.1/8 from the tunnel so hev's SOCKS5
         // dial to the main app's listener does NOT loop back through us.
         // (iOS may special-case loopback here but explicit is safer.)
-        ipv4.excludedRoutes = (ipv4.excludedRoutes ?? []) + [
+        var excluded: [NEIPv4Route] = (ipv4.excludedRoutes ?? []) + [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
-            // IPA-Q: WhitelistDetector probe targets must reach the
-            // underlying interface, not loop through our own utun.
-            // 1.1.1.1 + 8.8.8.8 are the global "is internet up" canaries;
-            // 77.88.8.0/24 covers all Yandex DNS variants used as the
-            // RU-whitelisted canary.
-            NEIPv4Route(destinationAddress: "1.1.1.1", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "8.8.8.8", subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "77.88.8.0", subnetMask: "255.255.255.0"),
         ]
+        // IPA-D23: dynamic WhitelistDetector probe-target exclusions.
+        // Pull the two configured hosts (testHost + whitelistHost) from
+        // App Group UserDefaults. If a value is an IPv4 literal, add it
+        // as /32. If it's a hostname, resolve once now (synchronous, 2 s
+        // budget). On resolution failure, skip — the detector will
+        // simply report fail on that probe until the user reconnects
+        // with a working value.
+        let probeTargets = [
+            WhitelistProbePreferences.testHost,
+            WhitelistProbePreferences.whitelistHost,
+        ]
+        var addedProbeIPs = Set<String>()
+        for target in probeTargets {
+            guard let ip = Self.resolveProbeTargetIPv4(target, log: appendExtLog) else {
+                appendExtLog("warn: probe target \(target) — could not resolve to IPv4, route skipped")
+                continue
+            }
+            if addedProbeIPs.contains(ip) {
+                appendExtLog("info: probe target \(target) → \(ip) already excluded (deduped)")
+                continue
+            }
+            addedProbeIPs.insert(ip)
+            appendExtLog("info: probe target \(target) → excludedRoute \(ip)/32")
+            excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
+        }
+        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 
         // No IPv6 — see Phase 2.5 rationale; v4-only tunnel is unambiguous.
@@ -602,11 +892,54 @@ misc:
         // Now that IPA-I added cmd=0x05 / FWD_UDP support in SocksStub
         // backed by samizdat.Client.DialUDP, we can safely force DNS
         // (UDP/53) through the tunnel: hev wraps it as cmd=0x05, our
-        // SocksStub opens a samizdat UDP tunnel to 1.1.1.1:53 / 8.8.8.8:53,
-        // and the response comes back the same way. matchDomains=[""]
-        // catches every domain (the empty-string match-all sentinel).
-        let dns = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
+        // SocksStub opens a samizdat UDP tunnel to the configured
+        // resolver, and the response comes back the same way.
+        //
+        // IPA-D22 fix3 (DNS leak): the resolver IPs were 1.1.1.1 + 8.8.8.8
+        // — the SAME IPs we exclude above for WhitelistDetector canary.
+        // Result: iOS sent DNS queries to 1.1.1.1, routing matched
+        // excludedRoutes, packets went OUT VIA PHYSICAL Wi-Fi/cellular
+        // (RU ISP), Cloudflare anycast saw RU client and returned
+        // RU-close CDN edges. App then opened TCP to that RU-close IP
+        // via tunnel → exit Finland → server saw Finland IP for an
+        // RU-edge destination → mismatch → ChatGPT/CDN refusals.
+        //
+        // Use Cloudflare/Google SECONDARY IPs (1.0.0.1, 8.8.4.4) for
+        // DNS-via-tunnel. They are anycast and unrelated to canary IPs
+        // in excludedRoutes, so they resolve cleanly through the tunnel
+        // and the upstream-server (Finland exit) is the query source.
+        // GeoDNS therefore returns Finland-close edges; subsequent TCP
+        // is consistent with the tunnel exit IP.
+        //
+        // IPA-DNS-LEAK-FIX (2026-05-11): the previous fix3 set
+        // `matchDomains = [""]` but did NOT set `matchDomainsNoSearch =
+        // true`. On iOS 17/18 with split-DNS semantics this is the
+        // documented difference between "every query goes to our DNS"
+        // vs "iOS still consults the system resolver in parallel /
+        // first for FQDNs". Production iOS proxy clients (sing-box-
+        // for-apple ExtensionProvider.swift, Hiddify, Streisand) all
+        // set BOTH flags together — empty matchDomain alone is not a
+        // reliable catch-all on iOS. The leak manifested as ChatGPT
+        // and Roblox refusing the iPhone: app got a Russia-biased CDN
+        // IP from the leaked system DNS query (RU ISP resolver
+        // returning RU-edge), then opened TCP to that RU-edge IP via
+        // tunnel → exit IP Finland but destination is RU-edge of CDN
+        // → CDN sees geo-mismatch → block. Setting
+        // matchDomainsNoSearch=true forces ALL DNS through the tunnel
+        // so the IPs the app receives are Finland-edge from the start.
+        //
+        // Refs:
+        //   https://sing-box.sagernet.org/configuration/dns/  (catch-all pattern)
+        //   sing-box-for-apple/ExtensionProvider/include/ExtensionProvider.swift
+        //   Apple NEDNSSettings docs:
+        //     matchDomainsNoSearch=true means "treat matchDomains as a
+        //     pure resolver-selection filter, do NOT also add them to
+        //     the system search list" — which is exactly what we want
+        //     for [""] catch-all (otherwise iOS treats "" as a search
+        //     suffix and bypass FQDNs).
+        let dns = NEDNSSettings(servers: ["1.0.0.1", "8.8.4.4"])
         dns.matchDomains = [""]
+        dns.matchDomainsNoSearch = true
         settings.dnsSettings = dns
 
         return settings
@@ -628,29 +961,125 @@ misc:
         }
     }
 
+    private func startBurstProtection() {
+        // IPA-D7: nuclear close pattern from sing-box-for-apple.
+        // IPA-D9: dump heap profile right before nuclear close — captures
+        // the heap state at the exact moment iOS says we're critical,
+        // which is the most informative snapshot for diagnosing leaks.
+        let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
+        let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
+        src.setEventHandler { [weak self] in
+            self?.dumpProfileBeforeNuclear(reason: "kernel-critical")
+            let closed = SocksstubCloseAllFlows()
+            self?.appendExtLog("warn: kernel memorypressure CRITICAL — nuclear close (\(closed) flows)")
+        }
+        src.activate()
+        self.memPressureSrc = src
+    }
+
+    private func dumpProfileBeforeNuclear(reason: String) {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupID
+        ) else {
+            appendExtLog("warn: heap-dump: appGroup container not available")
+            return
+        }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let heapURL = containerURL.appendingPathComponent("heap-\(reason)-\(stamp).pb.gz")
+        let heapErr = SocksstubWriteHeapProfile(heapURL.path)
+        if heapErr.isEmpty {
+            appendExtLog("info: heap-dump → \(heapURL.lastPathComponent)")
+        } else {
+            appendExtLog("warn: heap-dump failed: \(heapErr)")
+        }
+    }
+
+    private func stopBurstProtection() {
+        self.memPressureSrc?.cancel()
+        self.memPressureSrc = nil
+    }
+
     private func startSwiftHeartbeat() {
         let queue = DispatchQueue(label: "com.anarki.samizdat-test.swift-hb", qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        // IPA-D18: 1 s → 30 s. The 1 Hz cadence kept the extension CPU
+        // pinned awake and ran runtime.GC() 3600x/hour — both major
+        // battery leaks per gpt-5.5 analyst. Memory leak from D12 is
+        // fixed; we no longer need fast crash-correlation. Pressure
+        // detection still fires via DispatchSource.makeMemoryPressure
+        // Source(.critical) which kernel-pushes (zero-cost when idle).
+        // sing-box-for-apple has no comparable extension heartbeat at
+        // all — we keep one for diagnostics but at human cadence.
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(30))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
-            let avail = os_proc_available_memory()
+            // iOS's apple-supplied "available before jetsam" gauge.
+            let availKB = os_proc_available_memory() / 1024
+
+            // IPA-D7/D9: per-process memory backstop with heap dump.
+            let availBytes = os_proc_available_memory()
+            var nuclearFired = false
+            if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
+                self.dumpProfileBeforeNuclear(reason: "avail8mib")
+                let closed = SocksstubCloseAllFlows()
+                self.appendExtLog("warn: avail<8MiB heartbeat — nuclear close (\(closed) flows)")
+                nuclearFired = true
+            }
+
+            // Go heap detail — disambiguates "Go is bloating" from
+            // "non-Go is bloating" on a crash.
+            //   inUse: working set of allocated objects RIGHT NOW.
+            //   sys: heap committed from OS (>= inUse).
+            //   released: returned to OS via madvise.
+            //   numGC: cycles completed since process start (rate)
+            let goInUseKB = SocksstubMemHeapInUseKB()
+            let goSysKB   = SocksstubMemHeapSysKB()
+            let goRelKB   = SocksstubMemHeapReleasedKB()
+            let numGC     = SocksstubMemNumGC()
+
+            // IPA-D18: only force GC when actually approaching the
+            // jetsam ceiling. The unconditional 1 Hz call was running
+            // runtime.GC() 3600 times/hour, pinning CPU and burning
+            // battery. Go's pacer + GOGC handles the normal case;
+            // we only step in when avail-memory is genuinely tight
+            // (< 12 MiB headroom before iOS reaps us).
+            if availBytes > 0 && availBytes < 12 * 1024 * 1024 {
+                SocksstubFreeOSMemory()
+            }
+
+            // IPA-A1: pps comes from hev's own tunnel-stats counters
+            // (it now owns the data path again — no bridge counters
+            // to consult). Compute delta since last heartbeat.
             var tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0
             hev_socks5_tunnel_stats(&tx_pkts, &tx_bytes, &rx_pkts, &rx_bytes)
-            // Ask the Go runtime to return freed pages to iOS so they
-            // don't sit on our jetsam ledger between heartbeats. Cheap
-            // (a single madvise loop in Go's scavenger).
-            SocksstubFreeOSMemory()
-            self.appendExtLog(String(
-                format: "info: hb avail=%dKB hev tx=%d/%dKB rx=%d/%dKB",
-                avail / 1024,
-                tx_pkts, tx_bytes / 1024,
-                rx_pkts, rx_bytes / 1024
-            ))
+            let inboundPPS  = Int64(tx_pkts) - self.lastHevTxPkts
+            let outboundPPS = Int64(rx_pkts) - self.lastHevRxPkts
+            self.lastHevTxPkts = Int64(tx_pkts)
+            self.lastHevRxPkts = Int64(rx_pkts)
+
+            // IPA-D18: log only every 5 ticks (~150 s) for periodic
+            // health snapshot, OR immediately when nuclear close
+            // fired. Drops appendExtLog() rate from 3600/hour to
+            // ~24/hour, removing the per-tick file-write that pulled
+            // iOS out of idle state.
+            self.hbTick += 1
+            if nuclearFired || (self.hbTick % 5) == 0 {
+                self.appendExtLog(String(
+                    format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
+                    availKB,
+                    goInUseKB, goSysKB, goRelKB,
+                    numGC,
+                    inboundPPS, outboundPPS
+                ))
+            }
         }
         timer.resume()
         swiftHeartbeatTimer = timer
     }
+
+    // IPA-A1 bookkeeping for pps delta in heartbeat (from hev's own counters).
+    private var lastHevTxPkts: Int64 = 0
+    private var lastHevRxPkts: Int64 = 0
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -678,5 +1107,29 @@ misc:
             code: -1,
             userInfo: [NSLocalizedDescriptionKey: message]
         )
+    }
+}
+
+/// IPA-D26: gomobile-bound bridge for the ping prober's auto-rewire
+/// signal. Go calls `requestRewire()` when it has detected 2+
+/// consecutive HTTP HEAD failures through the tunnel — likely the
+/// upstream is unreachable on the current path (wifi dying without
+/// NWPath having flipped yet, or upstream node blip). We respond by
+/// rebuilding the samizdat client over the current default route.
+/// Throttled in Go to once per 15 s.
+final class AutoRewireBridge: NSObject, SocksstubRewireRequesterProtocol {
+    private let onRequest: () -> Void
+
+    init(onRequest: @escaping () -> Void) {
+        self.onRequest = onRequest
+        super.init()
+    }
+
+    /// Called from a Go goroutine — bounce off Go's stack before
+    /// touching extension state.
+    func requestRewire() {
+        DispatchQueue.global(qos: .userInitiated).async { [onRequest] in
+            onRequest()
+        }
     }
 }

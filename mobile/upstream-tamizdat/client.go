@@ -20,6 +20,77 @@ import (
 
 var setClientTCPQuickAck = setTCPQuickAck
 
+// pickServerNameExcluding returns a random SNI from the pool, biased away
+// from any SNI in `exclude`. Used to guarantee that a freshly-spawned lite
+// transport picks a different cover SNI than the active bulk transport so
+// the TSPU #546 counter (src_IP, SNI, JA3) for any single SNI stays at 1.
+//
+// If filtering yields an empty candidate set (pool exhausted by excludes),
+// falls back to the unfiltered weighted pick — the safety property is
+// best-effort, not absolute.
+func (c *Client) pickServerNameExcluding(exclude []string) string {
+	if len(exclude) == 0 {
+		return c.pickServerName()
+	}
+	excludeSet := make(map[string]struct{}, len(exclude))
+	for _, e := range exclude {
+		if e != "" {
+			excludeSet[e] = struct{}{}
+		}
+	}
+	if pushed := c.serverPushedSNIPool.Load(); pushed != nil && len(*pushed) > 0 {
+		primary := c.config.PrimarySNI
+		if primary == "" {
+			primary = c.config.ServerName
+		}
+		entries := []SNIEntry{}
+		if _, skip := excludeSet[primary]; !skip {
+			entries = append(entries, SNIEntry{SNI: primary, Weight: 100})
+		}
+		for _, e := range *pushed {
+			if e.SNI == "" {
+				continue
+			}
+			if _, skip := excludeSet[e.SNI]; skip {
+				continue
+			}
+			if len(entries) > 0 && entries[0].SNI == primary && e.SNI == primary {
+				if e.Weight > entries[0].Weight {
+					entries[0].Weight = e.Weight
+				}
+				continue
+			}
+			entries = append(entries, e)
+		}
+		if len(entries) > 0 {
+			if picked := pickWeightedSNI(entries); picked != "" {
+				return picked
+			}
+		}
+	}
+	pool := c.config.ServerNames
+	if len(pool) == 0 {
+		return c.pickServerName()
+	}
+	filtered := pool[:0:0]
+	for _, s := range pool {
+		if _, skip := excludeSet[s]; skip {
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	if len(filtered) == 0 {
+		return c.pickServerName()
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	var idx [8]byte
+	_, _ = rand.Read(idx[:])
+	i := int(binary.BigEndian.Uint64(idx[:])>>1) % len(filtered)
+	return filtered[i]
+}
+
 // pickServerName returns a randomly-chosen SNI from the configured pool.
 // Falls back to legacy single ServerName when no pool is configured.
 // Per-transport rotation breaks the "all clients of one IP share one SNI"
@@ -94,11 +165,20 @@ type Client struct {
 	handshakeLimiter    *handshakeLimiter
 	realtime            *RealtimeController
 	derivedShortIDs     atomic.Pointer[[][8]byte]
-	serverPushedSNIPool atomic.Pointer[[]SNIEntry]
-	coverCtx            context.Context
+	serverPushedSNIPool   atomic.Pointer[[]SNIEntry]
+	serverPushedTURNCreds atomic.Pointer[TURNCredsEntry]
+	coverCtx              context.Context
 	coverCancel         context.CancelFunc
 	bundleCtx           context.Context
 	bundleCancel        context.CancelFunc
+	// v1FlipChan delivers async ShapeMode flips for the V1 single-transport
+	// hot path. Audit #6: Promote -> onRealtimeOpen runs on the first RTP
+	// packet and previously held pool.mu + did syscalls inline; that delay
+	// hits the latency-critical packet. We now signal a goroutine via a
+	// buffered chan so the observer returns immediately.
+	v1FlipChan          chan ShapeMode
+	rttProbe            *rttProbe
+	v1FlipDone          chan struct{}
 	mu                  sync.Mutex
 	closed              bool
 }
@@ -131,18 +211,57 @@ func NewClient(config ClientConfig) (*Client, error) {
 	c.shaper = NewShaper(false, 0)
 	c.fragmenter = NewRecordFragmenter(config.RecordFragmentation)
 	c.fingerprintChooser = newFingerprintRotator(config.Fingerprint)
-	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.MaxTransports, config.BytesPerTransportSoftCap, config.RotationOverlapAllowance, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	// liteSpawnDelay default 3 sec — operator-supplied filter against short
+	// STUN probes (analyst #3 recommendation 2026-05-03). Disabled in strict
+	// mode (no lite spawn at all under strict).
+	liteSpawnDelay := 3 * time.Second
+	if config.StrictSingleH2 {
+		liteSpawnDelay = 0
+	}
+	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, config.MinTransports, config.MaxTransports, config.BytesPerTransportSoftCap, config.RotationOverlapAllowance, config.StrictSingleH2, liteSpawnDelay, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		return c.createTransport(ctx, class)
 	})
 	c.pool.setRealtimeController(c.realtime)
-	c.realtime.onLastRealtimeClose = c.pool.armLiteCloseHysteresis
+	c.realtime.onLastRealtimeClose = func() {
+		c.pool.armLiteCloseHysteresis()
+		c.pool.resetFirstRealtimeNanos()
+	}
 	if config.MaxTransports == 1 {
+		// V1 path: defer the (potentially slow) pool-wide flip to a worker
+		// goroutine so Promote -> Observe never blocks on pool.mu or syscalls.
+		c.v1FlipChan = make(chan ShapeMode, 4)
+		c.v1FlipDone = make(chan struct{})
+		go c.v1FlipWorker()
+		// Tier 2.5: V1 valve fires on RTP-stickylocked flow transitions only.
+		// onRealtimeOpen still fires on any realtime-class flow (including
+		// default-promoted UDP background like NTP/QUIC) — used for hysteresis
+		// management ONLY, no shape flip.
 		c.realtime.onRealtimeOpen = func() {
 			c.pool.cancelLiteCloseHysteresis()
-			c.pool.flipAllBulkTransports(ShapeLite)
 		}
+		// Locked-flow callbacks: only proven realtime (RTP-stickylocked) drives
+		// the valve. Background UDP no longer flips the pipe.
+		c.realtime.onLockedOpen = func() {
+			select {
+			case c.v1FlipChan <- ShapeLite:
+			default:
+			}
+		}
+		c.realtime.onLockedReturnToFull = func() {
+			select {
+			case c.v1FlipChan <- ShapeFull:
+			default:
+			}
+		}
+		// Backstop: even if locked-flow tracking missed a 1->0 (e.g., flow
+		// closed without going through Forget cleanly), hysteresis on
+		// activeRealtimeCount eventually fires onModeReturnToFull and we
+		// re-push ShapeFull. Idempotent.
 		c.realtime.onModeReturnToFull = func() {
-			c.pool.flipAllBulkTransports(ShapeFull)
+			select {
+			case c.v1FlipChan <- ShapeFull:
+			default:
+			}
 		}
 	} else {
 		c.realtime.onRealtimeOpen = c.pool.cancelLiteCloseHysteresis
@@ -153,10 +272,88 @@ func NewClient(config ClientConfig) (*Client, error) {
 		c.cover = c.startCoverTraffic(c.coverCtx, config.CoverTrafficTargets)
 	}
 
+	c.rttProbe = newRTTProbe(c)
+	c.rttProbe.start()
 	return c, nil
 }
 
 // DialContext opens a proxied connection to the destination through the server.
+// ShapeMode returns the current transport-wide shape mode of the bulk
+// transport. Useful for debug/observability via expvar:
+//
+//	expvar.Publish("tamizdat_shape_mode", expvar.Func(func() interface{} {
+//	    return client.ShapeMode()
+//	}))
+//
+// Returns "ShapeFull" or "ShapeLite". Returns "ShapeFull" if controller is nil.
+func (c *Client) ShapeMode() string {
+	if c == nil || c.realtime == nil {
+		return "ShapeFull"
+	}
+	return c.realtime.Mode().String()
+}
+
+// DisableRealtimeDetector puts the client's realtime classifier into
+// no-op mode. ClassifyOpen / Observe early-return TrafficBulk; per-
+// packet d.mu acquisition is skipped; cleanupLoop exits gracefully.
+// Wire-protocol unaffected — server-side classifier runs independently.
+//
+// IPA-A7 iOS-local: speedtest-time mutex contention on the global
+// detector lock (10000 acq/sec) was the dominant CPU cost on iOS.
+// Operator's measurement showed bulk-vs-lite RTT difference of 1 ms
+// — no measurable user benefit on this network. Trade the realtime-
+// aware shape-flip for a simpler V1+StrictSingleH2 invariant.
+func (c *Client) DisableRealtimeDetector() {
+	if c == nil || c.realtime == nil || c.realtime.Detector == nil {
+		return
+	}
+	c.realtime.Detector.Disable()
+}
+
+// ActiveRealtimeCount returns the live count of realtime-class flows tracked
+// by the client's realtime controller. Useful for debug observability.
+func (c *Client) ActiveRealtimeCount() int {
+	if c == nil || c.realtime == nil {
+		return 0
+	}
+	return c.realtime.ActiveRealtimeCount()
+}
+
+// LockedRealtimeCount returns the count of RTP-stickylocked (proven real
+// realtime) flows. Distinct from ActiveRealtimeCount which includes
+// default-promoted UDP background noise. Drives V1 valve toggle.
+func (c *Client) LockedRealtimeCount() int32 {
+	if c == nil || c.realtime == nil {
+		return 0
+	}
+	return c.realtime.LockedRealtimeCount()
+}
+
+// RealShapeMode returns the actual wire-shape of the bulk transport — what
+// outgoing TLS records are really shaped as right now. This is the ground
+// truth, not controller-intent. For V1 (single transport) this directly
+// reflects whether the valve has flipped.
+func (c *Client) RealShapeMode() string {
+	if c == nil || c.pool == nil {
+		return ""
+	}
+	return c.pool.BulkTransportShapeMode().String()
+}
+
+// LiteTransportAlive reports whether the V2/V3 dedicated lite-class realtime
+// transport is currently live. Always 0 for V1 (MaxTransports==1) where there
+// is no separate lite truba. Used for variant-aware lamp logic: V1 lights on
+// bulk-shape flip, V2/V3 light on this + locked-flow count.
+func (c *Client) LiteTransportAlive() int32 {
+	if c == nil || c.pool == nil {
+		return 0
+	}
+	if c.pool.LiteTransportAlive() {
+		return 1
+	}
+	return 0
+}
+
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	c.mu.Lock()
 	if c.closed {
@@ -168,8 +365,9 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	class := TrafficBulk
 	var flowID uint64
 	if c.realtime != nil {
-		class = c.realtime.Detector.ClassifyOpen(NewFlowMeta(network, address))
-		flowID = c.realtime.Open(class)
+		var token *flowToken
+		class, token = c.realtime.Detector.ClassifyOpenWithToken(NewFlowMeta(network, address))
+		flowID = c.realtime.OpenWithToken(class, token)
 	}
 	closeRealtime := func() {
 		if c.realtime != nil && flowID != 0 {
@@ -233,8 +431,9 @@ func (c *Client) DialUDP(ctx context.Context, address string) (net.PacketConn, e
 	class := TrafficBulk
 	var flowID uint64
 	if c.realtime != nil {
-		class = c.realtime.Detector.ClassifyOpen(NewFlowMeta("udp", address))
-		flowID = c.realtime.Open(class)
+		var token *flowToken
+		class, token = c.realtime.Detector.ClassifyOpenWithToken(NewFlowMeta("udp", address))
+		flowID = c.realtime.OpenWithToken(class, token)
 	}
 	closeRealtime := func() {
 		if c.realtime != nil && flowID != 0 {
@@ -248,11 +447,31 @@ func (c *Client) DialUDP(ctx context.Context, address string) (net.PacketConn, e
 		return nil, fmt.Errorf("getting transport: %w", err)
 	}
 
-	rwc, err := transport.openUDPTunnel(ctx, address)
+	rwc, err := transport.openUDPTunnel(ctx, address, class)
 	if err != nil {
 		transport.releaseStreamSlot()
 		closeRealtime()
 		return nil, fmt.Errorf("opening UDP tunnel to %s: %w", address, err)
+	}
+
+	if c.realtime != nil && c.realtime.Detector != nil && flowID != 0 {
+		if stream, ok := rwc.(*h2StreamRWC); ok {
+			c.realtime.Detector.registerMigrationHandle(flowID, &migrationHandle{
+				fastCloseFn:           stream.fastClose,
+				dstAddr:               address,
+				originalTransportLite: transport.class == TrafficRealtime,
+				ensureBulkFn: func() error {
+					bulkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					bulkTransport, err := c.pool.getTransportForClass(bulkCtx, TrafficBulk)
+					if err != nil {
+						return err
+					}
+					bulkTransport.releaseStreamSlot()
+					return nil
+				},
+			})
+		}
 	}
 
 	target := &streamAddr{network: "udp", address: address}
@@ -268,6 +487,9 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.rttProbe != nil {
+		c.rttProbe.stop()
+	}
 	if c.bundleCancel != nil {
 		c.bundleCancel()
 	}
@@ -277,7 +499,39 @@ func (c *Client) Close() error {
 	if c.cover != nil {
 		c.cover.close()
 	}
+	if c.realtime != nil && c.realtime.Detector != nil {
+		c.realtime.Detector.Close()
+	}
+	if c.v1FlipDone != nil {
+		select {
+		case <-c.v1FlipDone:
+		default:
+			close(c.v1FlipDone)
+		}
+	}
 	return c.pool.close()
+}
+
+// v1FlipWorker drains v1FlipChan and applies the latest mode to all bulk
+// transports asynchronously. Coalesces successive same-mode signals.
+func (c *Client) v1FlipWorker() {
+	for {
+		select {
+		case mode := <-c.v1FlipChan:
+			// Drain any pending updates — only the latest mode matters.
+			for draining := true; draining; {
+				select {
+				case next := <-c.v1FlipChan:
+					mode = next
+				default:
+					draining = false
+				}
+			}
+			c.pool.flipAllBulkTransports(mode)
+		case <-c.v1FlipDone:
+			return
+		}
+	}
 }
 
 // createTransport creates a new TLS+H2 connection to the server with
@@ -314,7 +568,15 @@ func (c *Client) createTransport(ctx context.Context, class TrafficClass) (*h2Tr
 		conn = fragmenter
 	}
 
-	sni := c.pickServerName()
+	var sni string
+	if class == TrafficRealtime {
+		// Lite transport: avoid the SNI(s) used by the bulk transport(s).
+		// Counter (src_IP, SNI, JA3) for any single SNI stays at 1 even
+		// under multi-transport (V1 default + lite, or V2/V3).
+		sni = c.pickServerNameExcluding(c.pool.activeSNIs())
+	} else {
+		sni = c.pickServerName()
+	}
 	tlsConfig := &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
@@ -397,7 +659,7 @@ func (c *Client) createTransport(ctx context.Context, class TrafficClass) (*h2Tr
 		fragmenter.ReportOutcome(true)
 	}
 
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout, class)
+	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper, c.fragmenter, c.config.DrainTimeout, class, sni)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
@@ -486,6 +748,31 @@ func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
 			c.cover.replaceGap(time.Duration(bundle.CoverGapMinMS)*time.Millisecond, time.Duration(bundle.CoverGapMaxMS)*time.Millisecond)
 		}
 	}
+	// VK TURN credentials: store for future TURN transport implementation.
+	// Currently a forward-compatible placeholder; the client-side TURN
+	// dialer will read these when implemented.
+	if bundle.TURNCreds != nil {
+		entry := *bundle.TURNCreds
+		c.serverPushedTURNCreds.Store(&entry)
+	}
+	// Phase C iOS-notify: forward a one-shot user-facing notification to any
+	// registered consumer (iOS NE bridges this to a local notification).
+	// Fire on a goroutine to keep the bundle-apply path non-blocking; the
+	// callback may do I/O (UserDefaults write, sendProviderMessage) we don't
+	// want to serialize against transport rotation. Copy the entry by value
+	// before launching — the caller may reuse the bundle.
+	if bundle.Notification != nil && c.config.OnNotification != nil {
+		entry := *bundle.Notification
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Don't propagate consumer panics into the client pool.
+					_ = r
+				}
+			}()
+			c.config.OnNotification(entry)
+		}()
+	}
 }
 
 type tlsConnWrapper struct {
@@ -500,4 +787,43 @@ func (w *tlsConnWrapper) ConnectionState() tls.ConnectionState {
 		NegotiatedProtocol: state.NegotiatedProtocol,
 		ServerName:         state.ServerName,
 	}
+}
+
+// TopRealtimeFlowSnapshot is a debug accessor — returns the busiest UDP flow
+// the detector currently tracks (highest pkts). Used for rate-stickylock
+// tuning observation via expvar.
+func (c *Client) TopRealtimeFlowSnapshot() TopRealtimeFlowStats {
+	if c == nil || c.realtime == nil || c.realtime.Detector == nil {
+		return TopRealtimeFlowStats{}
+	}
+	return c.realtime.Detector.TopRealtimeFlowSnapshot()
+}
+
+// ServerPushedTURNCreds returns the most recently received VK TURN
+// credentials from the server's CoverConfigBundle. Returns nil if the
+// server has not pushed any credentials yet (e.g. turncreds manager
+// disabled or credentials not yet fetched).
+func (c *Client) ServerPushedTURNCreds() *TURNCredsEntry {
+	if c == nil {
+		return nil
+	}
+	return c.serverPushedTURNCreds.Load()
+}
+
+// RTTProbeSnapshot returns the current RTT probe stats — last p50 in ms for
+// each shape (lite vs bulk), sample counts, and the most-recent measurement.
+// Returns -1 fields if probe has not collected samples yet.
+func (c *Client) RTTProbeSnapshot() RTTProbeStats {
+	if c == nil || c.rttProbe == nil {
+		return RTTProbeStats{LiteP50Ms: -1, BulkP50Ms: -1, LastMs: -1}
+	}
+	return c.rttProbe.Snapshot()
+}
+
+// LockedFlowsSnapshot — debug accessor to see currently-locked flows for tuning.
+func (c *Client) LockedFlowsSnapshot() []LockedFlowSnapshot {
+	if c == nil || c.realtime == nil || c.realtime.Detector == nil {
+		return nil
+	}
+	return c.realtime.Detector.LockedFlowsSnapshot()
 }

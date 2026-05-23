@@ -11,6 +11,7 @@ package tamizdat
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -90,8 +91,28 @@ type ClientConfig struct {
 	// transports; pool reaper spawns a replacement. 0 = disabled.
 	BytesPerTransportSoftCap int64
 
+	// StrictSingleH2 enforces "one TCP/443 per user, always" mode. When true:
+	//   - MinTransports = MaxTransports = 1 (no lite transport ever spawned)
+	//   - BytesPerTransportSoftCap pinned to 0 (no rotation)
+	//   - RotationOverlapAllowance pinned to 0
+	//   - Realtime classifier still runs, but on promote it transport-wide
+	//     flips the bulk H2's shapeMode to Lite for ALL streams. On last
+	//     realtime close + hysteresis the bulk transport flips back to Full.
+	// Trade-off: HoL blocking on shared TCP (bulk packet loss stalls voice
+	// frames for ~RTO=200ms). Wins: max one entry in TSPU #546 counter
+	// (src_IP, cover-SNI, JA3) per user, regardless of activity type.
+	// Default false = current V1 behaviour (lite-transport spawned on demand).
+	StrictSingleH2 bool
+
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
+
+	// OnNotification is invoked once per applied bundle when the server
+	// piggy-backed a NotificationEntry. Fires on a fresh Go goroutine so
+	// the bundle-apply path stays non-blocking; consumer MUST be thread-
+	// safe and MUST NOT panic (panics are recovered). Phase C iOS-notify
+	// pipeline — iOS NE bridges this to a local UNNotification.
+	OnNotification func(NotificationEntry)
 }
 
 func (c *ClientConfig) applyDefaults() {
@@ -115,8 +136,12 @@ func (c *ClientConfig) applyDefaults() {
 	if c.Fingerprint == "" {
 		c.Fingerprint = "mix"
 	}
-	if c.MaxStreamsPerConn == 0 {
-		c.MaxStreamsPerConn = 100
+	// MaxStreamsPerConn = 0 (default) means "no client-side cap; rely on
+	// the server's SETTINGS_MAX_CONCURRENT_STREAMS announced via h2 SETTINGS
+	// frame". Set to a positive value only as a per-platform safety floor
+	// (e.g. iOS PacketTunnelProvider memory-budget protection).
+	if c.MaxStreamsPerConn < 0 {
+		c.MaxStreamsPerConn = 0
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
@@ -135,23 +160,43 @@ func (c *ClientConfig) applyDefaults() {
 		c.TCPFragmentation = true
 		c.RecordFragmentation = true
 		c.CoverTrafficEnabled = true
-		if c.PoolVariant != "v1" && c.PoolVariant != "v2" && c.MinTransports < 2 {
+		if c.PoolVariant != "v1" && c.PoolVariant != "v2" && c.PoolVariant != "v3" && c.MinTransports < 2 {
 			c.MinTransports = 2
 		}
 	} else if c.MinTransports < 1 {
 		// even with security disabled, MinTransports must be >=1
 		c.MinTransports = 1
 	}
-	switch c.PoolVariant {
-	case "v1":
+	if c.StrictSingleH2 {
 		c.MinTransports = 1
 		c.MaxTransports = 1
-		if c.RotationOverlapAllowance == 0 {
+		c.RotationOverlapAllowance = 0
+		c.BytesPerTransportSoftCap = 0
+		// Strict mode owns the pool sizing; ignore PoolVariant overrides
+		// below by clearing them. Operator can still set PoolVariant for
+		// telemetry/labeling, but transport count is locked to 1.
+		c.PoolVariant = "v1-strict"
+	}
+	switch c.PoolVariant {
+	case "v1", "v1-strict":
+		c.MinTransports = 1
+		c.MaxTransports = 1
+		if c.PoolVariant == "v1-strict" {
+			c.RotationOverlapAllowance = 0
+			c.BytesPerTransportSoftCap = 0
+		} else if c.RotationOverlapAllowance == 0 {
 			c.RotationOverlapAllowance = 1
 		}
 	case "v2":
 		c.MinTransports = 1
 		c.MaxTransports = 2
+	case "v3":
+		// Opus pool sizing (compass review): two prewarmed transports for
+		// throughput parallelism, up to four under load. Trades a slightly
+		// taller TLS-conn-count fingerprint vs #546 threshold (~12) for
+		// significantly better tail latency and per-flow throughput.
+		c.MinTransports = 2
+		c.MaxTransports = 4
 	default:
 		if c.MaxTransports == 0 {
 			c.MaxTransports = c.MinTransports
@@ -196,6 +241,14 @@ type ServerConfig struct {
 	Debug           bool
 	DebugListenAddr string
 
+	// ShapeEventLogPath, when non-empty, opens a SEPARATE log file (NOT
+	// stderr/journalctl) and records V1 valve transitions:
+	//   - valve_open  when activeRealtimeCount transitions 0 → 1 (first realtime flow)
+	//   - valve_close when activeRealtimeCount transitions 1 → 0 (last realtime flow gone)
+	//   - stream_open per-flow with client identity (remoteAddr+shortid) + dst+class
+	// Operator-only debug aid, off by default (empty path).
+	ShapeEventLogPath string
+
 	DisableDefaultSecurity bool
 
 	EpochGraceWindow int
@@ -216,7 +269,7 @@ func (c *ServerConfig) applyDefaults() {
 		c.MasqueradeMaxDuration = 10 * time.Minute
 	}
 	if c.MaxConcurrentStreams == 0 {
-		c.MaxConcurrentStreams = 250
+		c.MaxConcurrentStreams = 1000
 	}
 	if c.ReplayWindow == 0 {
 		c.ReplayWindow = defaultReplayWindow
@@ -227,4 +280,28 @@ func (c *ServerConfig) applyDefaults() {
 	if !c.DisableDefaultSecurity {
 		c.RecordFragmentation = c.RecordFragmentation || true
 	}
+}
+
+// ContextWithAppHint attaches a process-name hint to ctx. Client-side
+// process attribution (e.g. /proc/net/tcp lookup on Linux) uses this to
+// pass the local app's name into Client.DialContext, which forwards it
+// as a "Tamizdat-App-Hint" HTTP/2 CONNECT header. Server-side realtime
+// classifier reads the header and applies a Tier 3 side-signal score
+// boost when the app is in the operator-configured realtime-app list.
+//
+// Empty hint is no-op. Hint values are lower-cased + trimmed before
+// transport to normalise across OSes.
+func ContextWithAppHint(ctx context.Context, hint string) context.Context {
+	hint = strings.ToLower(strings.TrimSpace(hint))
+	if hint == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, appHintCtxKey{}, hint)
+}
+
+// AppHintFromContext returns the app hint stored on ctx via
+// ContextWithAppHint, or "" if none.
+func AppHintFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(appHintCtxKey{}).(string)
+	return v
 }

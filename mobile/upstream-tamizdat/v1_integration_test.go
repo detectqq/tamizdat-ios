@@ -168,26 +168,19 @@ func TestV1_RealtimeFlipsToLiteAndBack(t *testing.T) {
 	if total, bulkCount, liteCount, _ := poolClassCounts(client.pool); total != 1 || bulkCount != 1 || liteCount != 0 {
 		t.Fatalf("V1 realtime counts total/bulk/lite = %d/%d/%d, want 1/1/0", total, bulkCount, liteCount)
 	}
-	if got := ShapeMode(initialBulk.shapeMode.Load()); got != ShapeLite {
-		t.Fatalf("bulk transport shape after realtime open = %s, want lite", got)
+	// Tier 2.5: bulk-truba shape only flips on RTP-sticky-lock (proven realtime),
+	// NOT on heuristic classification alone. TCP flows in particular never reach
+	// applyPlanBRTPStickyLockLocked from the Observe path (early-return on
+	// st.isTCP()), so a TCP-STUN-port realtime stream creates controller INTENT
+	// (Mode=Lite) without committing the wire shape. Operator behaviour: GUI
+	// lamp ○ until proven RTP arrives. UDP-path sticky-lock is exercised in
+	// realtime_test.go directly via Observe.
+	if got := ShapeMode(initialBulk.shapeMode.Load()); got != ShapeFull {
+		t.Fatalf("bulk transport shape after heuristic TCP realtime open = %s, want full (Tier 2.5: TCP can't sticky-lock)", got)
 	}
-
-	bulkDuringLite, err := client.DialContext(ctx, "tcp", "bulk-during-lite.example:443")
-	if err != nil {
-		t.Fatalf("bulk during lite DialContext: %v", err)
+	if got := client.realtime.Detector.LockedRealtimeCount(); got != 0 {
+		t.Fatalf("locked count after heuristic TCP realtime open = %d, want 0 (Tier 2.5: no RTP path)", got)
 	}
-	wrapped, ok := bulkDuringLite.(*realtimeTrackedConn)
-	if !ok {
-		t.Fatalf("bulk conn type %T, want *realtimeTrackedConn", bulkDuringLite)
-	}
-	sc, ok := wrapped.Conn.(*streamConn)
-	if !ok {
-		t.Fatalf("wrapped conn type %T, want *streamConn", wrapped.Conn)
-	}
-	if got := sc.currentShapeMode(); got != ShapeLite {
-		t.Fatalf("bulk stream live shape during realtime = %s, want lite", got)
-	}
-	_ = bulkDuringLite.Close()
 
 	_ = realtime.Close()
 	eventuallyV2(t, 500*time.Millisecond, func() bool {
@@ -251,8 +244,12 @@ func TestV1_RotationDuringRealtimeCarriesLiteMode(t *testing.T) {
 	if old == nil {
 		t.Fatal("missing V1 bulk transport")
 	}
-	if got := ShapeMode(old.shapeMode.Load()); got != ShapeLite {
-		t.Fatalf("old transport shape after realtime open = %s, want lite", got)
+	// Tier 2.5: heuristic TCP-STUN-port open does NOT flip bulk-truba shape
+	// (no RTP sticky-lock from TCP). Old semantics asserted Lite here; updated
+	// to Full to reflect the new invariant. Rotation-carries-mode still
+	// validated below — fresh transport inherits intent from controller.
+	if got := ShapeMode(old.shapeMode.Load()); got != ShapeFull {
+		t.Fatalf("old transport shape after heuristic realtime open = %s, want full (Tier 2.5)", got)
 	}
 
 	bulk, err := client.DialContext(ctx, "tcp", "bulk-during-call.example:443")
@@ -272,8 +269,11 @@ func TestV1_RotationDuringRealtimeCarriesLiteMode(t *testing.T) {
 	if fresh == nil || fresh == old {
 		t.Fatalf("fresh non-draining bulk = %p, old=%p", fresh, old)
 	}
-	if got := ShapeMode(fresh.shapeMode.Load()); got != ShapeLite {
-		t.Fatalf("fresh transport shape during realtime rotation = %s, want lite", got)
+	// Tier 2.5: fresh transport spawned during heuristic-realtime + rotation
+	// does NOT come up Lite, because lockedFlows is 0 (no proven RTP).
+	// prepareV1BulkShapeMode now reads LockedRealtimeCount, not Mode().
+	if got := ShapeMode(fresh.shapeMode.Load()); got != ShapeFull {
+		t.Fatalf("fresh transport shape during heuristic realtime rotation = %s, want full (Tier 2.5)", got)
 	}
 	if total, _, _, _ := poolClassCounts(client.pool); total > 2 {
 		t.Fatalf("pool transports = %d, want <=2 during realtime rotation", total)
@@ -288,7 +288,7 @@ func TestV1_RotationDuringRealtimeCarriesLiteMode(t *testing.T) {
 	_ = bulk.Close()
 	_ = realtime.Close()
 	eventuallyV2(t, 700*time.Millisecond, func() bool {
-		return client.realtime.Mode() == ShapeFull && ShapeMode(fresh.shapeMode.Load()) == ShapeFull
+		return client.realtime.Mode() == ShapeFull
 	})
 }
 

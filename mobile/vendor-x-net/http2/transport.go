@@ -39,20 +39,30 @@ import (
 )
 
 const (
-	// transportDefaultConnFlow: shrunk from 1 GiB → 4 MiB. iOS-vendor
-	// patch for the NEPacketTunnelProvider 50 MB RSS cap. Upstream's
-	// 1 GiB allowance was sized for Google's WAN workloads; here we just
-	// need enough connection budget that ~16-32 streams can each fill
-	// their stream window without stalling the conn.
-	transportDefaultConnFlow = 4 << 20
+	// transportDefaultConnFlow: shrunk from 1 GiB upstream → 1 MiB iOS.
+	// IPA-A2: was 4 MiB, with MaxStreamsPerConn=1000 we want connection
+	// budget bounded — 1 MiB conn × 1 stream-window-completion per RTT =
+	// 80 Mbps single-stream best case, plenty for everything we need
+	// (multi-stream multiplexing aggregates higher).
+	transportDefaultConnFlow = 1 << 20
 
-	// transportDefaultStreamFlow: shrunk from 4 MiB → 256 KiB.
-	// SETTINGS_INITIAL_WINDOW_SIZE we advertise to the server == size
-	// of each stream's bufPipe receive buffer == bytes the server is
-	// allowed to push at us before WINDOW_UPDATE. 4 MiB × 64 streams =
-	// 256 MiB blew the iOS extension's RAM budget under Speedtest. At
-	// 256 KiB × 64 streams = 16 MiB worst-case in-flight, comfortably
-	// below the 50 MB cap.
+	// transportDefaultStreamFlow: shrunk from 4 MiB upstream → 64 KiB iOS.
+	// IPA-A2: was 256 KiB. SETTINGS_INITIAL_WINDOW_SIZE advertised to
+	// the server == size of each stream's bufPipe receive buffer ==
+	// bytes the server is allowed to push at us before WINDOW_UPDATE.
+	//
+	// Roblox crashed IPA-A1 with 256 KiB × 200 stream cap = 50 MiB
+	// reserved buffer commitments. Operator's Windows tamizdat client
+	// uses 1000 stream cap (no memory cap on desktop). To match that
+	// on iOS we drop the per-stream window.
+	//
+	// IPA-D16: 128 KiB → 256 KiB. D14 confirmed heap stays at 5-10 MB
+	// even under heavy load (writeRequestBody leak fixed in D12). We
+	// have plenty of budget for bigger receive window.
+	// 500 streams × 256 KiB = 125 MiB max reserved (in practice <20% active
+	// → ~10 MiB live). Per-stream throughput @ 30 ms RTT:
+	// 256 KiB × 33/s = 70 Mbps single-stream — Speedtest single-conn
+	// shows this kind of number, YouTube quality switches faster.
 	transportDefaultStreamFlow = 256 << 10
 
 	defaultUserAgent = "Go-http-client/2.0"
@@ -1815,8 +1825,15 @@ var (
 //
 // It returns max(1, min(peer's advertised max frame size,
 // Request.ContentLength+1, 512KB)).
+//
+// IPA-D12 vendor patch: cap was 512 KiB upstream. On iOS extension we
+// hit 50 MiB jetsam at 50 × 512 KiB = 25 MiB just for these scratch
+// buffers (heap profile pinpointed 85% of in-use heap here). Shrunk
+// to 16 KiB — bw.Flush() runs after every WriteData (line ~1948 below)
+// so a smaller scratch doesn't reduce throughput; it just bounds the
+// per-stream outgoing memory footprint.
 func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
-	const max = 512 << 10
+	const max = 16 << 10
 	n := int64(maxFrameSize)
 	if n > max {
 		n = max

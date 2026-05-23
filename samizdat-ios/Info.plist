@@ -36,6 +36,19 @@
     <array>
         <string>arm64</string>
     </array>
+    <key>NSCameraUsageDescription</key>
+    <string>Tamizdat scans tamizdat:// QR codes for endpoint setup.</string>
+    <key>UIAppFonts</key>
+    <array>
+        <string>Geist-Regular.ttf</string>
+        <string>Geist-Medium.ttf</string>
+        <string>Geist-SemiBold.ttf</string>
+        <string>Geist-Bold.ttf</string>
+        <string>GeistMono-Regular.ttf</string>
+        <string>GeistMono-Medium.ttf</string>
+        <string>GeistMono-SemiBold.ttf</string>
+        <string>GeistMono-Bold.ttf</string>
+    </array>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>

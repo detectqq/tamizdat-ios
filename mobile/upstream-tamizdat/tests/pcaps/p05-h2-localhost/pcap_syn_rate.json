@@ -1,0 +1,35 @@
+{
+  "groups": [
+    {
+      "count": 3,
+      "interarrival": {
+        "count": 2,
+        "max": 0.05298614501953125,
+        "min": 0.0525970458984375,
+        "p50": 0.052791595458984375,
+        "p95": 0.05298614501953125
+      },
+      "server_ip": "127.0.0.1",
+      "server_port": "44993",
+      "windows": [
+        {
+          "end": 1777090571.86823,
+          "max_allowed": 36,
+          "max_observed": 3,
+          "start": 1777090571.762647,
+          "window_seconds": 60.0
+        },
+        {
+          "end": 1777090571.86823,
+          "max_allowed": 165,
+          "max_observed": 3,
+          "start": 1777090571.762647,
+          "window_seconds": 300.0
+        }
+      ]
+    }
+  ],
+  "ok": true,
+  "rows": 3,
+  "violations": []
+}

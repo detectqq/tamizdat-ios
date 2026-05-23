@@ -22,7 +22,7 @@ func (rt *v1CoverRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 
 func TestCoverLoopV1SkipsWhileRealtimeLite(t *testing.T) {
 	rt := &v1CoverRoundTripper{}
-	p := newConnPool(10, time.Hour, 1, 1, 0, 1, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	p := newConnPool(10, time.Hour, 1, 1, 0, 1, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		tr := &h2Transport{
 			maxStreams:   10,
 			serverAddr:   "tamizdat.test:443",

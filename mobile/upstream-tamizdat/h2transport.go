@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,11 @@ type h2Transport struct {
 	// shapeMode controls per-stream shaping inherited from this transport.
 	shapeMode atomic.Int32
 	class     TrafficClass
+	// sni is the SNI presented by THIS transport's TLS handshake. Connpool
+	// reads it to feed pickServerNameExcluding() so a freshly-spawned lite
+	// transport gets a different SNI than the active bulk transport(s).
+	// Empty string = unknown / not tracked.
+	sni string
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
@@ -59,7 +65,9 @@ type h2Transport struct {
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration, class TrafficClass) (*h2Transport, error) {
+// sni is the SNI presented during the TLS handshake (used by connpool
+// excludeSNIs accounting); empty string allowed for back-compat callers.
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper, fragmenter *RecordFragmenter, drainTimeout time.Duration, class TrafficClass, sni string) (*h2Transport, error) {
 	t := &h2Transport{
 		tlsConn:      tlsConn,
 		serverAddr:   serverAddr,
@@ -70,6 +78,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		fragmenter:   fragmenter,
 		drainTimeout: drainTimeout,
 		class:        class,
+		sni:          sni,
 	}
 	if class == TrafficRealtime {
 		t.shapeMode.Store(int32(ShapeLite))
@@ -145,6 +154,12 @@ func (t *h2Transport) addBytesSent(n int) {
 // live pcaps before treating BytesPerTransportSoftCap as an outer-wire budget.
 func estimatedOuterWireBytes(n int) int64 { return int64(n) * 6 }
 
+// appHintCtxKey is the context key used by client-side process attribution
+// to pass an "app hint" (process name) through DialContext into the H2
+// CONNECT request as the "Tamizdat-App-Hint" header. Server uses it as a
+// Tier 3 side signal in the realtime classifier.
+type appHintCtxKey struct{}
+
 // openTunnel issues an HTTP/2 CONNECT request to open a tunnel to the
 // destination through the proxy server. Returns a net.Conn backed by the
 // H2 stream.
@@ -174,12 +189,23 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
 	}
 	req.Host = destination
+	if hint, ok := ctx.Value(appHintCtxKey{}).(string); ok && hint != "" {
+		req.Header.Set("Tamizdat-App-Hint", hint)
+	}
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
 		stop()
 		tunnelCancel()
 		pw.Close()
+		// If the underlying TCP/TLS conn died, mark this transport closed so
+		// future pool selections skip it and create a fresh one. Common
+		// patterns: "use of closed network connection", "EOF", "stream error",
+		// "broken pipe" — all indicate the outer pipe is gone, not just this
+		// stream.
+		if isOuterDeadErr(err) {
+			t.closeFromError(err)
+		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
 
@@ -229,7 +255,7 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 // `destination`. The returned io.ReadWriteCloser carries length-prefixed UDP
 // datagrams (uint16 BE length || payload, see udp_packetconn.go MaxUDPDatagram).
 // Wrapped by Client.DialUDP into a net.PacketConn for callers.
-func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io.ReadWriteCloser, error) {
+func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string, class TrafficClass) (io.ReadWriteCloser, error) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -256,12 +282,18 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 	}
 	req.Host = destination
 	req.Header.Set(SamizdatProtocolHeader, SamizdatProtocolUDP)
+	if class == TrafficBulk {
+		req.Header.Set(SamizdatForceClassHeader, "bulk")
+	}
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
 		stop()
 		tunnelCancel()
 		pw.Close()
+		if isOuterDeadErr(err) {
+			t.closeFromError(err)
+		}
 		return nil, fmt.Errorf("UDP CONNECT to %s: %w", destination, err)
 	}
 
@@ -295,6 +327,9 @@ func (t *h2Transport) openUDPTunnel(ctx context.Context, destination string) (io
 // hasCapacity returns true if the transport can accept more streams.
 // Read-only -- racy by design. Use reserveStreamSlot for atomic claim.
 func (t *h2Transport) hasCapacity() bool {
+	if t.maxStreams <= 0 {
+		return !t.isDraining()
+	}
 	return !t.isDraining() && int(t.activeStreams.Load()) < t.maxStreams
 }
 
@@ -303,6 +338,17 @@ func (t *h2Transport) hasCapacity() bool {
 // HIGH-4: prevents the TOCTOU oversubscription where two callers each pass
 // hasCapacity() at activeStreams=99 and then both Add(1) -> 101 > 100.
 func (t *h2Transport) reserveStreamSlot() bool {
+	if t.maxStreams <= 0 {
+		// No client-side cap configured: trust server's
+		// SETTINGS_MAX_CONCURRENT_STREAMS handled by net/http2 internally.
+		// Still increment activeStreams so observability + drain accounting work.
+		if t.isDraining() || t.isClosed() {
+			return false
+		}
+		t.activeStreams.Add(1)
+		return true
+	}
+
 	for {
 		if t.isClosed() || t.isDraining() {
 			return false
@@ -392,6 +438,24 @@ func (s *h2StreamRWC) Close() error {
 				_ = s.transport.close()
 			}
 		}()
+	})
+	return closeErr
+}
+
+func (s *h2StreamRWC) fastClose() error {
+	var closeErr error
+	s.once.Do(func() {
+		closeErr = s.closeWriter()
+		_ = s.reader.Close()
+		if s.tunnelCancel != nil {
+			s.tunnelCancel()
+		}
+		if s.transport != nil {
+			remaining := s.transport.activeStreams.Add(-1)
+			if remaining == 0 && s.transport.isDraining() {
+				_ = s.transport.close()
+			}
+		}
 	})
 	return closeErr
 }
@@ -611,4 +675,40 @@ func (c *h2AdaptiveConn) observeFrames(p []byte) {
 		copy(c.readBuf, c.readBuf[frameLen:])
 		c.readBuf = c.readBuf[:len(c.readBuf)-frameLen]
 	}
+}
+
+// isOuterDeadErr reports whether the error indicates the outer TCP/TLS pipe
+// is dead (not just a per-stream issue). When true, the whole h2Transport
+// must be discarded — no further streams will succeed on it.
+func isOuterDeadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "GOAWAY") ||
+		strings.Contains(s, "ENOTCONN") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "no route to host")
+}
+
+// closeFromError marks this transport closed *because* of an outer-pipe
+// failure detected from a RoundTrip. Idempotent — safe to call repeatedly.
+// Goal is to flip the closed flag so the pool stops handing this transport
+// to new dials. The actual H2/TLS teardown runs in a background goroutine.
+func (t *h2Transport) closeFromError(err error) {
+	t.mu.Lock()
+	already := t.closed
+	t.closed = true
+	t.mu.Unlock()
+	if already {
+		return
+	}
+	go func() {
+		t.closeH2RoundTripper()
+		_ = t.closeTLSConn()
+	}()
 }

@@ -22,6 +22,14 @@ enum WhitelistStatusStore {
     private static let updatedAtKey = "whitelistStatusUpdatedAt"
     private static let activeEndpointKey = "whitelistActiveEndpoint"
 
+    // Main-app WhitelistMonitor consecutive-result counters
+    private static let whitelistCountKey = "whitelistConsecutiveCount"
+    private static let freeCountKey = "freeConsecutiveCount"
+
+    // Extension WhitelistDetector consecutive-result counters
+    private static let failbackSuccessesKey = "whitelistFailbackSuccesses"
+    private static let whitelistSuccessesKey = "whitelistWhitelistSuccesses"
+
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
     }
@@ -63,9 +71,37 @@ enum WhitelistStatusStore {
         }
     }
 
+    // -- Main-app monitor counters (WhitelistMonitor) --
+
+    static var whitelistConsecutiveCount: Int {
+        get { defaults?.integer(forKey: whitelistCountKey) ?? 0 }
+        set { defaults?.set(newValue, forKey: whitelistCountKey) }
+    }
+
+    static var freeConsecutiveCount: Int {
+        get { defaults?.integer(forKey: freeCountKey) ?? 0 }
+        set { defaults?.set(newValue, forKey: freeCountKey) }
+    }
+
+    // -- Extension detector counters (WhitelistDetector) --
+
+    static var failbackSuccesses: Int {
+        get { defaults?.integer(forKey: failbackSuccessesKey) ?? 0 }
+        set { defaults?.set(newValue, forKey: failbackSuccessesKey) }
+    }
+
+    static var whitelistSuccessesExtension: Int {
+        get { defaults?.integer(forKey: whitelistSuccessesKey) ?? 0 }
+        set { defaults?.set(newValue, forKey: whitelistSuccessesKey) }
+    }
+
     static func reset() {
         defaults?.removeObject(forKey: statusKey)
         defaults?.removeObject(forKey: updatedAtKey)
         defaults?.removeObject(forKey: activeEndpointKey)
+        defaults?.removeObject(forKey: whitelistCountKey)
+        defaults?.removeObject(forKey: freeCountKey)
+        defaults?.removeObject(forKey: failbackSuccessesKey)
+        defaults?.removeObject(forKey: whitelistSuccessesKey)
     }
 }

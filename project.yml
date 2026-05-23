@@ -81,12 +81,40 @@ targets:
       # check the user-set enabled flag before posting a local
       # notification on whitelist on/off transitions.
       - path: samizdat-ios/NotificationPreferences.swift
-      # IPA-T: PerformancePreferences shared so the SocksStub can
-      # check whether to flip DisableDefaultSecurity on the
-      # tamizdat ClientConfig (Game-optimized mode disables TLS
-      # transport rotation + cover-traffic + fragmentation, which
-      # otherwise make real-time games stutter).
-      - path: samizdat-ios/PerformancePreferences.swift
+      # IPA-D22: PoolVariantPreferences deleted — V1 is hardcoded in Go
+      # (mobile/socksstub) and never exposed in the iOS UI. The
+      # extension still calls `SocksstubSetPoolVariant("v1")` directly
+      # to keep the Go bridge wired with the same value, but no Swift
+      # storage is involved any more.
+      # IPA-D20 (Phase C iOS-notify, 2026-05-11): NotificationPayload
+      # shape + App Group / Darwin constants shared between app and
+      # extension. Extension encodes after a server callback, app
+      # decodes and binds to a SwiftUI alert.
+      - path: samizdat-ios/NotificationPayload.swift
+      # IPA-D21: PingURLPreferences shared so the extension can read
+      # the user-set ping probe URL from App Group UserDefaults at
+      # startTunnel and on the live "refreshPingURL" provider
+      # message. Default points at gstatic.com/generate_204.
+      - path: samizdat-ios/PingURLPreferences.swift
+      # IPA-D23: WhitelistProbePreferences shared so the extension can
+      # read the user-configured testHost + whitelistHost values for
+      # the new ICMP-based WhitelistDetector. App Group UserDefaults
+      # source of truth; live updates land via the
+      # "refreshWhitelistProbes" provider message.
+      - path: samizdat-ios/WhitelistProbePreferences.swift
+      # IPA-D30: ICMPPinger relocated from samizdat-tunnel/ to
+      # samizdat-ios/ so the main app's WhitelistMonitor can use the
+      # same unprivileged SOCK_DGRAM ICMP echo as the extension's
+      # WhitelistDetector — semantics now match operator's native
+      # ping tool (TCP-connect probes were too permissive and missed
+      # real ICMP-level whitelist mode).
+      - path: samizdat-ios/ICMPPinger.swift
+      # IPA-D65b: VK TURN credential cache (read-side only — the
+      # extension reads `TURNCredsStore.shared.isFresh` in its status
+      # RPC). The write side lives in the main app (WKWebView captcha
+      # solver + 5-step VK API client) and is intentionally NOT
+      # compiled into the extension.
+      - path: samizdat-ios/TURNCredsStore.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

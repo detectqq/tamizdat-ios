@@ -16,7 +16,7 @@ func newClassTestPool(t *testing.T, maxStreams, minTransports, maxTransports int
 		allowance = overlapAllowance[0]
 	}
 	var created atomic.Int32
-	p := newConnPool(maxStreams, time.Hour, minTransports, maxTransports, 13312, allowance, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
+	p := newConnPool(maxStreams, time.Hour, minTransports, maxTransports, 13312, allowance, false, 0, func(ctx context.Context, class TrafficClass) (*h2Transport, error) {
 		created.Add(1)
 		tr := &h2Transport{maxStreams: maxStreams, drainTimeout: 10 * time.Millisecond}
 		prepareTransportForClass(tr, class)

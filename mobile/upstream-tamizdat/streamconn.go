@@ -39,8 +39,8 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 		shaper:        shaper,
 		fragmenter:    fragmenter,
 		shapeMode:     shapeMode,
-		readDeadline:  newDeadlineTimer(),
-		writeDeadline: newDeadlineTimer(),
+		readDeadline:  newDeadlineTimer(rwc),
+		writeDeadline: newDeadlineTimer(rwc),
 	}
 }
 
@@ -123,17 +123,21 @@ type deadlineTimer struct {
 	mu      sync.Mutex
 	timer   *time.Timer
 	expired bool
+	rwc     io.Closer
+	gen     uint64
 }
 
-func newDeadlineTimer() *deadlineTimer {
-	return &deadlineTimer{}
+func newDeadlineTimer(rwc io.Closer) *deadlineTimer {
+	return &deadlineTimer{rwc: rwc}
 }
 
 // set configures the deadline. A zero time clears the deadline.
 func (dt *deadlineTimer) set(t time.Time) {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
+	var closeNow io.Closer
 
+	dt.mu.Lock()
+	dt.gen++
+	gen := dt.gen
 	dt.expired = false
 	if dt.timer != nil {
 		dt.timer.Stop()
@@ -141,27 +145,44 @@ func (dt *deadlineTimer) set(t time.Time) {
 	}
 
 	if t.IsZero() {
+		dt.mu.Unlock()
 		return
 	}
 
 	d := time.Until(t)
 	if d <= 0 {
 		dt.expired = true
+		closeNow = dt.rwc
+		dt.mu.Unlock()
+		if closeNow != nil {
+			_ = closeNow.Close()
+		}
 		return
 	}
 
 	dt.timer = time.AfterFunc(d, func() {
 		dt.mu.Lock()
+		if dt.gen != gen {
+			dt.mu.Unlock()
+			return
+		}
 		dt.expired = true
+		rwc := dt.rwc
 		dt.mu.Unlock()
+		if rwc != nil {
+			_ = rwc.Close()
+		}
 	})
+	dt.mu.Unlock()
 }
 
 func (dt *deadlineTimer) stop() {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
+	dt.gen++
 	if dt.timer != nil {
 		dt.timer.Stop()
+		dt.timer = nil
 	}
 }
 

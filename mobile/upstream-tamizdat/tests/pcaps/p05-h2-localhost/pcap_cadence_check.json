@@ -1,0 +1,36 @@
+{
+  "events": {
+    "ack": {
+      "count": 38,
+      "interarrival": {
+        "count": 37,
+        "cv": 2.2596775763017747,
+        "max": 0.02543807029724121,
+        "mean": 0.003607646839038746,
+        "min": 1.1205673217773438e-05,
+        "p50": 0.000141143798828125,
+        "p95": 0.025422096252441406,
+        "range": 0.025426864624023438,
+        "stdev": 0.008152118665391832
+      },
+      "metronomic": false
+    },
+    "ping": {
+      "count": 0,
+      "interarrival": {
+        "count": 0
+      },
+      "metronomic": false
+    },
+    "rebind": {
+      "count": 0,
+      "interarrival": {
+        "count": 0
+      },
+      "metronomic": false
+    }
+  },
+  "ok": true,
+  "rows": 126,
+  "violations": []
+}
