@@ -369,7 +369,9 @@ actor VKCredsClient {
             throw VKCredsError.malformedResponse(step: "5", hint: "turn_server missing")
         }
         TURNLog.info("vkcreds", "step 5 ok — turn_server received")
-        return try Self.parseTurnBlock(turnBlock)
+        let creds = try Self.parseTurnBlock(turnBlock)
+        TURNLog.info("vkcreds", "creds JSON: \(Self.credsLogJSONString(creds))")
+        return creds
     }
 
     // MARK: – HTTP
@@ -451,6 +453,32 @@ actor VKCredsClient {
                                                 hint: "non-string at \(path.joined(separator: "."))")
         }
         return s
+    }
+
+    private static func credsLogJSONString(_ creds: VKTURNCredentials) -> String {
+        struct LogShape: Encodable {
+            let username: String
+            let password: String
+            let turn_servers: [String]
+            let lifetime_sec: Int
+        }
+
+        let shape = LogShape(
+            username: creds.username,
+            password: creds.password,
+            turn_servers: creds.turnURLs,
+            lifetime_sec: Int(creds.lifetime)
+        )
+
+        do {
+            let data = try JSONEncoder().encode(shape)
+            guard let json = String(data: data, encoding: .utf8) else {
+                return "<encode-failed: non-utf8 JSON>"
+            }
+            return json
+        } catch {
+            return "<encode-failed: \(error)>"
+        }
     }
 
     private static func parseTurnBlock(_ block: [String: Any]) throws -> VKTURNCredentials {
