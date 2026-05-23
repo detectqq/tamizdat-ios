@@ -173,15 +173,13 @@ final class TamizdatStatusStore: ObservableObject {
     /// `Combine`-style mirror of `TURNCredsRefresher.isRefreshing`.
     @Published private(set) var captchaIsActive: Bool = false
 
-    /// IPA-D65b: derived flag — true iff the cached VK TURN creds in
-    /// App Group UserDefaults are fresh enough to use without
+    /// IPA-D65b: published mirror — true iff the cached VK TURN creds
+    /// in App Group UserDefaults are fresh enough to use without
     /// triggering a refresh. The extension surfaces the same bit via
     /// the status RPC (`snapshot.hasTURNCreds`); this main-app-side
-    /// view lets `ContentView` paint immediately without a poll round
-    /// trip.
-    var turnCredsValid: Bool {
-        TURNCredsStore.shared.isFresh
-    }
+    /// mirror lets `ContentView` repaint when the cache changes while
+    /// the VPN is offline.
+    @Published private(set) var turnCredsValid: Bool = TURNCredsStore.shared.isFresh
 
     /// Pollling cadence. 500 ms is the same value sing-box-for-apple
     /// uses for its connection-stat polling. Drop to 250 ms or lower
@@ -297,6 +295,12 @@ final class TamizdatStatusStore: ObservableObject {
         // stat tile via `dataText`.
         if rxBytes != snap.rxBytes { rxBytes = snap.rxBytes }
         if txBytes != snap.txBytes { txBytes = snap.txBytes }
+
+        // VK TURN creds are written by the main app even when the VPN
+        // is offline, so mirror the local cache separately from the NE
+        // status RPC and publish changes for the TURN stat tile.
+        let freshTurnCreds = TURNCredsStore.shared.isFresh
+        if turnCredsValid != freshTurnCreds { turnCredsValid = freshTurnCreds }
         // IPA-D25: per-sample rate computation removed with the
         // bandwidth chip; `now` is no longer used here, but kept on
         // the signature for the uptime block above.

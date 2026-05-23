@@ -420,7 +420,7 @@ struct ContentView: View {
                      value: lampStore.dataText.value,
                      unit: lampStore.dataText.unit)
             StatTile(label: "TURN",
-                     value: lampStore.snapshot.hasTURNCreds ? "✓" : "—",
+                     value: (lampStore.turnCredsValid || lampStore.snapshot.hasTURNCreds) ? "✓" : "—",
                      unit: nil)
         }
     }
