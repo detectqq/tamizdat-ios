@@ -53,6 +53,12 @@ struct SettingsView: View {
     @State private var wlSuccessesDraft: Int = WhitelistProbePreferences.successesNeeded
     @State private var wlIntervalDraft: Int = WhitelistProbePreferences.probeInterval
 
+    // Phase 2G: what does the whitelist endpoint actually do?
+    // Either dial the backup tamizdat URI (legacy), or route through
+    // VK TURN. The backup URI is preserved in either case so the
+    // operator can flip back without re-pasting it.
+    @State private var whitelistMode: WhitelistMode = WhitelistMode.current
+
     @State private var showEndpoints = false
     @State private var showLogs = false
     @State private var showTelegram = false
@@ -467,6 +473,28 @@ struct SettingsView: View {
                             .foregroundStyle(theme.textDim)
                     }
                     Spacer()
+                }
+
+                // Phase 2G: pick how the "whitelist" endpoint actually
+                // works. H2 = legacy backup URI. TURN = VK TURN relay.
+                // Switching this does NOT clear the existing backup URI,
+                // so the operator can flip back without re-pasting.
+                Text("Whitelist mode")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Picker("", selection: $whitelistMode) {
+                    ForEach(WhitelistMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: whitelistMode) { _, newValue in
+                    WhitelistMode.current = newValue
+                    // For symmetry with the existing VK TURN section's
+                    // legacy `EndpointTurnMode` toggle: keep the two
+                    // stores aligned so the extension never sees them
+                    // disagree.
+                    EndpointTurnMode.current = (newValue == .vkTurn) ? .vk : .off
                 }
 
                 Text("Test host")
