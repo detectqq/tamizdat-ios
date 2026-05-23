@@ -76,29 +76,34 @@ actor CaptchaWebViewManager {
 
     // ─── Tuning constants (mirrors Kotlin reference) ─────────────────
 
-    private static let overallTimeout: TimeInterval = 45.0
+    // NOTE: these constants are `fileprivate` (not `private`) because they
+    // are consumed by the `SolveSession` helper defined later in the same
+    // file. `private` would restrict access to the actor body itself; the
+    // helper is a separate type, so it would fail to see them. (Build CI
+    // caught this — 2026-05-23.)
+    fileprivate static let overallTimeout: TimeInterval = 45.0
 
     /// Random viewport widths (pixels). Picking from a small pool means
     /// VK rarely sees the same viewport twice across solves; constant
     /// 360×400 would be a giveaway.
-    private static let viewportWidths: [CGFloat] = [356, 358, 360, 362, 364, 366, 368]
-    private static let viewportHeights: [CGFloat] = [376, 378, 380, 382, 384, 386, 388]
+    fileprivate static let viewportWidths: [CGFloat] = [356, 358, 360, 362, 364, 366, 368]
+    fileprivate static let viewportHeights: [CGFloat] = [376, 378, 380, 382, 384, 386, 388]
 
     /// Pool of Chrome desktop builds. Choose one per solve so the User-
     /// Agent rotates. Numbers chosen to be plausibly current as of
     /// 2026-05.
-    private static let chromeBuilds: [String] = [
+    fileprivate static let chromeBuilds: [String] = [
         "146.0.0.0", "145.0.6422.60", "145.0.6422.53",
         "144.0.6367.78", "144.0.6367.61", "143.0.6312.99",
     ]
 
     // Random-delay ranges, all in seconds (Kotlin used ms longs).
-    private static let pageReadDelayRange: ClosedRange<Double> = 2.5...3.5
-    private static let thinkBeforeClickRange: ClosedRange<Double> = 1.5...3.5
-    private static let touchHoldRange: ClosedRange<Double> = 0.08...0.18
-    private static let postClickPollInterval: Double = 0.65
-    private static let postClickAttempts: Int = 12
-    private static let postClickFirstDelay: Double = 0.9
+    fileprivate static let pageReadDelayRange: ClosedRange<Double> = 2.5...3.5
+    fileprivate static let thinkBeforeClickRange: ClosedRange<Double> = 1.5...3.5
+    fileprivate static let touchHoldRange: ClosedRange<Double> = 0.08...0.18
+    fileprivate static let postClickPollInterval: Double = 0.65
+    fileprivate static let postClickAttempts: Int = 12
+    fileprivate static let postClickFirstDelay: Double = 0.9
 
     // ─── State (actor-isolated) ──────────────────────────────────────
 
