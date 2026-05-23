@@ -295,10 +295,20 @@ struct ContentView: View {
                         .tracking(-0.52)
                         .foregroundStyle(theme.mint)
                 }
-                Text("Tamizdat")
-                    .font(.geist(.semibold, size: 15))
-                    .tracking(-0.15)
-                    .foregroundStyle(theme.text)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Tamizdat")
+                        .font(.geist(.semibold, size: 15))
+                        .tracking(-0.15)
+                        .foregroundStyle(theme.text)
+                    // Bundle version + build is baked by the CI Archive step
+                    // (MARKETING_VERSION=0.2.<run>-<sha>, CURRENT_PROJECT_VERSION=<run>).
+                    // Showing it right under the logo lets us answer "what's
+                    // installed?" at a glance without diving into Settings →
+                    // About.
+                    Text(Self.shortVersionLabel)
+                        .font(.geistMono(.regular, size: 10))
+                        .foregroundStyle(theme.textDim)
+                }
             }
             Spacer()
             HStack(spacing: 8) {
@@ -307,6 +317,15 @@ struct ContentView: View {
             }
         }
     }
+
+    /// Read CFBundleShortVersionString lazily once and cache; we only
+    /// want to format this string, never to recompute on every redraw.
+    private static let shortVersionLabel: String = {
+        let info = Bundle.main.infoDictionary
+        let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(marketing) (\(build))"
+    }()
 
     private func circleIconButton(systemName: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

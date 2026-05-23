@@ -178,18 +178,16 @@ jobs:
 
       - name: Compute versioned IPA name
         id: ipa_name
-        # ref_name is the branch/tag (e.g. "feature/wkwebview-vk-captcha");
-        # github.sha is the full SHA, we want the short form. Slashes in
-        # branch names must become dashes — GitHub artifact names disallow /.
+        # Match the operator's existing milestone naming convention
+        # (e.g. `Tamizdat-0.2.219-a511029-build-219.ipa`) so downloaded
+        # artifacts can be moved straight into the `samizdat-ios/ipa/
+        # milestones/` archive without renaming. Bundle MARKETING_VERSION
+        # is `0.2.<run>-<sha7>` per the Archive step above.
         run: |
-          SAFE_BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-')
           SHORT_SHA=${GITHUB_SHA:0:7}
-          NAME="samizdat-ios-${SAFE_BRANCH}-${SHORT_SHA}"
+          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "Artifact will be: ${NAME}"
-          # Copy the IPA next to itself with the versioned filename so
-          # downloads land as `samizdat-ios-<branch>-<sha>.ipa` instead
-          # of generic `samizdat-ios.ipa`.
           cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
 
       - name: Upload IPA artifact
