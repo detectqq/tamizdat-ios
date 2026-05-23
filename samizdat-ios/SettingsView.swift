@@ -359,6 +359,9 @@ struct SettingsView: View {
                         .foregroundStyle(theme.text)
                 }
                 .tint(theme.mint)
+                .onChange(of: wlSuccessesDraft) { _, newValue in
+                    WhitelistProbePreferences.successesNeeded = newValue
+                }
 
                 // D45: probe interval (seconds)
                 Text("Probe interval (seconds)")
@@ -370,6 +373,9 @@ struct SettingsView: View {
                         .foregroundStyle(theme.text)
                 }
                 .tint(theme.mint)
+                .onChange(of: wlIntervalDraft) { _, newValue in
+                    WhitelistProbePreferences.probeInterval = newValue
+                }
 
                 HStack(spacing: 8) {
                     Button(action: saveWhitelistProbes) {
