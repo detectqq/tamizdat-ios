@@ -46,4 +46,52 @@ enum NotificationIDs {
     static let categoryIdentifier = "WHITELIST_DETECTION"
     static let detectedID = "whitelist.detected"
     static let recoveredID = "whitelist.recovered"
+
+    // Phase 2G: VK Smart Captcha required a human. Posted whenever
+    // `TURNCredsRefresher.manualChallenge` flips from nil to non-nil
+    // (i.e. the auto-solver bailed because VK served a slider).
+    // Deliberately NOT gated by NotificationPreferences.enabled — this
+    // is on the critical path; without it the VPN silently dies when
+    // VK rotates to a slider variant.
+    static let captchaRequiredID = "captcha.required"
+}
+
+/// Convenience helpers for the captcha-required notification.
+/// Separated from `NotificationPreferences` because that enum stores
+/// the master toggle (which captcha notifications deliberately bypass).
+enum CaptchaNotification {
+    /// Schedule the local notification immediately. iOS permission
+    /// authorization is checked synchronously — if denied, this is a
+    /// no-op (we can't surface anything; the manual sheet still shows
+    /// inside the app on next launch).
+    @MainActor
+    static func post() {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            guard settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional
+            else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Tamizdat"
+            content.body = "Решите капчу, чтобы прокси продолжал работать"
+            content.sound = .default
+            let req = UNNotificationRequest(
+                identifier: NotificationIDs.captchaRequiredID,
+                content: content,
+                trigger: nil
+            )
+            center.add(req, withCompletionHandler: nil)
+        }
+    }
+
+    /// Cancel an outstanding captcha-required prompt. Called when the
+    /// user resolves the challenge or cancels it.
+    @MainActor
+    static func cancel() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers:
+            [NotificationIDs.captchaRequiredID])
+        center.removeDeliveredNotifications(withIdentifiers:
+            [NotificationIDs.captchaRequiredID])
+    }
 }

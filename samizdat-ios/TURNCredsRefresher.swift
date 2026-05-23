@@ -106,6 +106,7 @@ final class TURNCredsRefresher: ObservableObject {
     func resolveManual(token: String) {
         TURNLog.info("turncreds", "manual token resolved (length=\(token.count))")
         manualChallenge = nil
+        CaptchaNotification.cancel()
         manualContinuation?.resume(returning: token)
         manualContinuation = nil
     }
@@ -114,6 +115,7 @@ final class TURNCredsRefresher: ObservableObject {
     func cancelManual() {
         TURNLog.warn("turncreds", "manual captcha cancelled by user")
         manualChallenge = nil
+        CaptchaNotification.cancel()
         manualContinuation?.resume(throwing: CaptchaError.cancelled)
         manualContinuation = nil
     }
@@ -207,6 +209,7 @@ final class TURNCredsRefresher: ObservableObject {
         manualContinuation?.resume(throwing: CaptchaError.cancelled)
         manualContinuation = nil
         manualChallenge = nil
+        CaptchaNotification.cancel()
         isRefreshing = false
         lastError = "Сброшено вручную"
     }
@@ -216,6 +219,11 @@ final class TURNCredsRefresher: ObservableObject {
     /// auto solver bails with `.sliderRequired`.
     fileprivate func awaitManual(redirectURI: URL, sessionToken: String) async throws -> String {
         TURNLog.info("turncreds", "manual captcha requested (host=\(redirectURI.host ?? "<unknown>"))")
+        // Fire the iOS notification so the user knows to open the app
+        // even if it's in the background. Operator requirement: this
+        // must be unconditional (bypass NotificationPreferences.enabled)
+        // because the VPN silently dies otherwise.
+        CaptchaNotification.post()
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             self.manualContinuation = cont
             self.manualChallenge = ManualChallenge(
