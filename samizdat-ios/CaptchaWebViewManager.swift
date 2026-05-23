@@ -459,50 +459,111 @@ private final class SolveSession {
         let jitterY = cssY + Double.random(in: -0.5...0.5)
         let holdMs = Int(holdSec * 1000)
 
+        // Build the FULL native-equivalent event stack. A real iOS Safari
+        // tap fires pointer + touch + mouse + click in a specific order
+        // (Apple's WebKit synthesizes mouse events from touches unless
+        // the page preventDefault's touchstart). Since we can't issue a
+        // real UITouch, we manually fire every layer VK's anti-bot might
+        // be listening on:
+        //   pointerdown → touchstart → touchend → pointerup
+        //   → mousedown → mouseup → click
+        // Build-225 showed step 3 reaching "touch dispatched" then
+        // hanging — VK accepted the request, the page loaded, but
+        // success_token never came back. That's the smoking gun for
+        // missing the `click` event downstream of the touch.
         let js = """
         (function() {
             var el = document.elementFromPoint(\(cssX), \(cssY));
             if (!el) return 'no_element';
             var target = el.closest('label.vkc__Checkbox-module__Checkbox') || el;
-            function makeTouch(x, y) {
+            var x = \(cssX), y = \(cssY);
+            var jx = \(jitterX), jy = \(jitterY);
+            var force = \(force);
+
+            function makeTouch(tx, ty) {
                 return new Touch({
                     identifier: 0,
                     target: target,
-                    clientX: x,
-                    clientY: y,
-                    pageX: x,
-                    pageY: y,
-                    radiusX: 11.5,
-                    radiusY: 11.5,
+                    clientX: tx, clientY: ty,
+                    pageX: tx, pageY: ty,
+                    screenX: tx, screenY: ty,
+                    radiusX: 11.5, radiusY: 11.5,
                     rotationAngle: 0,
-                    force: \(force)
+                    force: force
                 });
             }
-            function makeEvent(type, x, y) {
-                var t = makeTouch(x, y);
+            function makeTouchEv(type, tx, ty) {
+                var t = makeTouch(tx, ty);
+                var ended = (type === 'touchend' || type === 'touchcancel');
                 return new TouchEvent(type, {
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true,
-                    touches: type === 'touchend' ? [] : [t],
-                    targetTouches: type === 'touchend' ? [] : [t],
+                    bubbles: true, cancelable: true, composed: true,
+                    touches: ended ? [] : [t],
+                    targetTouches: ended ? [] : [t],
                     changedTouches: [t]
                 });
             }
-            try {
-                target.dispatchEvent(makeEvent('touchstart', \(cssX), \(cssY)));
-            } catch (e) {
-                // Touch / TouchEvent constructors are not always available
-                // on older WebKit; fall back to .click() so we at least try.
-                try { target.click(); } catch (e2) {}
-                return 'fallback_click';
+            function makePointerEv(type, tx, ty) {
+                return new PointerEvent(type, {
+                    bubbles: true, cancelable: true, composed: true,
+                    pointerId: 1, pointerType: 'touch',
+                    isPrimary: true,
+                    width: 23, height: 23,
+                    pressure: force,
+                    clientX: tx, clientY: ty,
+                    screenX: tx, screenY: ty,
+                    button: 0, buttons: 1
+                });
             }
+            function makeMouseEv(type, tx, ty) {
+                return new MouseEvent(type, {
+                    bubbles: true, cancelable: true, composed: true,
+                    view: window,
+                    clientX: tx, clientY: ty,
+                    screenX: tx, screenY: ty,
+                    button: 0, buttons: type === 'mouseup' || type === 'click' ? 0 : 1,
+                    detail: type === 'click' ? 1 : 0
+                });
+            }
+            try {
+                // 1. Pointer + touch start
+                if (typeof PointerEvent === 'function') {
+                    target.dispatchEvent(makePointerEv('pointerdown', x, y));
+                }
+                target.dispatchEvent(makeTouchEv('touchstart', x, y));
+            } catch (e) {
+                // Older WebKit may not have Touch/TouchEvent constructors.
+                // Skip directly to mouse + click; better than nothing.
+                try {
+                    target.dispatchEvent(makeMouseEv('mousedown', x, y));
+                    target.dispatchEvent(makeMouseEv('mouseup', x, y));
+                    target.dispatchEvent(makeMouseEv('click', x, y));
+                    target.click();
+                } catch (e2) {}
+                return 'fallback_mouse';
+            }
+            // 2. Hold, then end + mouse + click stack
             setTimeout(function() {
                 try {
-                    target.dispatchEvent(makeEvent('touchend', \(jitterX), \(jitterY)));
+                    target.dispatchEvent(makeTouchEv('touchend', jx, jy));
+                    if (typeof PointerEvent === 'function') {
+                        target.dispatchEvent(makePointerEv('pointerup', jx, jy));
+                    }
+                    // WebKit normally synthesizes mouse events from touch
+                    // unless touchstart was preventDefault'd. The captcha
+                    // page is built on a checkbox label — it probably
+                    // listens on click. We fire the full mouse stack to
+                    // be safe.
+                    target.dispatchEvent(makeMouseEv('mousedown', jx, jy));
+                    target.dispatchEvent(makeMouseEv('mouseup', jx, jy));
+                    target.dispatchEvent(makeMouseEv('click', jx, jy));
+                    // Finally call the HTMLElement.click() native helper
+                    // as a belt-and-suspenders: it triggers default
+                    // checkbox toggle behaviour the synthetic 'click'
+                    // event alone might miss.
+                    try { target.click(); } catch (e3) {}
                 } catch (e) {}
             }, \(holdMs));
-            return 'dispatched';
+            return 'dispatched_full_stack';
         })();
         """
         wv.evaluateJavaScript(js) { [weak self] value, error in
