@@ -109,6 +109,12 @@ targets:
       # ping tool (TCP-connect probes were too permissive and missed
       # real ICMP-level whitelist mode).
       - path: samizdat-ios/ICMPPinger.swift
+      # IPA-D65b: VK TURN credential cache (read-side only — the
+      # extension reads `TURNCredsStore.shared.isFresh` in its status
+      # RPC). The write side lives in the main app (WKWebView captcha
+      # solver + 5-step VK API client) and is intentionally NOT
+      # compiled into the extension.
+      - path: samizdat-ios/TURNCredsStore.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

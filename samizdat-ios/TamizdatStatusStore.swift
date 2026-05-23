@@ -167,6 +167,22 @@ final class TamizdatStatusStore: ObservableObject {
 
     private var timer: Timer?
 
+    /// IPA-D65b: True while the main-app refresher is solving a VK
+    /// captcha (auto WKWebView or manual sheet). Drives a small
+    /// "Решаем капчу..." indicator under the shield. Backed by a
+    /// `Combine`-style mirror of `TURNCredsRefresher.isRefreshing`.
+    @Published private(set) var captchaIsActive: Bool = false
+
+    /// IPA-D65b: derived flag — true iff the cached VK TURN creds in
+    /// App Group UserDefaults are fresh enough to use without
+    /// triggering a refresh. The extension surfaces the same bit via
+    /// the status RPC (`snapshot.hasTURNCreds`); this main-app-side
+    /// view lets `ContentView` paint immediately without a poll round
+    /// trip.
+    var turnCredsValid: Bool {
+        TURNCredsStore.shared.isFresh
+    }
+
     /// Pollling cadence. 500 ms is the same value sing-box-for-apple
     /// uses for its connection-stat polling. Drop to 250 ms or lower
     /// if lamp feel is sluggish; round-trip RPC is ~10-30 ms so we
@@ -239,6 +255,14 @@ final class TamizdatStatusStore: ObservableObject {
             snapshot = result
         }
         applyDerivedState(snap: result)
+
+        // IPA-D65b: mirror the refresher's in-flight flag so any
+        // observer of this store can render a "Решаем капчу..." chip
+        // without separately subscribing to `TURNCredsRefresher`.
+        let active = TURNCredsRefresher.shared.isRefreshing
+        if captchaIsActive != active {
+            captchaIsActive = active
+        }
     }
 
     // MARK: – Derived state (IPA-D22)

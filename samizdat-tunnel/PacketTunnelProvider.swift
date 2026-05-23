@@ -565,8 +565,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "txBytes":     Int64(tx_bytes),
                 "uptimeSec":   uptime,
                 "isRewiring":  self.isRewiring ? 1 : 0,
-                // VK TURN relay credential status.
-                "hasTURNCreds": !(SocksstubTURNCredsSnapshot()?.isEmpty ?? true),
+                // VK TURN relay credential status. IPA-D65b: the main
+                // app now acquires creds itself via WKWebView captcha
+                // solving and writes them to App Group UserDefaults
+                // (`TURNCredsStore`). The extension only READS the
+                // cache here — no VK API touch from inside the NE.
+                // The legacy `SocksstubTURNCredsSnapshot()` is kept on
+                // the Go side as a no-op fallback for now but is no
+                // longer the source of truth.
+                "hasTURNCreds": TURNCredsStore.shared.isFresh,
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

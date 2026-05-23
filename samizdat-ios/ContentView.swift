@@ -23,6 +23,11 @@ struct ContentView: View {
     // auto mode + foreground, so WhitelistStatusStore.activeEndpoint
     // is already correct by the time the user taps Connect.
     @StateObject private var whitelistMonitor = WhitelistMonitor()
+    // IPA-D65b: VK TURN refresh state. We observe `manualChallenge`
+    // so a slider-fallback escalation from the hidden WKWebView
+    // surfaces a sheet here. `@ObservedObject` is correct here —
+    // the singleton owns itself; this view just subscribes.
+    @ObservedObject private var turnRefresher = TURNCredsRefresher.shared
 
     @State private var showSettings = false
     @State private var showLogs = false
@@ -211,6 +216,23 @@ struct ContentView: View {
                 }
             }
             .environment(\.themeTokens, theme)
+        }
+        // IPA-D65b: slider-fallback for VK Smart Captcha. The hidden
+        // WKWebView solver throws `CaptchaError.sliderRequired` when
+        // VK swaps in a slider; the refresher publishes a
+        // `manualChallenge` here, we present a modal sheet and pass
+        // the user-solved success_token back into the refresh task.
+        .sheet(item: $turnRefresher.manualChallenge) { challenge in
+            ManualCaptchaSheet(
+                redirectURI: challenge.redirectURI,
+                sessionToken: challenge.sessionToken,
+                onSuccess: { token in
+                    turnRefresher.resolveManual(token: token)
+                },
+                onCancel: {
+                    turnRefresher.cancelManual()
+                }
+            )
         }
         .onAppear {
             startStatusPolling()

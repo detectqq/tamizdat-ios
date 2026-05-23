@@ -1,0 +1,204 @@
+import Foundation
+
+/// App Group-backed cache for VK TURN credentials acquired by the
+/// main-app WKWebView solver.
+///
+/// WHY App Group UserDefaults: the Network Extension cannot run a
+/// WKWebView (Apple disallows; only the main app process can host
+/// WebKit), so the creds-acquire flow lives in the main app. The
+/// extension reads the cached creds at startTunnel and on each
+/// status RPC. The cache is the canonical source of truth — the
+/// main app writes on every refresh, the extension only reads.
+///
+/// Lifetime model:
+///   - `acquiredAt` is set when VK API returns creds.
+///   - `lifetime` is the TTL VK announces (seconds; typically ~30 min).
+///   - `expiresAt = acquiredAt + lifetime`.
+///   - `isFresh` ⇒ creds exist AND will still be alive 5 min from now.
+///   - `needsRefresh` ⇒ creds missing OR will expire within 5 min.
+///
+/// We refresh ~5 min ahead of expiry so the first failed creds-bound
+/// connection attempt has full creds for retry. A burst of refreshes
+/// during a quick succession of scene-active events is naturally
+/// debounced by the actor in `VKCredsClient.fetchCredentials` (single
+/// flight).
+struct VKTURNCredentials: Codable, Equatable {
+    /// TURN realm username — passed verbatim to libstun / libice.
+    let username: String
+    /// TURN realm password — opaque bearer; treat as a secret.
+    let password: String
+    /// Ordered TURN URLs (host:port) returned by VK / OK back-end. The
+    /// scheme prefix (`turn:` / `turns:`) is stripped by the client.
+    let turnURLs: [String]
+    /// VK-advertised credential lifetime in seconds. Negative or zero
+    /// means VK didn't return a `lifetime` / `ttl`; we treat such creds
+    /// as already needing refresh.
+    let lifetime: TimeInterval
+    /// Wall-clock time the creds were acquired. Used to compute
+    /// `expiresAt` for client-side cache decisions.
+    let acquiredAt: Date
+
+    var expiresAt: Date {
+        acquiredAt.addingTimeInterval(max(lifetime, 0))
+    }
+}
+
+/// Singleton helper around the App Group UserDefaults.
+///
+/// Concurrency: UserDefaults is itself thread-safe and we only do
+/// small synchronous Codable round-trips here, so no locking is
+/// required. The Network Extension reads from a separate process; iOS
+/// flushes the suite store via shared memory.
+final class TURNCredsStore {
+    static let shared = TURNCredsStore()
+
+    /// App Group identifier shared with the extension. MUST stay in
+    /// sync with `samizdat-ios.entitlements` /
+    /// `samizdat-tunnel.entitlements` and the same constant referenced
+    /// in `EndpointModeStore`, `PacketTunnelProvider`, etc.
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    /// UserDefaults key. Versioned in case the schema changes later
+    /// — bump to `v2` on breaking changes so an old extension that
+    /// can't decode the new shape simply sees "no creds" and falls
+    /// back to its no-TURN path instead of crashing on decode.
+    private static let storageKey = "tamizdat.vkTURNCreds.v1"
+
+    /// Cushion before expiry that triggers a refresh. 5 min gives the
+    /// VK API call + WKWebView solve + 1-2 retries enough headroom on
+    /// a busy network.
+    static let refreshCushion: TimeInterval = 5 * 60
+
+    private var defaults: UserDefaults? {
+        UserDefaults(suiteName: Self.appGroupID)
+    }
+
+    private init() {}
+
+    /// Persisted creds (if any). Returns nil if the entry is missing
+    /// or the stored payload can't be decoded (e.g. schema drift).
+    func load() -> VKTURNCredentials? {
+        guard let data = defaults?.data(forKey: Self.storageKey) else { return nil }
+        do {
+            return try JSONDecoder.iso8601.decode(VKTURNCredentials.self, from: data)
+        } catch {
+            // Decode failures are silent on purpose — a corrupt entry
+            // is the same as no entry from the caller's perspective.
+            return nil
+        }
+    }
+
+    /// Replace the current entry with `creds`. Atomic; the extension
+    /// reads the new value on its next status RPC tick (≤ 500 ms).
+    func save(_ creds: VKTURNCredentials) {
+        guard let defaults else { return }
+        do {
+            let data = try JSONEncoder.iso8601.encode(creds)
+            defaults.set(data, forKey: Self.storageKey)
+        } catch {
+            // Encoding can't realistically fail for this Codable shape;
+            // if it does we drop the write rather than crash so the app
+            // remains usable.
+        }
+    }
+
+    /// Drop the cached entry. Used when the user signs out, when VK
+    /// rejects a known-stale entry, or in tests.
+    func clear() {
+        defaults?.removeObject(forKey: Self.storageKey)
+    }
+
+    /// `true` iff creds exist and have at least `refreshCushion`
+    /// seconds of remaining lifetime. Drives the green/grey TURN tile
+    /// in the main UI and the `hasTURNCreds` field in the status RPC.
+    var isFresh: Bool {
+        guard let c = load() else { return false }
+        return c.expiresAt.timeIntervalSinceNow > Self.refreshCushion
+    }
+
+    /// `true` iff the cache is empty or close to expiring. Drives the
+    /// refresh-on-scene-active path in `App.swift`.
+    var needsRefresh: Bool {
+        guard let c = load() else { return true }
+        return c.expiresAt.timeIntervalSinceNow <= Self.refreshCushion
+    }
+}
+
+// MARK: – Codable date helpers
+
+extension JSONEncoder {
+    /// ISO-8601 dates so the persisted JSON is human-readable in the
+    /// App Group plist and easier to debug than a raw Double.
+    static var iso8601: JSONEncoder {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }
+}
+
+extension JSONDecoder {
+    static var iso8601: JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }
+}
+
+// MARK: – VK creds runtime configuration (App Group preferences)
+
+/// Static helper that surfaces the VK creds knobs from App Group
+/// UserDefaults. Kept separate from `TURNCredsStore` so the refresh
+/// coordinator can read these without entangling read/write paths.
+///
+/// At this stage of the rollout we expect the call hash to come from
+/// server-pushed config or a one-off Settings field — the refresh
+/// coordinator simply skips refresh when no hash is set, so the iOS
+/// client degrades gracefully to "no VK TURN" until the operator
+/// provides one.
+enum VKCredsPreferences {
+    private static let appGroupID = "group.com.anarki.samizdat-test"
+    private static let primaryHashKey = "tamizdat.vkCallHash"
+    private static let secondaryHashKey = "tamizdat.vkCallHashSecondary"
+    private static let deviceIDKey = "tamizdat.vkDeviceID"
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: appGroupID)
+    }
+
+    static var primaryCallHash: String {
+        get { defaults?.string(forKey: primaryHashKey) ?? "" }
+        set { defaults?.set(newValue, forKey: primaryHashKey) }
+    }
+
+    static var secondaryCallHash: String? {
+        get {
+            let s = defaults?.string(forKey: secondaryHashKey) ?? ""
+            return s.isEmpty ? nil : s
+        }
+        set { defaults?.set(newValue ?? "", forKey: secondaryHashKey) }
+    }
+
+    /// Stable per-install UUID — lazy-initialised on first read so the
+    /// extension and the main app see the same value through the App
+    /// Group store.
+    static var deviceID: String {
+        if let s = defaults?.string(forKey: deviceIDKey), !s.isEmpty {
+            return s
+        }
+        let fresh = UUID().uuidString
+        defaults?.set(fresh, forKey: deviceIDKey)
+        return fresh
+    }
+
+    /// True iff a primary hash is configured — refresh is a no-op
+    /// otherwise.
+    static var isConfigured: Bool {
+        !primaryCallHash.isEmpty
+    }
+}
+
+// The main-app-only refresh coordinator (`TURNCredsRefresher`) lives
+// in a separate file so that this one can be compiled by both the
+// main app target AND the Network Extension target — the extension
+// only needs the read-side primitives (`VKTURNCredentials`,
+// `TURNCredsStore`, `VKCredsPreferences`) and must NOT pull in
+// WKWebView / SwiftUI dependencies. See `TURNCredsRefresher.swift`.
