@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/detectqq/tamizdat/wgturnclient"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 // VK TURN upstream — opt-in transport that wraps WireGuard inside DTLS
@@ -27,13 +28,16 @@ import (
 // strings: an empty string means success.
 
 var (
-	vkturnRunner   *wgturnclient.Runner
-	vkturnCancel   context.CancelFunc
-	vkturnWGConfig atomic.Pointer[string]
-	vkturnStats    atomic.Pointer[string]
-	vkturnErr      atomic.Pointer[string]
-	vkturnRunning  atomic.Bool
-	vkturnMu       sync.Mutex
+	vkturnRunner     *wgturnclient.Runner
+	vkturnCancel     context.CancelFunc
+	vkturnWGConfig   atomic.Pointer[string]
+	vkturnStats      atomic.Pointer[string]
+	vkturnErr        atomic.Pointer[string]
+	vkturnNet        atomic.Pointer[netstack.Net]
+	vkturnRunning    atomic.Bool
+	vkturnAttachOnce sync.Once
+	vkturnAttachStop func()
+	vkturnMu         sync.Mutex
 )
 
 // StartVKTurnUpstream starts the VK TURN upstream. On success it returns "".
@@ -53,6 +57,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	}
 
 	resetVKTurnAtomicsLocked()
+	vkturnAttachOnce = sync.Once{}
 
 	runner, err := wgturnclient.New(wgturnclient.Config{
 		Listen:         fmt.Sprintf("127.0.0.1:%d", listenPort),
@@ -93,6 +98,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 			errText := err.Error()
 			vkturnErr.Store(&errText)
 		}
+		stopVKTurnAttachLocked()
 		vkturnRunning.Store(false)
 		storeVKTurnStats(0, false)
 		vkturnRunner = nil
@@ -102,6 +108,31 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if p := vkturnWGConfig.Load(); p != nil {
+			if !vkturnRunning.Load() {
+				return "not running"
+			}
+
+			var res *wgturnclient.AttachResult
+			var attachErr error
+			vkturnAttachOnce.Do(func() {
+				res, attachErr = runner.AttachWireGuardUserspace(*p)
+			})
+			if attachErr != nil {
+				cancel()
+				runner.Shutdown()
+				return "wg attach: " + attachErr.Error()
+			}
+			if res != nil {
+				vkturnMu.Lock()
+				if vkturnRunner != runner || !vkturnRunning.Load() {
+					vkturnMu.Unlock()
+					res.Stop()
+					return "not running"
+				}
+				vkturnNet.Store(res.Net)
+				vkturnAttachStop = res.Stop
+				vkturnMu.Unlock()
+			}
 			return ""
 		}
 		if p := vkturnErr.Load(); p != nil {
@@ -134,6 +165,7 @@ func StopVKTurnUpstream() {
 	}
 	vkturnRunner = nil
 	vkturnCancel = nil
+	stopVKTurnAttachLocked()
 	resetVKTurnAtomicsLocked()
 }
 
@@ -165,6 +197,27 @@ func TURNUpstreamStatsJSON() string {
 // TURNUpstreamRunning reports whether the VK TURN runner goroutine is alive.
 func TURNUpstreamRunning() bool {
 	return vkturnRunning.Load()
+}
+
+// VKTurnNetstack returns the userspace WireGuard netstack the upstream
+// is currently bound to, or nil if there is none. Callers route every
+// TCP/UDP dial through this stack — its underlying packets traverse
+// 127.0.0.1:<wgturn relay port> → DTLS+TURN → VK relay → server.
+//
+// Not gomobile-exported (returns a struct pointer), only the Go callers
+// in this same module use it.
+func VKTurnNetstack() *netstack.Net {
+	return vkturnNet.Load()
+}
+
+// stopVKTurnAttachLocked tears down the userspace WG + netstack the
+// previous Start built. MUST be called with vkturnMu held.
+func stopVKTurnAttachLocked() {
+	if vkturnAttachStop != nil {
+		vkturnAttachStop()
+		vkturnAttachStop = nil
+	}
+	vkturnNet.Store(nil)
 }
 
 func parseVKTurnCredsJSON(credsJSON string) (*wgturnclient.Credentials, error) {

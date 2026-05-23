@@ -21,6 +21,7 @@ require (
 	github.com/detectqq/tamizdat v0.0.0-00010101000000-000000000000
 	github.com/sagernet/sing v0.8.9
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
+	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	gvisor.dev/gvisor v0.0.0-20260325202830-7644cf3a343c
 )
 
@@ -28,7 +29,6 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/cbeuw/connutil v1.0.1 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/logging v0.2.4 // indirect
@@ -47,4 +47,5 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )

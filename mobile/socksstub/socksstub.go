@@ -1038,6 +1038,15 @@ func sendReply(client net.Conn, code byte) error {
 // Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
 // classifier without us.
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
+	// Phase 2G PART C — when a VK TURN userspace WireGuard netstack
+	// is alive (operator set EndpointTurnMode=.vk and StartVKTurnUpstream
+	// completed GETCONF + WireGuard attach), every TCP flow rides
+	// through it instead of the legacy samizdat-H2 upstream. The wg
+	// device's Endpoint is 127.0.0.1:<wgturn relay port>, so packets
+	// → wg → DTLS+TURN → VK relay → RU server → outbound chain → EU.
+	if n := VKTurnNetstack(); n != nil {
+		return n.DialContext(ctx, "tcp", dest)
+	}
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
@@ -1053,6 +1062,19 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 // dialUpstreamUDP returns a net.PacketConn bound to a single target,
 // either via the samizdat UDP-over-H2 tunnel or a direct UDP socket.
 func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+	// Phase 2G PART C — same precedence as dialUpstream. The netstack
+	// uses gvisor-backed UDP sockets; we wrap into a PacketConn the
+	// callers already expect.
+	if n := VKTurnNetstack(); n != nil {
+		c, err := n.Dial("udp", dest)
+		if err != nil {
+			return nil, err
+		}
+		// gvisor's gonet.UDPConn satisfies net.Conn but not net.PacketConn.
+		// connectedNetConnUDPAdapter promotes a connected net.Conn into the
+		// PacketConn interface our callers expect.
+		return newConnectedNetConnUDPAdapter(c, dest), nil
+	}
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
@@ -1068,6 +1090,32 @@ func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	}
 	return client.DialUDP(ctx, dest)
 }
+
+// connectedNetConnUDPAdapter promotes any connected net.Conn (e.g.
+// gvisor's *gonet.UDPConn) into a net.PacketConn whose remote is the
+// dial target. Used by dialUpstreamUDP when the VK TURN netstack is
+// the upstream — gvisor doesn't expose net.PacketConn directly.
+type connectedNetConnUDPAdapter struct {
+	conn   net.Conn
+	target net.Addr
+}
+
+func newConnectedNetConnUDPAdapter(c net.Conn, dest string) *connectedNetConnUDPAdapter {
+	return &connectedNetConnUDPAdapter{conn: c, target: &udpDestAddr{s: dest}}
+}
+
+func (a *connectedNetConnUDPAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := a.conn.Read(p)
+	return n, a.target, err
+}
+func (a *connectedNetConnUDPAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return a.conn.Write(p)
+}
+func (a *connectedNetConnUDPAdapter) Close() error                       { return a.conn.Close() }
+func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr                { return a.conn.LocalAddr() }
+func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error      { return a.conn.SetDeadline(t) }
+func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
+func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
 
 // connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
 // net.PacketConn with the connected peer as the constant remote addr.
