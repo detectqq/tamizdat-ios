@@ -181,6 +181,13 @@ final class TamizdatStatusStore: ObservableObject {
     /// the VPN is offline.
     @Published private(set) var turnCredsValid: Bool = TURNCredsStore.shared.isFresh
 
+    /// Phase 2D-PART-C: true when the in-process VK TURN runner
+    /// (mobile/socksstub/vkturn.go) reports itself alive. The runner
+    /// lives in the EXTENSION process, not the main app, so this
+    /// always returns false in the main app — wire it up here so a
+    /// future RPC field can light up the home-screen TURN tile.
+    var turnUpstreamRunning: Bool { SocksstubTURNUpstreamRunning() }
+
     /// Pollling cadence. 500 ms is the same value sing-box-for-apple
     /// uses for its connection-stat polling. Drop to 250 ms or lower
     /// if lamp feel is sluggish; round-trip RPC is ~10-30 ms so we

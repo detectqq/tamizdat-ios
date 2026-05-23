@@ -230,7 +230,60 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             log("error: SocksstubSetSamizdatConfig: \(cfgErr.localizedDescription)")
             return false
         }
+
+        // Phase 2D-PART-C: attach VK TURN upstream when the operator
+        // has explicitly opted in via Settings → VK TURN → mode = .vk.
+        // The runner spins up 12 DTLS sessions to VK relays, fetches a
+        // WireGuard config via GETCONF, and logs it. Traffic still
+        // flows over the existing hev path — actually splicing the WG
+        // config into a userspace WireGuard is the next phase
+        // (WireGuardKit dependency isn't vendored yet).
+        if EndpointTurnMode.current == .vk {
+            attachVKTurnUpstream()
+        }
         return true
+    }
+
+    /// Spin up the VK TURN runner if the operator selected it.
+    /// All inputs come from App Group UserDefaults — the user fills
+    /// them in Settings → VK TURN before flipping the picker on.
+    /// Failure paths log + fall through silently so the existing
+    /// hev tunnel still serves traffic.
+    private func attachVKTurnUpstream() {
+        let peer = VKCredsPreferences.peerAddr
+        let password = VKCredsPreferences.connectPassword
+        guard !peer.isEmpty, !password.isEmpty else {
+            appendExtLog("warn: VK TURN attach skipped — peer or password empty")
+            return
+        }
+        let deviceID = VKCredsPreferences.deviceID
+        guard let creds = TURNCredsStore.shared.load(), TURNCredsStore.shared.isFresh else {
+            appendExtLog("warn: VK TURN attach skipped — no fresh creds")
+            return
+        }
+        let json = vkCredsAsJSON(creds: creds)
+        let err = SocksstubStartVKTurnUpstream(json, peer, password, deviceID, 9000)
+        if !err.isEmpty {
+            appendExtLog("error: SocksstubStartVKTurnUpstream: \(err)")
+            return
+        }
+        appendExtLog("info: VK TURN upstream started, polling for WG config...")
+
+        // Poll for the WG config the wgturn server sends back. The
+        // bridge stores it once GETCONF resolves; we want it visible
+        // in the file log so the operator can verify reachability via
+        // the existing Share-to-Telegram flow.
+        Task.detached(priority: .utility) {
+            for _ in 0..<60 { // 60 * 250 ms = 15 s
+                let wg = SocksstubTURNUpstreamWGConfig()
+                if !wg.isEmpty {
+                    self.appendExtLog("info: VK TURN WG config received:\n\(wg)")
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            self.appendExtLog("warn: VK TURN WG config not received within 15 s")
+        }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
@@ -253,6 +306,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // main-app WhitelistMonitor resumes on disconnect and writes
         // fresh values; the 200s stale-check handles truly stale data.
         pathMonitor.cancel()
+        // Phase 2D-PART-C: stop the VK TURN runner if it was attached.
+        // Idempotent on the Go side — safe to call even when never started.
+        SocksstubStopVKTurnUpstream()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil

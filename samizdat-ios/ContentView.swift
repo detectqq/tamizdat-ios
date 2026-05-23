@@ -420,9 +420,23 @@ struct ContentView: View {
                      value: lampStore.dataText.value,
                      unit: lampStore.dataText.unit)
             StatTile(label: "TURN",
-                     value: (lampStore.turnCredsValid || lampStore.snapshot.hasTURNCreds) ? "✓" : "—",
+                     value: turnTileValue,
                      unit: nil)
         }
+    }
+
+    /// TURN tile glyph based on three states:
+    ///   "▲" — upstream runner alive (creds + lifecycle attached)
+    ///   "✓" — creds cached but not actively used
+    ///   "—" — no creds, no upstream
+    private var turnTileValue: String {
+        if lampStore.turnUpstreamRunning {
+            return "▲"
+        }
+        if lampStore.turnCredsValid || lampStore.snapshot.hasTURNCreds {
+            return "✓"
+        }
+        return "—"
     }
 
     /// "Effective" endpoint for label purposes:
