@@ -233,13 +233,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Phase 2D-PART-C: attach VK TURN upstream when the operator
         // has explicitly opted in via Settings → VK TURN → mode = .vk.
-        // The runner spins up 12 DTLS sessions to VK relays, fetches a
-        // WireGuard config via GETCONF, and logs it. Traffic still
-        // flows over the existing hev path — actually splicing the WG
-        // config into a userspace WireGuard is the next phase
-        // (WireGuardKit dependency isn't vendored yet).
+        // Static helper because startInProcessSocks itself is static —
+        // it has no `self`, only the log closure threaded through from
+        // the instance-level caller. Failure paths log + fall through
+        // silently so the hev tunnel still serves traffic.
         if EndpointTurnMode.current == .vk {
-            attachVKTurnUpstream()
+            Self.attachVKTurnUpstream(log: log)
         }
         return true
     }
@@ -247,42 +246,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Spin up the VK TURN runner if the operator selected it.
     /// All inputs come from App Group UserDefaults — the user fills
     /// them in Settings → VK TURN before flipping the picker on.
-    /// Failure paths log + fall through silently so the existing
-    /// hev tunnel still serves traffic.
-    private func attachVKTurnUpstream() {
+    /// Traffic still flows over the existing hev path; this only logs
+    /// the WireGuard config it receives so the operator can verify
+    /// reachability. WireGuardKit attach is Phase 2D-followup.
+    private static func attachVKTurnUpstream(log: @escaping (String) -> Void) {
         let peer = VKCredsPreferences.peerAddr
         let password = VKCredsPreferences.connectPassword
         guard !peer.isEmpty, !password.isEmpty else {
-            appendExtLog("warn: VK TURN attach skipped — peer or password empty")
+            log("warn: VK TURN attach skipped — peer or password empty")
             return
         }
         let deviceID = VKCredsPreferences.deviceID
         guard let creds = TURNCredsStore.shared.load(), TURNCredsStore.shared.isFresh else {
-            appendExtLog("warn: VK TURN attach skipped — no fresh creds")
+            log("warn: VK TURN attach skipped — no fresh creds")
             return
         }
         let json = vkCredsAsJSON(creds: creds)
         let err = SocksstubStartVKTurnUpstream(json, peer, password, deviceID, 9000)
         if !err.isEmpty {
-            appendExtLog("error: SocksstubStartVKTurnUpstream: \(err)")
+            log("error: SocksstubStartVKTurnUpstream: \(err)")
             return
         }
-        appendExtLog("info: VK TURN upstream started, polling for WG config...")
+        log("info: VK TURN upstream started, polling for WG config...")
 
-        // Poll for the WG config the wgturn server sends back. The
-        // bridge stores it once GETCONF resolves; we want it visible
-        // in the file log so the operator can verify reachability via
-        // the existing Share-to-Telegram flow.
         Task.detached(priority: .utility) {
             for _ in 0..<60 { // 60 * 250 ms = 15 s
                 let wg = SocksstubTURNUpstreamWGConfig()
                 if !wg.isEmpty {
-                    self.appendExtLog("info: VK TURN WG config received:\n\(wg)")
+                    log("info: VK TURN WG config received:\n\(wg)")
                     return
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
-            self.appendExtLog("warn: VK TURN WG config not received within 15 s")
+            log("warn: VK TURN WG config not received within 15 s")
         }
     }
 
