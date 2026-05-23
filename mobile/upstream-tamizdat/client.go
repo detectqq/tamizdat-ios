@@ -165,8 +165,9 @@ type Client struct {
 	handshakeLimiter    *handshakeLimiter
 	realtime            *RealtimeController
 	derivedShortIDs     atomic.Pointer[[][8]byte]
-	serverPushedSNIPool atomic.Pointer[[]SNIEntry]
-	coverCtx            context.Context
+	serverPushedSNIPool   atomic.Pointer[[]SNIEntry]
+	serverPushedTURNCreds atomic.Pointer[TURNCredsEntry]
+	coverCtx              context.Context
 	coverCancel         context.CancelFunc
 	bundleCtx           context.Context
 	bundleCancel        context.CancelFunc
@@ -747,6 +748,13 @@ func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
 			c.cover.replaceGap(time.Duration(bundle.CoverGapMinMS)*time.Millisecond, time.Duration(bundle.CoverGapMaxMS)*time.Millisecond)
 		}
 	}
+	// VK TURN credentials: store for future TURN transport implementation.
+	// Currently a forward-compatible placeholder; the client-side TURN
+	// dialer will read these when implemented.
+	if bundle.TURNCreds != nil {
+		entry := *bundle.TURNCreds
+		c.serverPushedTURNCreds.Store(&entry)
+	}
 	// Phase C iOS-notify: forward a one-shot user-facing notification to any
 	// registered consumer (iOS NE bridges this to a local notification).
 	// Fire on a goroutine to keep the bundle-apply path non-blocking; the
@@ -789,6 +797,17 @@ func (c *Client) TopRealtimeFlowSnapshot() TopRealtimeFlowStats {
 		return TopRealtimeFlowStats{}
 	}
 	return c.realtime.Detector.TopRealtimeFlowSnapshot()
+}
+
+// ServerPushedTURNCreds returns the most recently received VK TURN
+// credentials from the server's CoverConfigBundle. Returns nil if the
+// server has not pushed any credentials yet (e.g. turncreds manager
+// disabled or credentials not yet fetched).
+func (c *Client) ServerPushedTURNCreds() *TURNCredsEntry {
+	if c == nil {
+		return nil
+	}
+	return c.serverPushedTURNCreds.Load()
 }
 
 // RTTProbeSnapshot returns the current RTT probe stats — last p50 in ms for

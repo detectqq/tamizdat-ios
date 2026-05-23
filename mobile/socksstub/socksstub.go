@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +88,7 @@ type upstreamClient interface {
 	LockedRealtimeCount() int32
 	LiteTransportAlive() int32
 	RTTProbeSnapshot() samizdat.RTTProbeStats
+	ServerPushedTURNCreds() *samizdat.TURNCredsEntry
 }
 
 type runtimeState struct {
@@ -778,6 +780,31 @@ func currentPoolVariant() string {
 		return "v1"
 	}
 	return v
+}
+
+// TURNCredsSnapshot returns a JSON string with the current VK TURN
+// relay credentials pushed by the server, or an empty string if no
+// credentials are available yet. The JSON shape matches TURNCredsEntry:
+//
+//	{"username":"...","password":"...","urls":["host:port",...],"lifetime":86400}
+//
+// Swift reads this to surface TURN status in the UI.
+func TURNCredsSnapshot() string {
+	rt.mu.Lock()
+	cli := rt.samizdatClient
+	rt.mu.Unlock()
+	if cli == nil {
+		return ""
+	}
+	creds := cli.ServerPushedTURNCreds()
+	if creds == nil {
+		return ""
+	}
+	data, err := json.Marshal(creds)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.

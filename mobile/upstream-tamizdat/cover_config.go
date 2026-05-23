@@ -33,6 +33,23 @@ type CoverConfigBundle struct {
 	// admin_message / admin_broadcast) and clears the pending flag after
 	// a successful body write. Empty in cached/global bundles.
 	Notification *NotificationEntry `json:"notification,omitempty"`
+
+	// TURNCreds carries VK TURN relay credentials obtained by the
+	// server's turncreds.Manager. Clients that support TURN-based
+	// transport use these to establish relay connections through VK
+	// infrastructure. Older clients silently ignore the field.
+	TURNCreds *TURNCredsEntry `json:"turn_creds,omitempty"`
+}
+
+// TURNCredsEntry carries TURN relay credentials for client-side TURN
+// transport. Lifetime is in seconds from the time the credentials
+// were issued by VK; clients should re-fetch the bundle before
+// lifetime expires to obtain fresh credentials.
+type TURNCredsEntry struct {
+	Username string   `json:"username"`
+	Password string   `json:"password"`
+	URLs     []string `json:"urls"`
+	Lifetime int      `json:"lifetime"`
 }
 
 // NotificationEntry is a one-shot user-facing message delivered via the
