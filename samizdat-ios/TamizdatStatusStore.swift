@@ -316,13 +316,17 @@ final class TamizdatStatusStore: ObservableObject {
 
     // MARK: – Formatted strings (IPA-D22)
 
-    /// "Main" / "Whitelist" — synced from `EndpointModeStore.current`.
-    /// The store doesn't know which mode is selected — caller passes
-    /// the resolved label in. Kept as a free helper for symmetry.
+    /// "Main" / "Whitelist" / "TURN" — synced from `EndpointModeStore.current`.
+    /// When the active endpoint is .backup AND the operator picked
+    /// WhitelistMode.vkTurn, render "TURN" so the home-screen tile
+    /// reflects the actual transport — not just the abstract "we are
+    /// on the whitelist endpoint" position. Operator looking at the
+    /// tile expects to see what's carrying traffic.
     static func modeLabel(active: EndpointMode) -> String {
         switch active {
         case .primary: return "Main"
-        case .backup:  return "Whitelist"
+        case .backup:
+            return WhitelistMode.current == .vkTurn ? "TURN" : "Whitelist"
         case .auto:    return "Auto"
         }
     }
