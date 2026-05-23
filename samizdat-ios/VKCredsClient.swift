@@ -474,10 +474,23 @@ actor VKCredsClient {
         guard !urls.isEmpty else {
             throw VKCredsError.malformedResponse(step: "5", hint: "no TURN urls")
         }
+        // VK ships `lifetime` (sec) in some responses and `ttl` in others;
+        // sometimes neither (build-227 log showed step 5 ok then immediate
+        // re-refresh — root cause was lifetime=0, expiresAt = acquiredAt,
+        // needsRefresh always true → infinite refresh loop). Fall back to
+        // 3600s (one hour) — the donor's empirical default and a safe
+        // floor: VK invalidates creds long before they actually go stale.
         let lifetime: TimeInterval = {
-            if let life = block["lifetime"] as? Double, life > 0 { return life }
-            if let ttl = block["ttl"] as? Double, ttl > 0 { return ttl }
-            return 0
+            if let life = block["lifetime"] as? Double, life > 0 {
+                TURNLog.info("vkcreds", "parsed lifetime=\(Int(life))s from response")
+                return life
+            }
+            if let ttl = block["ttl"] as? Double, ttl > 0 {
+                TURNLog.info("vkcreds", "parsed ttl=\(Int(ttl))s from response")
+                return ttl
+            }
+            TURNLog.warn("vkcreds", "no lifetime/ttl in step 5 response — using default 3600s")
+            return 3600
         }()
         return VKTURNCredentials(
             username: user,
