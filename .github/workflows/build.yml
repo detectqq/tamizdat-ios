@@ -176,10 +176,26 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/tunnel-profile.plist
           rm -rf _inspect
 
+      - name: Compute versioned IPA name
+        id: ipa_name
+        # ref_name is the branch/tag (e.g. "feature/wkwebview-vk-captcha");
+        # github.sha is the full SHA, we want the short form. Slashes in
+        # branch names must become dashes — GitHub artifact names disallow /.
+        run: |
+          SAFE_BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          NAME="samizdat-ios-${SAFE_BRANCH}-${SHORT_SHA}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Artifact will be: ${NAME}"
+          # Copy the IPA next to itself with the versioned filename so
+          # downloads land as `samizdat-ios-<branch>-<sha>.ipa` instead
+          # of generic `samizdat-ios.ipa`.
+          cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: samizdat-ios-ipa
-          path: ${{ env.EXPORT_PATH }}/samizdat-ios.ipa
+          name: ${{ steps.ipa_name.outputs.name }}
+          path: ${{ env.EXPORT_PATH }}/${{ steps.ipa_name.outputs.name }}.ipa
           if-no-files-found: error
           retention-days: 30
