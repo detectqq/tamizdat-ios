@@ -27,9 +27,16 @@ struct VKTURNCredentials: Codable, Equatable {
     let username: String
     /// TURN realm password — opaque bearer; treat as a secret.
     let password: String
-    /// Ordered TURN URLs (host:port) returned by VK / OK back-end. The
-    /// scheme prefix (`turn:` / `turns:`) is stripped by the client.
-    let turnURLs: [String]
+    /// Ordered TURN servers with full metadata (scheme + transport)
+    /// returned by VK / OK back-end. Authoritative — `turnURLs` is a
+    /// computed projection kept for the older callers that just want
+    /// host:port dial targets.
+    ///
+    /// Optional in the Codable shape so a freshly-decoded V1 blob
+    /// (saved by a previous app version that had no notion of
+    /// per-server transport) still deserialises. When nil, callers
+    /// fall back to `turnURLs` + a default-UDP guess.
+    let turnServers: [TurnServer]?
     /// VK-advertised credential lifetime in seconds. Negative or zero
     /// means VK didn't return a `lifetime` / `ttl`; we treat such creds
     /// as already needing refresh.
@@ -38,23 +45,95 @@ struct VKTURNCredentials: Codable, Equatable {
     /// `expiresAt` for client-side cache decisions.
     let acquiredAt: Date
 
+    /// Legacy projection — `host:port` per server. Kept so the
+    /// existing extension log path + the v1 wire shape can still
+    /// reference URLs without knowing about TurnServer.
+    var turnURLs: [String] {
+        guard let turnServers, !turnServers.isEmpty else { return [] }
+        return turnServers.map { "\($0.host):\($0.port)" }
+    }
+
     var expiresAt: Date {
         acquiredAt.addingTimeInterval(max(lifetime, 0))
     }
+
+    /// Backwards-compatible initialiser for tests / call-sites that
+    /// only have the legacy `[String]` URL list. Splits each entry on
+    /// `:` (the form `host:port`) and stamps default `turn` scheme /
+    /// `udp` transport.
+    init(username: String,
+         password: String,
+         turnURLs: [String],
+         lifetime: TimeInterval,
+         acquiredAt: Date) {
+        self.username = username
+        self.password = password
+        self.lifetime = lifetime
+        self.acquiredAt = acquiredAt
+        self.turnServers = turnURLs.compactMap { raw in
+            let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let port = Int(parts[1]) else { return nil }
+            return TurnServer(host: parts[0], port: port, scheme: "turn", transport: "udp")
+        }
+    }
+
+    /// Modern initialiser used by `VKCredsClient.parseTurnBlock`.
+    init(username: String,
+         password: String,
+         turnServers: [TurnServer],
+         lifetime: TimeInterval,
+         acquiredAt: Date) {
+        self.username = username
+        self.password = password
+        self.turnServers = turnServers
+        self.lifetime = lifetime
+        self.acquiredAt = acquiredAt
+    }
+}
+
+/// One TURN URL with its transport metadata preserved. VK ships URLs
+/// like `turn:1.2.3.4:80?transport=tcp`; we keep all four pieces so
+/// the Go runner can pick UDP-vs-TCP per server instead of guessing.
+struct TurnServer: Codable, Equatable {
+    let host: String
+    let port: Int
+    /// `"turn"` or `"turns"`. Defaults to `"turn"` when the source URL
+    /// omitted the scheme.
+    let scheme: String
+    /// `"udp"` or `"tcp"`. Defaults to `"udp"` per RFC 5928 § 3.1.
+    let transport: String
 }
 
 func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
+    // V2 entry shape — matches mobile/socksstub/vkturn.go::turnServerWire.
+    struct TurnServerWire: Encodable {
+        let host: String
+        let port: Int
+        let scheme: String
+        let transport: String
+    }
+
+    // V1 + V2 wire shape. `turn_servers` kept verbatim for
+    // backward-compat with extension builds that still parse the old
+    // v1 schema; `turn_servers_v2` is the authoritative source for
+    // the post-fix runner.
     struct LogShape: Encodable {
         let username: String
         let password: String
         let turn_servers: [String]
+        let turn_servers_v2: [TurnServerWire]
         let lifetime_sec: Int
+    }
+
+    let v2: [TurnServerWire] = (creds.turnServers ?? []).map { s in
+        TurnServerWire(host: s.host, port: s.port, scheme: s.scheme, transport: s.transport)
     }
 
     let shape = LogShape(
         username: creds.username,
         password: creds.password,
         turn_servers: creds.turnURLs,
+        turn_servers_v2: v2,
         lifetime_sec: Int(creds.lifetime)
     )
 
@@ -84,10 +163,13 @@ final class TURNCredsStore {
     /// in `EndpointModeStore`, `PacketTunnelProvider`, etc.
     private static let appGroupID = "group.com.anarki.samizdat-test"
     /// UserDefaults key. Versioned in case the schema changes later
-    /// — bump to `v2` on breaking changes so an old extension that
-    /// can't decode the new shape simply sees "no creds" and falls
-    /// back to its no-TURN path instead of crashing on decode.
-    private static let storageKey = "tamizdat.vkTURNCreds.v1"
+    /// — bumped to `v2` when `turnURLs: [String]` was replaced by
+    /// `turnServers: [TurnServer]?` so an old extension reading a
+    /// v1 blob would have seen `turnServers == nil` (zero usable
+    /// URLs) but still treated the entry as fresh. With the new
+    /// key, an old v1 entry is invisible to the new code and the
+    /// refresher fetches a fresh v2 blob on first launch.
+    private static let storageKey = "tamizdat.vkTURNCreds.v2"
 
     /// Cushion before expiry that triggers a refresh. 15 min gives the
     /// foreground 5-minute heartbeat (TURNCredsRefresher) four chances
@@ -128,6 +210,9 @@ final class TURNCredsStore {
         do {
             let data = try JSONEncoder.iso8601.encode(creds)
             defaults.set(data, forKey: Self.storageKey)
+            // Drop the legacy v1 key on first v2 write so a stale
+            // entry doesn't linger in the App Group plist forever.
+            defaults.removeObject(forKey: "tamizdat.vkTURNCreds.v1")
         } catch {
             // Encoding can't realistically fail for this Codable shape;
             // if it does we drop the write rather than crash so the app
@@ -153,9 +238,12 @@ final class TURNCredsStore {
     /// rejects a known-stale entry, or in tests. Wipes all three keys
     /// the save() path writes (binary blob, plain-string JSON for the
     /// extension, and the standalone acquiredAt stamp) so a stale
-    /// timestamp can never linger past a clear().
+    /// timestamp can never linger past a clear(). Also drops the legacy
+    /// v1 binary key so a long-lived install that was bridged across
+    /// the schema bump can never resurface old creds.
     func clear() {
         defaults?.removeObject(forKey: Self.storageKey)
+        defaults?.removeObject(forKey: "tamizdat.vkTURNCreds.v1")
         defaults?.removeObject(forKey: "tamizdat.vkTURNCredsJSON")
         defaults?.removeObject(forKey: "tamizdat.vkTURNCredsAcquiredAt")
     }

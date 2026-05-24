@@ -319,21 +319,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         ExtLog.info("[vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
 
-        // Safety margin gate. VK TURN credentials live ~3600 s (one
-        // hour). If the cached creds are already past 3480 s old we
-        // refuse to call `SocksstubStartVKTurnUpstream` — that gomobile
+        // Safety margin gate. The pre-fix code hard-coded 3480 s
+        // (lifetime 3600 minus 120 s cushion), but VK has shipped
+        // shorter-lived creds in the past — and a future TTL change
+        // would have silently let us call `SocksstubStartVKTurnUpstream`
+        // against creds that were already past expiry. That gomobile
         // function does a synchronous VK Allocate against the TURN
-        // server, which can sleep up to 15 s before failing with 401.
-        // Better to bail clean here and let the foreground/BG refresher
-        // grab fresh creds than to eat the wedged-listener timeout.
+        // server, which can sleep up to 15 s before failing 401, so
+        // we want to bail clean here and let the foreground/BG
+        // refresher grab fresh creds instead.
         //
+        // Now: parse `lifetime_sec` out of the credsJSON we already
+        // loaded above (wire shape `{username, password, turn_servers,
+        // lifetime_sec}` from TURNCredsStore.vkCredsAsJSON) and gate
+        // on `age >= lifetime - 120 s`. lifetime_sec <= 0 falls back
+        // to the historic 3480 s value so older entries (pre-refresh
+        // schema) still age-check cleanly.
+        let cushionSec: TimeInterval = 120
+        let lifetimeSec: TimeInterval = {
+            guard let data = credsJSON.data(using: .utf8) else { return 0 }
+            struct LifetimeShape: Decodable { let lifetime_sec: Int? }
+            guard let parsed = try? JSONDecoder().decode(LifetimeShape.self, from: data),
+                  let life = parsed.lifetime_sec, life > 0 else {
+                return 0
+            }
+            return TimeInterval(life)
+        }()
+        let safeBound: TimeInterval = lifetimeSec > 0 ? (lifetimeSec - cushionSec) : 3480
+
         // Key written by `TURNCredsStore.save(_:)` alongside the JSON
         // payload — see step C of feat/turn-autonomous-refresh.
         if let acquiredAt = defaults?.object(forKey: "tamizdat.vkTURNCredsAcquiredAt") as? Date {
             let age = Date().timeIntervalSince(acquiredAt)
-            ExtLog.info("[vkturn] attach: creds acquiredAt age = \(Int(age))s")
-            if age >= 3480 {
-                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ 3480s). Wait for refresh, then reconnect.")
+            ExtLog.info("[vkturn] attach: creds age=\(Int(age))s (lifetime=\(Int(lifetimeSec))s, cushion=\(Int(cushionSec))s)")
+            if age >= safeBound {
+                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ \(Int(safeBound))s). Wait for refresh, then reconnect.")
                 return
             }
         } else {
@@ -370,6 +390,62 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             ExtLog.warn("[vkturn] WG config NOT received within 30 s. running=\(SocksstubTURNUpstreamRunning())")
         }
+    }
+
+    private static func refreshVKTurnCredsFromAppGroup() -> String {
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
+              !credsJSON.isEmpty else {
+            ExtLog.warn("[vkturn] refresh creds SKIPPED — no creds JSON in App Group")
+            return "noCreds"
+        }
+
+        if let data = credsJSON.data(using: .utf8) {
+            struct Shape: Decodable {
+                struct Server: Decodable {
+                    let host: String?
+                    let port: Int?
+                    let scheme: String?
+                    let transport: String?
+                }
+                let username: String?
+                let turn_servers: [String]?
+                let turn_servers_v2: [Server]?
+                let lifetime_sec: Int?
+            }
+            if let shape = try? JSONDecoder().decode(Shape.self, from: data) {
+                let endpoints: String
+                if let v2 = shape.turn_servers_v2, !v2.isEmpty {
+                    endpoints = v2.map { s in
+                        let scheme = s.scheme ?? "turn"
+                        let transport = s.transport ?? "udp"
+                        let host = s.host ?? "<empty>"
+                        let port = s.port.map(String.init) ?? "0"
+                        return "\(scheme):\(host):\(port)?transport=\(transport)"
+                    }.joined(separator: ",")
+                } else {
+                    endpoints = (shape.turn_servers ?? []).joined(separator: ",")
+                }
+                ExtLog.info("[vkturn] refresh creds: username=\(shape.username ?? "<empty>") lifetime=\(shape.lifetime_sec ?? 0)s endpoints=[\(endpoints)] running=\(SocksstubTURNUpstreamRunning())")
+            } else {
+                ExtLog.warn("[vkturn] refresh creds: metadata decode failed (raw creds JSON intentionally not logged)")
+            }
+        }
+
+        let beforeMs = Date()
+        let err = SocksstubUpdateVKTurnCreds(credsJSON)
+        let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
+        if err.isEmpty {
+            ExtLog.info("[vkturn] refresh creds: SocksstubUpdateVKTurnCreds OK dur=\(durMs)ms")
+            return "ok"
+        }
+        if err == "not running" {
+            ExtLog.info("[vkturn] refresh creds: runner not running dur=\(durMs)ms")
+            return err
+        }
+        ExtLog.warn("[vkturn] refresh creds: SocksstubUpdateVKTurnCreds returned \"\(err)\" dur=\(durMs)ms")
+        return err
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
@@ -663,6 +739,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested whitelist probes refresh → testHost=\(WhitelistProbePreferences.testHost) whitelistHost=\(WhitelistProbePreferences.whitelistHost)")
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
+        case "refreshVKTurnCreds":
+            // Main app fetched fresh VK TURN creds and wrote them to the
+            // App Group. The active runner lives in THIS extension
+            // process, so update it here; calling the gomobile bridge
+            // in the main app only touches that process' idle Go runtime.
+            appendExtLog("info: app requested VK TURN creds refresh")
+            let result = Self.refreshVKTurnCredsFromAppGroup()
+            completionHandler?(result.data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which

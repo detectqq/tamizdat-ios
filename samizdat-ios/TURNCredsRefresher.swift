@@ -208,6 +208,36 @@ final class TURNCredsRefresher: ObservableObject {
                 }
                 TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
+                // Push the fresh snapshot into the in-process Go VK
+                // TURN runner so the next worker-group rotation uses
+                // them — without this hop the runner kept reading the
+                // creds it took at startup and started 401-ing once
+                // the original 3600 s lifetime elapsed.
+                //
+                // The runner lives in the extension process, not the
+                // main app, so this in-process call usually returns
+                // "not running". We still keep it for simulator/unit
+                // paths, then send a provider message so the extension
+                // re-reads the App Group mirror and updates its live
+                // Go runner in the correct process.
+                let credsJSON = vkCredsAsJSON(creds: creds)
+                let updateErr = SamizdatBridge.updateVKTurnCreds(credsJSON)
+                if updateErr.isEmpty {
+                    TURNLog.info("turncreds", "VK TURN runner creds updated in-process")
+                } else if updateErr == "not running" {
+                    TURNLog.info("turncreds", "VK TURN runner not running in this process — App Group mirror still updated")
+                } else {
+                    TURNLog.warn("turncreds", "SocksstubUpdateVKTurnCreds returned: \(updateErr)")
+                }
+                let extUpdate = await VPNProfileStore.shared.refreshVKTurnCreds()
+                if extUpdate == "ok" || extUpdate.isEmpty {
+                    let extStatus = extUpdate.isEmpty ? "not-running" : extUpdate
+                    TURNLog.info("turncreds", "extension VK TURN creds refresh result=\(extStatus)")
+                } else if extUpdate == "not running" {
+                    TURNLog.info("turncreds", "extension VK TURN runner not running — fresh creds saved for next attach")
+                } else {
+                    TURNLog.warn("turncreds", "extension VK TURN creds refresh returned: \(extUpdate)")
+                }
                 self.lastSaveAt = Date()
                 self.lastError = nil
                 self.consecutiveFailures = 0
