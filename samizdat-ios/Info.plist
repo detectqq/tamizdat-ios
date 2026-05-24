@@ -36,6 +36,14 @@
     <array>
         <string>arm64</string>
     </array>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>fetch</string>
+    </array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>com.anarki.samizdat-test.creds-refresh</string>
+    </array>
     <key>NSCameraUsageDescription</key>
     <string>Tamizdat scans tamizdat:// QR codes for endpoint setup.</string>
     <key>UIAppFonts</key>
