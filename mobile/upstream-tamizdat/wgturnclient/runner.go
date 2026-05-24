@@ -123,6 +123,9 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.PreloadedCreds != nil {
 		dup := *cfg.PreloadedCreds
 		dup.TurnURLs = append([]string(nil), cfg.PreloadedCreds.TurnURLs...)
+		if len(cfg.PreloadedCreds.TurnServers) > 0 {
+			dup.TurnServers = append([]TurnServer(nil), cfg.PreloadedCreds.TurnServers...)
+		}
 		r.preloadedCreds.Store(&dup)
 	}
 	return r, nil
@@ -278,6 +281,26 @@ func (r *Runner) Shutdown() {
 	if localConn != nil {
 		_ = localConn.Close()
 	}
+}
+
+// UpdatePreloadedCreds atomically swaps the credentials that the next
+// worker-group rotation will pick up via getCredsWithFallback. iOS
+// callers refresh VK creds out-of-band (TURNCredsRefresher) and push
+// the new snapshot in here so long-lived sessions stay authenticated
+// past the original creds' 3600 s lifetime.
+//
+// A nil argument is a no-op — we never want to clear creds out from
+// under a running rotation.
+func (r *Runner) UpdatePreloadedCreds(creds *Credentials) {
+	if creds == nil {
+		return
+	}
+	dup := *creds
+	dup.TurnURLs = append([]string(nil), creds.TurnURLs...)
+	if len(creds.TurnServers) > 0 {
+		dup.TurnServers = append([]TurnServer(nil), creds.TurnServers...)
+	}
+	r.preloadedCreds.Store(&dup)
 }
 
 func (r *Runner) SetPaused(paused bool) {

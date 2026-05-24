@@ -133,6 +133,35 @@ final class SamizdatBridge: ObservableObject {
         SamizdatVersion()
     }
 
+    /// Push freshly-acquired VK TURN credentials into the in-process Go
+    /// runner so its next worker-group rotation tick uses them for
+    /// TURN Allocate, instead of the snapshot it took from
+    /// `Config.PreloadedCreds` when the tunnel started.
+    ///
+    /// Returns the gomobile error string ("" on success, "not running"
+    /// when no VK TURN runner is alive in this process). Stateless —
+    /// safe to call from `TURNCredsRefresher` after every successful
+    /// refresh whether or not the user has the tunnel up.
+    ///
+    /// NOTE: the VK TURN runner lives in the EXTENSION process, not the
+    /// main app. A call from the main app reaches the main app's own
+    /// (always-nil) runner and returns "not running" — that is
+    /// expected and the caller silently logs + ignores. To make live
+    /// refresh land in the running extension a follow-up patch needs
+    /// to plumb a `refreshVKTurnCreds` provider message through
+    /// `handleAppMessage`. For now the Go-side API is in place so the
+    /// extension binding regen + that plumbing can land in one step.
+    ///
+    /// TODO(gomobile-rebuild): `SocksstubUpdateVKTurnCreds` is a new
+    /// export; the SamizdatClient.xcframework currently checked into
+    /// the repo predates it. After regenerating bindings the linker
+    /// will find the symbol and this call will start returning
+    /// meaningful values. See commit message for the regen command.
+    @discardableResult
+    static func updateVKTurnCreds(_ credsJSON: String) -> String {
+        SocksstubUpdateVKTurnCreds(credsJSON)
+    }
+
     // MARK: – Status
 
     private func refreshStatus() async {

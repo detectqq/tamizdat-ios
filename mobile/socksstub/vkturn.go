@@ -59,11 +59,18 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	resetVKTurnAtomicsLocked()
 	vkturnAttachOnce = sync.Once{}
 
+	// Pick transport from the first TURN server's metadata when the v2
+	// wire shape is present; otherwise default to UDP (legacy
+	// behaviour). VK has shipped both UDP and TCP-only relays, and
+	// hard-forcing UDP against a TCP-only relay produces the
+	// "Allocate: timeout" path users see on long-lived sessions.
+	useUDP := shouldUseUDP(creds)
+
 	runner, err := wgturnclient.New(wgturnclient.Config{
 		Listen:         fmt.Sprintf("127.0.0.1:%d", listenPort),
 		PeerAddr:       peerAddr,
 		Workers:        12,
-		UseUDP:         true,
+		UseUDP:         useUDP,
 		DeviceID:       deviceID,
 		ConnPassword:   wgPassword,
 		PreloadedCreds: creds,
@@ -149,6 +156,40 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	return "GETCONF timeout"
 }
 
+// UpdateVKTurnCreds swaps fresh credentials into the running runner so
+// the next worker-group rotation tick uses them for TURN Allocate.
+// Returns "" on success, "not running" when no runner is alive, or a
+// parser error message when credsJSON is malformed.
+//
+// Why this exists: Config.PreloadedCreds is consumed once when the
+// runner starts. Credentials live ~3600 s, but workers rotate every
+// `lifetime - 120` s. Without a live update path the second rotation
+// (about 58 min into the session) tries to allocate against expired
+// creds and gets 401, killing the upstream. The Swift heartbeat in
+// TURNCredsRefresher (5-min cadence) re-fetches before expiry and
+// calls this exported func to publish the fresh snapshot.
+//
+// Concurrency: the worker loop calls preloadedCreds.Load() under
+// groupAuthMutex. We use atomic.Pointer.Store here too so the swap
+// is race-free without holding the mutex.
+func UpdateVKTurnCreds(credsJSON string) string {
+	if !vkturnRunning.Load() {
+		return "not running"
+	}
+	creds, err := parseVKTurnCredsJSON(credsJSON)
+	if err != nil {
+		return "credsJSON: " + err.Error()
+	}
+	vkturnMu.Lock()
+	runner := vkturnRunner
+	vkturnMu.Unlock()
+	if runner == nil {
+		return "not running"
+	}
+	runner.UpdatePreloadedCreds(creds)
+	return ""
+}
+
 // StopVKTurnUpstream stops the in-flight runner. Idempotent.
 func StopVKTurnUpstream() {
 	vkturnMu.Lock()
@@ -220,29 +261,99 @@ func stopVKTurnAttachLocked() {
 	vkturnNet.Store(nil)
 }
 
+// turnServerWire is the v2 wire shape for a single TURN server
+// entry. Swift writes this through TURNCredsStore.vkCredsAsJSON; the
+// older `turn_servers` []string is still emitted alongside for
+// backward compatibility with any extension build still on the v1
+// schema.
+type turnServerWire struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Scheme    string `json:"scheme"`
+	Transport string `json:"transport"`
+}
+
 func parseVKTurnCredsJSON(credsJSON string) (*wgturnclient.Credentials, error) {
 	var wire struct {
-		Username    string   `json:"username"`
-		Password    string   `json:"password"`
-		TurnServers []string `json:"turn_servers"`
-		LifetimeSec int      `json:"lifetime_sec"`
+		Username      string           `json:"username"`
+		Password      string           `json:"password"`
+		TurnServers   []string         `json:"turn_servers"`
+		TurnServersV2 []turnServerWire `json:"turn_servers_v2"`
+		LifetimeSec   int              `json:"lifetime_sec"`
 	}
 	if err := json.Unmarshal([]byte(credsJSON), &wire); err != nil {
 		return nil, err
 	}
-	if wire.Username == "" || wire.Password == "" || len(wire.TurnServers) == 0 {
-		return nil, fmt.Errorf("empty username/password/turn_servers")
+	if wire.Username == "" || wire.Password == "" {
+		return nil, fmt.Errorf("empty username/password")
 	}
+
+	// Prefer v2 shape (carries scheme + transport per URL). Fall back
+	// to v1 turn_servers []string when v2 is absent — keeps the new
+	// Go-side runner compatible with extensions still writing the old
+	// JSON during a rolling deploy.
+	var turnURLs []string
+	var turnServers []wgturnclient.TurnServer
+	if len(wire.TurnServersV2) > 0 {
+		for _, s := range wire.TurnServersV2 {
+			if s.Host == "" || s.Port == 0 {
+				continue
+			}
+			scheme := s.Scheme
+			if scheme == "" {
+				scheme = "turn"
+			}
+			transport := s.Transport
+			if transport == "" {
+				transport = "udp"
+			}
+			turnServers = append(turnServers, wgturnclient.TurnServer{
+				Host:      s.Host,
+				Port:      s.Port,
+				Scheme:    scheme,
+				Transport: transport,
+			})
+			turnURLs = append(turnURLs, fmt.Sprintf("%s:%d", s.Host, s.Port))
+		}
+	}
+	if len(turnURLs) == 0 {
+		// v1 fallback path.
+		turnURLs = wire.TurnServers
+	}
+	if len(turnURLs) == 0 {
+		return nil, fmt.Errorf("empty turn_servers")
+	}
+
 	lifetime := wire.LifetimeSec
 	if lifetime <= 0 {
 		lifetime = 3600
 	}
 	return &wgturnclient.Credentials{
-		User:     wire.Username,
-		Pass:     wire.Password,
-		TurnURLs: wire.TurnServers,
-		Lifetime: lifetime,
+		User:        wire.Username,
+		Pass:        wire.Password,
+		TurnURLs:    turnURLs,
+		TurnServers: turnServers,
+		Lifetime:    lifetime,
 	}, nil
+}
+
+// shouldUseUDP picks the wire transport for the runner. Preference
+// order: UDP > TCP. When the v2 shape is present we look for any
+// server advertising UDP; if there is one, we run UDP and let the
+// session loop pick that server first (sessions iterate
+// sessionID%len(TurnURLs), so VK's UDP relay sits at the same index
+// in both lists). When v2 is absent we keep the historical
+// hard-coded UDP behaviour.
+func shouldUseUDP(creds *wgturnclient.Credentials) bool {
+	if creds == nil || len(creds.TurnServers) == 0 {
+		return true
+	}
+	for _, s := range creds.TurnServers {
+		if s.Transport == "udp" {
+			return true
+		}
+	}
+	return false
 }
 
 func resetVKTurnAtomicsLocked() {

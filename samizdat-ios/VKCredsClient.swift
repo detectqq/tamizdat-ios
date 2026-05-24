@@ -463,17 +463,54 @@ actor VKCredsClient {
             throw VKCredsError.malformedResponse(step: "5", hint: "missing credential")
         }
         let rawURLs = block["urls"] as? [String] ?? []
-        let urls: [String] = rawURLs.compactMap { raw in
-            // VK ships URLs with `turn:` / `turns:` scheme and an
-            // optional `?transport=tcp` suffix; strip both so callers
-            // get a bare host:port to feed into libice / Pion.
-            let trimmed = raw.split(separator: "?", maxSplits: 1).first.map(String.init) ?? raw
-            var clean = trimmed
-            if clean.hasPrefix("turns:") { clean.removeFirst("turns:".count) }
-            else if clean.hasPrefix("turn:") { clean.removeFirst("turn:".count) }
-            return clean.isEmpty ? nil : clean
+        let servers: [TurnServer] = rawURLs.compactMap { raw in
+            // VK ships URLs like `turn:1.2.3.4:80?transport=tcp` or
+            // `turns:1.2.3.4:443`. Preserve all three pieces so the Go
+            // dispatcher can route over the right wire transport — the
+            // old "strip everything to host:port then hard-force UDP"
+            // path silently broke TCP-only relays.
+            //
+            // Split scheme then host:port then optional query.
+            var clean = raw
+            var scheme = "turn"
+            if clean.hasPrefix("turns:") {
+                scheme = "turns"
+                clean.removeFirst("turns:".count)
+            } else if clean.hasPrefix("turn:") {
+                clean.removeFirst("turn:".count)
+            }
+            let (hostPortPart, queryPart): (String, String?) = {
+                if let q = clean.firstIndex(of: "?") {
+                    let h = String(clean[..<q])
+                    let qs = String(clean[clean.index(after: q)...])
+                    return (h, qs)
+                }
+                return (clean, nil)
+            }()
+            // RFC 3261 — split last `:` so IPv4 literals + bracketed
+            // IPv6 work. VK's relay IPs are v4 today; the simple
+            // split is sufficient for what they actually ship.
+            let parts = hostPortPart.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2,
+                  let port = Int(parts[1]),
+                  !parts[0].isEmpty else {
+                return nil
+            }
+            var transport = "udp"
+            if let queryPart {
+                for kv in queryPart.split(separator: "&") {
+                    let pair = kv.split(separator: "=", maxSplits: 1).map(String.init)
+                    if pair.count == 2, pair[0].lowercased() == "transport" {
+                        let t = pair[1].lowercased()
+                        if t == "tcp" || t == "udp" {
+                            transport = t
+                        }
+                    }
+                }
+            }
+            return TurnServer(host: parts[0], port: port, scheme: scheme, transport: transport)
         }
-        guard !urls.isEmpty else {
+        guard !servers.isEmpty else {
             throw VKCredsError.malformedResponse(step: "5", hint: "no TURN urls")
         }
         // VK ships `lifetime` (sec) in some responses and `ttl` in others;
@@ -497,7 +534,7 @@ actor VKCredsClient {
         return VKTURNCredentials(
             username: user,
             password: pass,
-            turnURLs: urls,
+            turnServers: servers,
             lifetime: lifetime,
             acquiredAt: Date()
         )

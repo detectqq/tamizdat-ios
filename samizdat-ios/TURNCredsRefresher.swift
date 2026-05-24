@@ -208,6 +208,27 @@ final class TURNCredsRefresher: ObservableObject {
                 }
                 TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
+                // Push the fresh snapshot into the in-process Go VK
+                // TURN runner so the next worker-group rotation uses
+                // them — without this hop the runner kept reading the
+                // creds it took at startup and started 401-ing once
+                // the original 3600 s lifetime elapsed.
+                //
+                // The runner lives in the extension process, not the
+                // main app, so this call against the main-app's own
+                // (always-nil) runner returns "not running" — we
+                // swallow that quietly and rely on the App Group
+                // mirror + a follow-up provider message for the
+                // cross-process plumbing.
+                let credsJSON = vkCredsAsJSON(creds: creds)
+                let updateErr = SamizdatBridge.updateVKTurnCreds(credsJSON)
+                if updateErr.isEmpty {
+                    TURNLog.info("turncreds", "VK TURN runner creds updated in-process")
+                } else if updateErr == "not running" {
+                    TURNLog.info("turncreds", "VK TURN runner not running in this process — App Group mirror still updated")
+                } else {
+                    TURNLog.warn("turncreds", "SocksstubUpdateVKTurnCreds returned: \(updateErr)")
+                }
                 self.lastSaveAt = Date()
                 self.lastError = nil
                 self.consecutiveFailures = 0
