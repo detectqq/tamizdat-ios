@@ -246,7 +246,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // via UserDefaults from another process, EndpointTurnMode
         // stayed at .off and attach silently skipped. Read the picker
         // store directly to remove that whole class of bug.
-        if WhitelistMode.current == .vkTurn {
+        //
+        // Inlined because WhitelistMode.swift lives in the main-app
+        // target, not in samizdat-tunnel; the enum's storage key is
+        // copy-pasted from `samizdat-ios/WhitelistMode.swift` and
+        // MUST stay in sync. (TODO: lift WhitelistMode into a shared
+        // sources directory listed by both targets in project.yml.)
+        let appGroupID = "group.com.anarki.samizdat-test"
+        let whitelistModeRaw = UserDefaults(suiteName: appGroupID)?
+            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+        if whitelistModeRaw == "vkTurn" {
             Self.attachVKTurnUpstream(log: log)
         }
         return true
