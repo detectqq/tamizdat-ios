@@ -232,12 +232,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         // Phase 2D-PART-C: attach VK TURN upstream when the operator
-        // has explicitly opted in via Settings → VK TURN → mode = .vk.
+        // selected "Whitelist mode = TURN" in Settings.
+        //
         // Static helper because startInProcessSocks itself is static —
         // it has no `self`, only the log closure threaded through from
         // the instance-level caller. Failure paths log + fall through
         // silently so the hev tunnel still serves traffic.
-        if EndpointTurnMode.current == .vk {
+        //
+        // WhitelistMode is the single source of truth (the picker the
+        // operator actually touches). EndpointTurnMode was a separate
+        // legacy store that we used to read here, but the two could
+        // drift out of sync — when WhitelistMode flipped to .vkTurn
+        // via UserDefaults from another process, EndpointTurnMode
+        // stayed at .off and attach silently skipped. Read the picker
+        // store directly to remove that whole class of bug.
+        if WhitelistMode.current == .vkTurn {
             Self.attachVKTurnUpstream(log: log)
         }
         return true
