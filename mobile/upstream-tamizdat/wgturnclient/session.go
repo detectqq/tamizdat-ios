@@ -23,7 +23,26 @@ const (
 	sessionReadTimeout = 60 * time.Second
 	readBufSize        = 1600
 	socketBufSize      = 625 * 1024
+	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696.
+	// Cap concurrent DTLS handshakes to 3 to stop the OK CDN TURN
+	// server from rate-limiting the whole worker group when many
+	// sessions race to start at the same moment (worker-group rotation
+	// or app cold-start). 3 is the upstream value; matches what their
+	// production client ships with.
+	handshakeSemCap     = 3
+	handshakeAcquireTTL = 5 * time.Second
 )
+
+// handshakeSem throttles concurrent DTLS Client handshakes against
+// the TURN server. Package-level so all worker groups inside one
+// process share the same budget — the upstream client uses the same
+// scope. iOS test/release ship a single Runner per process, so the
+// distinction does not matter today, but keeping the scope identical
+// to upstream avoids drift when porting future fixes.
+//
+// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+// (client/main.go:66, 1404-1409).
+var handshakeSem = make(chan struct{}, handshakeSemCap)
 
 // NullLoggerFactory подавляет логи pion
 type NullLoggerFactory struct{}
@@ -349,6 +368,28 @@ func RunSession(
 		return false, fmt.Errorf("DTLS клиент: %w", err)
 	}
 	defer dtlsConn.Close()
+
+	// Acquire one slot from the package-level handshake throttle
+	// before running the DTLS handshake. Caps concurrency at
+	// handshakeSemCap (3). A 5 s budget is enough headroom for an
+	// in-flight neighbour to complete (a healthy DTLS handshake to
+	// OK CDN finishes in <1 s); after that we bail rather than queue
+	// indefinitely behind a stuck handshake.
+	//
+	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+	// (client/main.go:1404-1409).
+	acqCtx, acqCancel := context.WithTimeout(sessCtx, handshakeAcquireTTL)
+	select {
+	case handshakeSem <- struct{}{}:
+		acqCancel()
+		// Release the slot when this session ends — defer here, not
+		// inside the handshake block, so we don't double-release on
+		// error paths between acquire and Handshake completion.
+		defer func() { <-handshakeSem }()
+	case <-acqCtx.Done():
+		acqCancel()
+		return false, fmt.Errorf("DTLS handshake throttle: не удалось получить слот за %s (все %d заняты)", handshakeAcquireTTL, handshakeSemCap)
+	}
 
 	hctx, hcancel := context.WithTimeout(sessCtx, 45*time.Second)
 	log.Printf("[ВОРКЕР #%d] [DTLS] Рукопожатие (Handshake)...", sessionID)

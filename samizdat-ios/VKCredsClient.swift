@@ -50,15 +50,43 @@ struct WKWebViewCaptchaSolver: VKCaptchaSolver {
     }
 }
 
+/// One (ClientID, ClientSecret) pair for a VK anonymous app. The
+/// credential acquire flow runs against these as a list: when a step
+/// trips VK error_code 29 (rate-limit), the client advances to the
+/// next pair and retries — same behaviour as vk-turn-proxy's
+/// `vkCredentialsList` rotation.
+///
+/// The five default entries are the public IDs shipped by donor
+/// applications (vk.com, mvk.com, vkvideo, ID auth). Treating them as
+/// a constant pool spreads rate-limit pressure across five separate
+/// VK quotas and lets us survive a temporary ban on any single app.
+///
+/// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+/// (client/main.go:597-603).
+struct VKAppCredentials: Equatable {
+    let clientID: String
+    let clientSecret: String
+}
+
 /// Tuning knobs / fixed strings. The defaults are the Android donor's
 /// shipping values and produce traffic indistinguishable from their
 /// production traffic. Override only when you have a documented reason.
 struct VKCredsConfig {
-    /// VK App ID + Secret are the donor's "anonymous app" credentials —
-    /// effectively a constant; we keep them in config so unit tests
-    /// can override and to leave room for future rotation.
-    var appID: String = "6287487"
-    var appSecret: String = "QbYic1K3lEV5kTGiqlq2"
+    /// Ordered pool of VK app IDs / secrets to rotate through on
+    /// rate-limit (VK error_code 29). The first entry is the
+    /// historical default; the rest are vk-turn-proxy's fallbacks.
+    /// The client actor starts at index 0 and advances on rate-limit
+    /// responses; if every pair is exhausted, `fetchCredentials`
+    /// throws `VKCredsError.allAppIDsExhausted`.
+    ///
+    /// Single-app callers (e.g. unit tests) can override with a
+    /// one-element array.
+    var vkAppIDs: [VKAppCredentials] = VKCredsConfig.defaultAppIDs
+    /// Convenience accessor for the currently-active (index 0) app
+    /// ID — kept for old call sites and unit-test mocks that still
+    /// look at one pair.
+    var appID: String { vkAppIDs.first?.clientID ?? "6287487" }
+    var appSecret: String { vkAppIDs.first?.clientSecret ?? "QbYic1K3lEV5kTGiqlq2" }
     /// OK app key — burned into the donor flow.
     var okAppKey: String = "CGMMEJLGDIHBABABA"
     /// VK call hash — the per-deployment "room" id. MUST be set by the
@@ -83,6 +111,21 @@ struct VKCredsConfig {
     var maxRetries: Int = 5
     /// Per-request timeout (seconds).
     var perRequestTimeout: TimeInterval = 20
+
+    /// Default VK app IDs the client rotates through on rate-limit.
+    /// Five public anonymous-app credentials lifted from
+    /// vk-turn-proxy (their `vkCredentialsList`). Order matches
+    /// upstream so behaviour stays comparable.
+    ///
+    /// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+    /// (client/main.go:597-603).
+    static let defaultAppIDs: [VKAppCredentials] = [
+        VKAppCredentials(clientID: "6287487",  clientSecret: "QbYic1K3lEV5kTGiqlq2"),   // VK_WEB_APP_ID
+        VKAppCredentials(clientID: "7879029",  clientSecret: "aR5NKGmm03GYrCiNKsaw"),   // VK_MVK_APP_ID
+        VKAppCredentials(clientID: "52461373", clientSecret: "o557NLIkAErNhakXrQ7A"),   // VK_WEB_VKVIDEO_APP_ID
+        VKAppCredentials(clientID: "52649896", clientSecret: "WStp4ihWG4l3nmXZgIbC"),   // VK_MVK_VKVIDEO_APP_ID
+        VKAppCredentials(clientID: "51781872", clientSecret: "IjjCNl4L4Tf5QZEXIHKK"),   // VK_ID_AUTH_APP
+    ]
 }
 
 /// Errors thrown by `VKCredsClient.fetchCredentials()`.
@@ -99,6 +142,16 @@ enum VKCredsError: Error, LocalizedError {
     case deadHash
     /// Captcha solver failed (slider required → caller falls back).
     case captchaFailed(underlying: Error)
+    /// All configured VK app IDs (`VKCredsConfig.vkAppIDs`) hit
+    /// rate-limit responses in a row — every quota is exhausted and
+    /// there is nothing left to rotate to. Caller MUST wait minutes,
+    /// not seconds, before retrying.
+    case allAppIDsExhausted
+    /// VK returned error_code 29 (rate limit) for the currently
+    /// selected app ID. Internal sentinel — the retry loop advances
+    /// to the next app ID and retries. Never propagated past the
+    /// retry loop unless every ID is exhausted (see above).
+    case rateLimit(step: String, appID: String)
 
     var errorDescription: String? {
         switch self {
@@ -114,6 +167,10 @@ enum VKCredsError: Error, LocalizedError {
             return "VK хеш более не работает (code 9000)"
         case .captchaFailed(let underlying):
             return "Не удалось решить капчу: \(underlying.localizedDescription)"
+        case .allAppIDsExhausted:
+            return "Все VK App IDs упёрлись в rate-limit. Подожди несколько минут."
+        case .rateLimit(let step, let appID):
+            return "VK rate-limit на шаге \(step) (app_id=\(appID))"
         }
     }
 }
@@ -181,6 +238,48 @@ actor VKCredsClient {
     /// app's shared cookie store.
     private let session: URLSession
 
+    /// Index into `config.vkAppIDs`. Advances on VK error_code 29
+    /// (rate-limit) and wraps to `allAppIDsExhausted` when every pair
+    /// has been tried. Reset between `fetchCredentials` calls would
+    /// make sense too, but VK rate-limits are app-id-scoped and last
+    /// minutes — keeping the index across retries inside one
+    /// `runWithRetries` matches what vk-turn-proxy does.
+    private var currentAppIDIndex: Int = 0
+
+    /// Currently-active (clientID, clientSecret) pair. Falls back to
+    /// the historical default if the configured pool is empty.
+    private var currentApp: VKAppCredentials {
+        if currentAppIDIndex < config.vkAppIDs.count {
+            return config.vkAppIDs[currentAppIDIndex]
+        }
+        return VKAppCredentials(clientID: config.appID, clientSecret: config.appSecret)
+    }
+
+    /// Advance to the next app ID in the pool. Returns `false` when
+    /// the pool is exhausted — caller should throw
+    /// `.allAppIDsExhausted` and stop.
+    private func advanceAppID() -> Bool {
+        if currentAppIDIndex + 1 < config.vkAppIDs.count {
+            currentAppIDIndex += 1
+            return true
+        }
+        return false
+    }
+
+    /// True when the given VK error block represents a rate-limit
+    /// (error_code 29 OR an error_msg containing "rate limit" — VK
+    /// occasionally reports the throttle as a text-only message).
+    /// Mirror of vk-turn-proxy's `error_code:29` substring check.
+    ///
+    /// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+    /// (client/main.go:803).
+    private static func isRateLimit(_ block: [String: Any]) -> Bool {
+        let code = Int((block["error_code"] as? Double) ?? -1)
+        if code == 29 { return true }
+        let msg = (block["error_msg"] as? String ?? "").lowercased()
+        return msg.contains("rate limit")
+    }
+
     init(config: VKCredsConfig,
          captchaSolver: VKCaptchaSolver = WKWebViewCaptchaSolver()) {
         self.config = config
@@ -207,7 +306,7 @@ actor VKCredsClient {
     /// the primary returns dead-hash). Returns fully-populated creds.
     func fetchCredentials() async throws -> VKTURNCredentials {
         let hashPrefix = String(config.callHash.prefix(8))
-        TURNLog.info("vkcreds", "fetchCredentials: starting (hash=\(hashPrefix)...)")
+        TURNLog.info("vkcreds", "fetchCredentials: starting (hash=\(hashPrefix)... appIDs=\(config.vkAppIDs.count))")
         do {
             return try await runWithRetries(hash: config.callHash)
         } catch VKCredsError.deadHash {
@@ -217,6 +316,12 @@ actor VKCredsClient {
                 return try await runWithRetries(hash: secondary, maxAttempts: max(1, config.maxRetries - 2))
             }
             throw VKCredsError.deadHash
+        } catch VKCredsError.allAppIDsExhausted {
+            // Don't try secondary hash on rate-limit exhaustion: same
+            // pool of VK quotas, same exhaustion would just play out
+            // again. Surface the dedicated error so UI can show a
+            // "подожди X минут" message rather than a generic retry.
+            throw VKCredsError.allAppIDsExhausted
         }
     }
 
@@ -231,6 +336,31 @@ actor VKCredsClient {
                 return creds
             } catch VKCredsError.deadHash {
                 throw VKCredsError.deadHash
+            } catch let VKCredsError.rateLimit(step, appID) {
+                // VK throttled the currently-selected app ID. Advance
+                // to the next pair and retry quickly — the next app
+                // has its own quota window. If the pool is exhausted
+                // we surface `.allAppIDsExhausted` and STOP — there is
+                // nothing more we can usefully try in the next few
+                // minutes.
+                //
+                // Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit
+                // e8a9696 (client/main.go:803-805).
+                TURNLog.warn("vkcreds", "rate-limit at \(step) on app_id=\(appID) — rotating")
+                if !advanceAppID() {
+                    TURNLog.error("vkcreds", "all \(config.vkAppIDs.count) app IDs exhausted at \(step)")
+                    throw VKCredsError.allAppIDsExhausted
+                }
+                let nextID = currentApp.clientID
+                TURNLog.info("vkcreds", "rotated to app_id=\(nextID), retrying immediately")
+                // Skip the normal exponential backoff — moving to a
+                // fresh app ID resets the rate-limit window, so we
+                // want the retry to land before the user's session
+                // throttles further. Tiny 250 ms pause just to keep
+                // VK from seeing two requests at exactly the same
+                // millisecond.
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                continue
             } catch {
                 lastError = error
                 let backoff = Self.backoff(for: error, attempt: attempt)
@@ -263,13 +393,24 @@ actor VKCredsClient {
     /// One end-to-end run of the 5 calls. Throws on any failure; the
     /// outer retry loop decides whether to retry or bail.
     private func runOnce(hash: String) async throws -> VKTURNCredentials {
+        // Snapshot the currently-active app pair for this whole pass.
+        // The retry loop may advance `currentAppIDIndex` between
+        // attempts, but inside ONE runOnce we use the same ID across
+        // every call so VK sees a consistent identity per session.
+        let app = currentApp
+        let appID = app.clientID
+        let appSecret = app.clientSecret
+
         // Step 1 — anonymous app token (seed for step 2)
-        TURNLog.info("vkcreds", "step 1: getAnonymToken (seed)")
-        let step1 = "client_secret=\(config.appSecret)&client_id=\(config.appID)" +
+        TURNLog.info("vkcreds", "step 1: getAnonymToken (seed, app_id=\(appID))")
+        let step1 = "client_secret=\(appSecret)&client_id=\(appID)" +
                     "&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous" +
-                    "&isApiOauthAnonymEnabled=false&version=1&app_id=\(config.appID)"
+                    "&isApiOauthAnonymEnabled=false&version=1&app_id=\(appID)"
         let r1 = try await postJSON(step1, to: "https://login.vk.ru/?act=get_anonym_token",
                                      step: "1.getAnonymToken")
+        if let errBlock = r1["error"] as? [String: Any], Self.isRateLimit(errBlock) {
+            throw VKCredsError.rateLimit(step: "1", appID: appID)
+        }
         try Self.assertNoError(r1, step: "1")
         let t1: String = try Self.requireString(r1, path: ["data", "access_token"], step: "1")
         TURNLog.info("vkcreds", "step 1 ok")
@@ -277,13 +418,40 @@ actor VKCredsClient {
         // Step 2 — payload-bound anon token (the one with messages
         // scope) — fed into step 3.
         TURNLog.info("vkcreds", "step 2: getAnonymToken (payload-bound)")
-        let step2 = "client_id=\(config.appID)&token_type=messages&payload=\(t1)" +
-                    "&client_secret=\(config.appSecret)&version=1&app_id=\(config.appID)"
+        let step2 = "client_id=\(appID)&token_type=messages&payload=\(t1)" +
+                    "&client_secret=\(appSecret)&version=1&app_id=\(appID)"
         let r2 = try await postJSON(step2, to: "https://login.vk.ru/?act=get_anonym_token",
                                      step: "2.getAnonymToken")
+        if let errBlock = r2["error"] as? [String: Any], Self.isRateLimit(errBlock) {
+            throw VKCredsError.rateLimit(step: "2", appID: appID)
+        }
         try Self.assertNoError(r2, step: "2")
         let t3: String = try Self.requireString(r2, path: ["data", "access_token"], step: "2")
         TURNLog.info("vkcreds", "step 2 ok")
+
+        // Pre-auth warmup — VK's rate limiter and captcha gate are
+        // markedly more lenient against "browser-like" call sequences.
+        // vk-turn-proxy fires `calls.getCallPreview` between step 1
+        // and step 3 to look like a legitimate UI fetching the call
+        // preview before joining. The body shape mirrors upstream;
+        // failure is logged but never propagated — this is pure
+        // noise traffic. The only exception we surface is rate-limit,
+        // because a warmup throttle means step 3 is doomed and the
+        // retry loop should rotate to the next app ID immediately.
+        //
+        // Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+        // (client/main.go:897-901).
+        TURNLog.info("vkcreds", "step 0.warmup: calls.getCallPreview")
+        let warmupBody = "vk_join_link=https://vk.com/call/join/\(hash)&fields=photo_200&access_token=\(t1)"
+        let warmupURL = "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id=\(appID)"
+        if let warmupResp = try? await postJSON(warmupBody, to: warmupURL, step: "0.warmup") {
+            if let errBlock = warmupResp["error"] as? [String: Any], Self.isRateLimit(errBlock) {
+                throw VKCredsError.rateLimit(step: "0.warmup", appID: appID)
+            }
+            TURNLog.info("vkcreds", "step 0.warmup ok")
+        } else {
+            TURNLog.warn("vkcreds", "step 0.warmup failed (network) — continuing")
+        }
 
         // Step 3 — getAnonymousToken; the captcha-prone step.
         TURNLog.info("vkcreds", "step 3: getAnonymousToken (captcha-prone)")
@@ -291,7 +459,7 @@ actor VKCredsClient {
         let step3Base = "vk_join_link=https://vk.com/call/join/\(hash)" +
                         "&name=\(nameEnc)&access_token=\(t3)"
         var r3 = try await postJSON(step3Base,
-                                     to: "https://api.vk.ru/method/calls.getAnonymousToken?v=5.264",
+                                     to: "https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=\(appID)",
                                      step: "3.getAnonymousToken")
 
         if let errBlock = r3["error"] as? [String: Any] {
@@ -300,6 +468,9 @@ actor VKCredsClient {
             if code == 9000 || errMsg.lowercased().contains("call not found") {
                 TURNLog.error("vkcreds", "step 3: dead hash (code=\(code))")
                 throw VKCredsError.deadHash
+            }
+            if Self.isRateLimit(errBlock) {
+                throw VKCredsError.rateLimit(step: "3", appID: appID)
             }
             TURNLog.warn("vkcreds", "step 3: VK error error_code=\(code) error_msg=\(errMsg)")
             guard let challenge = VKCaptchaChallenge.decode(from: errBlock) else {
@@ -325,12 +496,15 @@ actor VKCredsClient {
                 "&captcha_key=&captcha_sid=\(challenge.captchaSid)&is_sound_captcha=0" +
                 "&success_token=\(tokEnc)&captcha_ts=\(challenge.captchaTs)&captcha_attempt=\(attempt)"
             r3 = try await postJSON(step3Retry,
-                                     to: "https://api.vk.ru/method/calls.getAnonymousToken?v=5.264",
+                                     to: "https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=\(appID)",
                                      step: "3-retry.getAnonymousToken")
             if let errBlock2 = r3["error"] as? [String: Any] {
                 let code2 = Int((errBlock2["error_code"] as? Double) ?? -1)
                 let errMsg2 = errBlock2["error_msg"] as? String ?? ""
                 TURNLog.warn("vkcreds", "step 3-retry: VK error error_code=\(code2) error_msg=\(errMsg2)")
+                if Self.isRateLimit(errBlock2) {
+                    throw VKCredsError.rateLimit(step: "3-retry", appID: appID)
+                }
                 if code2 == 14 {
                     log.warning("VK still demands captcha after a successful solve — backing off")
                     try? await Task.sleep(nanoseconds: 30_000_000_000)
