@@ -256,11 +256,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let appGroupDefaults = UserDefaults(suiteName: appGroupID)
         let whitelistModeRaw = appGroupDefaults?
             .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
-        log("info: WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
+        log("info: [vkturn] WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
         if whitelistModeRaw == "vkTurn" {
+            log("info: [vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
             Self.attachVKTurnUpstream(log: log)
+            log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
-            log("info: VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
+            log("info: [vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
         }
         return true
     }
@@ -272,35 +274,64 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// the WireGuard config it receives so the operator can verify
     /// reachability. WireGuardKit attach is Phase 2D-followup.
     private static func attachVKTurnUpstream(log: @escaping (String) -> Void) {
-        let peer = VKCredsPreferences.peerAddr
-        let password = VKCredsPreferences.connectPassword
-        guard !peer.isEmpty, !password.isEmpty else {
-            log("warn: VK TURN attach skipped — peer or password empty")
+        log("info: [vkturn] attach: entering helper")
+
+        // Read everything from App Group UserDefaults INLINED — the
+        // extension target doesn't compile against VKCredsPreferences
+        // (it lives in samizdat-ios target). Keep keys in sync with
+        // samizdat-ios/TURNCredsStore.swift::VKCredsPreferences.
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
+        let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
+        let hashPrefix = String((defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").prefix(8))
+        log("info: [vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
+
+        guard !peer.isEmpty else {
+            log("warn: [vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
             return
         }
-        let deviceID = VKCredsPreferences.deviceID
-        guard let creds = TURNCredsStore.shared.load(), TURNCredsStore.shared.isFresh else {
-            log("warn: VK TURN attach skipped — no fresh creds")
+        guard !password.isEmpty else {
+            log("warn: [vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
             return
         }
-        let json = vkCredsAsJSON(creds: creds)
-        let err = SocksstubStartVKTurnUpstream(json, peer, password, deviceID, 9000)
+
+        // Read raw creds JSON from App Group UserDefaults directly —
+        // TURNCredsStore lives in main-app target.
+        guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
+              !credsJSON.isEmpty else {
+            log("warn: [vkturn] attach SKIPPED — no creds JSON in App Group. Open the app, Settings → VK TURN → Save & refresh, wait for 'creds received, saving'.")
+            return
+        }
+        log("info: [vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
+
+        log("info: [vkturn] attach: calling SocksstubStartVKTurnUpstream(peer=\(peer), listenPort=9000)")
+        let err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000)
         if !err.isEmpty {
-            log("error: SocksstubStartVKTurnUpstream: \(err)")
+            log("error: [vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
             return
         }
-        log("info: VK TURN upstream started, polling for WG config...")
+        log("info: [vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
 
         Task.detached(priority: .utility) {
-            for _ in 0..<60 { // 60 * 250 ms = 15 s
+            log("info: [vkturn] async polling task started")
+            var attempts = 0
+            for _ in 0..<120 { // 120 * 250 ms = 30 s
+                attempts += 1
                 let wg = SocksstubTURNUpstreamWGConfig()
+                let running = SocksstubTURNUpstreamRunning()
                 if !wg.isEmpty {
-                    log("info: VK TURN WG config received:\n\(wg)")
+                    log("info: [vkturn] WG config received after \(attempts*250)ms:\n\(wg)")
+                    log("info: [vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
                     return
+                }
+                if attempts % 8 == 0 { // every 2 sec
+                    log("info: [vkturn] still waiting for WG config (running=\(running), \(attempts*250)ms)")
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
-            log("warn: VK TURN WG config not received within 15 s")
+            log("warn: [vkturn] WG config NOT received within 30 s. running=\(SocksstubTURNUpstreamRunning())")
         }
     }
 
