@@ -655,9 +655,9 @@ func TestTier2_PaddedRealtimeDoesNotGetMTUPenalty(t *testing.T) {
 
 func TestTier2_TCPSkipsCadence(t *testing.T) {
 	det := newRealtimeDetector()
-	class := det.ClassifyOpen(NewFlowMeta("tcp", "example.com:12345"))
+	class, token := det.ClassifyOpenWithToken(NewFlowMeta("tcp", "example.com:12345"))
 	controller := newRealtimeControllerWithConfig(det, time.Second, time.Second)
-	flowID := controller.Open(class)
+	flowID := controller.OpenWithToken(class, token)
 	base := time.Unix(280, 0)
 	for i := 0; i < 10; i++ {
 		det.Observe(ObservedPacket{FlowID: flowID, At: base.Add(time.Duration(i) * 20 * time.Millisecond), Payload: make([]byte, 80), Size: 80, Direction: DirUnknown})
