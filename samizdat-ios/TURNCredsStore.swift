@@ -89,10 +89,18 @@ final class TURNCredsStore {
     /// back to its no-TURN path instead of crashing on decode.
     private static let storageKey = "tamizdat.vkTURNCreds.v1"
 
-    /// Cushion before expiry that triggers a refresh. 5 min gives the
-    /// VK API call + WKWebView solve + 1-2 retries enough headroom on
-    /// a busy network.
-    static let refreshCushion: TimeInterval = 5 * 60
+    /// Cushion before expiry that triggers a refresh. 15 min gives the
+    /// foreground 5-minute heartbeat (TURNCredsRefresher) four chances
+    /// at refresh before the creds actually expire — and gives the BG
+    /// task scheduler equally generous slack when iOS gates the
+    /// background runner.
+    ///
+    /// Bumped from 5 → 15 min on the autonomous-refresh pass: the old
+    /// 5-min cushion was barely longer than the foreground heartbeat
+    /// (5 min) and the BG runner (45 min target), which meant every
+    /// missed iOS BG slot collapsed the refresh window onto the actual
+    /// expiry and we ate 15 s VK Allocate timeouts on Connect.
+    static let refreshCushion: TimeInterval = 15 * 60
 
     private var defaults: UserDefaults? {
         UserDefaults(suiteName: Self.appGroupID)
@@ -131,12 +139,25 @@ final class TURNCredsStore {
         // Wire shape matches what mobile/socksstub::parseVKTurnCredsJSON
         // expects: {username, password, turn_servers, lifetime_sec}.
         defaults.set(vkCredsAsJSON(creds: creds), forKey: "tamizdat.vkTURNCredsJSON")
+
+        // Mirror the acquisition timestamp as a standalone key so the
+        // extension can pre-flight-check creds age WITHOUT decoding
+        // the Codable blob (extension can't see VKTURNCredentials).
+        // Used by PacketTunnelProvider.attachVKTurnUpstream to refuse
+        // a 15-s VK Allocate timeout when creds are already past the
+        // safety margin.
+        defaults.set(creds.acquiredAt, forKey: "tamizdat.vkTURNCredsAcquiredAt")
     }
 
     /// Drop the cached entry. Used when the user signs out, when VK
-    /// rejects a known-stale entry, or in tests.
+    /// rejects a known-stale entry, or in tests. Wipes all three keys
+    /// the save() path writes (binary blob, plain-string JSON for the
+    /// extension, and the standalone acquiredAt stamp) so a stale
+    /// timestamp can never linger past a clear().
     func clear() {
         defaults?.removeObject(forKey: Self.storageKey)
+        defaults?.removeObject(forKey: "tamizdat.vkTURNCredsJSON")
+        defaults?.removeObject(forKey: "tamizdat.vkTURNCredsAcquiredAt")
     }
 
     /// `true` iff creds exist and have at least `refreshCushion`

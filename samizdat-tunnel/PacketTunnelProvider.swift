@@ -257,12 +257,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let whitelistModeRaw = appGroupDefaults?
             .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
         log("info: [vkturn] WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
+        ExtLog.info("[vkturn] WhitelistMode read = \"\(whitelistModeRaw)\"")
         if whitelistModeRaw == "vkTurn" {
             log("info: [vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            Self.attachVKTurnUpstream(log: log)
+            ExtLog.info("[vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
+            Self.attachVKTurnUpstream()
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
+            ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
             log("info: [vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
+            ExtLog.info("[vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
         }
         return true
     }
@@ -273,8 +277,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Traffic still flows over the existing hev path; this only logs
     /// the WireGuard config it receives so the operator can verify
     /// reachability. WireGuardKit attach is Phase 2D-followup.
-    private static func attachVKTurnUpstream(log: @escaping (String) -> Void) {
-        log("info: [vkturn] attach: entering helper")
+    ///
+    /// Logging changed from a captured `(String) -> Void` closure to
+    /// direct `ExtLog.*` calls. The closure path (which fans out to
+    /// `FileHandle.write` + `synchronize`) was eating every line we
+    /// emitted AFTER `SocksstubStartVKTurnUpstream` — that gomobile
+    /// call blocks for up to 15 s while VK Allocate handshakes, and
+    /// Foundation's buffered handle silently dropped post-block lines.
+    /// `ExtLog` open/write/fsync/close every call, so the timeline
+    /// survives the block.
+    private static func attachVKTurnUpstream() {
+        ExtLog.info("[vkturn] attach: entering helper")
 
         // Read everything from App Group UserDefaults INLINED — the
         // extension target doesn't compile against VKCredsPreferences
@@ -286,14 +299,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let hashPrefix = String((defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").prefix(8))
-        log("info: [vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
+        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
 
         guard !peer.isEmpty else {
-            log("warn: [vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
+            ExtLog.warn("[vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
             return
         }
         guard !password.isEmpty else {
-            log("warn: [vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
+            ExtLog.warn("[vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
             return
         }
 
@@ -301,37 +314,61 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // TURNCredsStore lives in main-app target.
         guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
               !credsJSON.isEmpty else {
-            log("warn: [vkturn] attach SKIPPED — no creds JSON in App Group. Open the app, Settings → VK TURN → Save & refresh, wait for 'creds received, saving'.")
+            ExtLog.warn("[vkturn] attach SKIPPED — no creds JSON in App Group. Открой приложение и подожди автообновление (5-минутный heartbeat) или сделай ручной refresh.")
             return
         }
-        log("info: [vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
+        ExtLog.info("[vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
 
-        log("info: [vkturn] attach: calling SocksstubStartVKTurnUpstream(peer=\(peer), listenPort=9000)")
+        // Safety margin gate. VK TURN credentials live ~3600 s (one
+        // hour). If the cached creds are already past 3480 s old we
+        // refuse to call `SocksstubStartVKTurnUpstream` — that gomobile
+        // function does a synchronous VK Allocate against the TURN
+        // server, which can sleep up to 15 s before failing with 401.
+        // Better to bail clean here and let the foreground/BG refresher
+        // grab fresh creds than to eat the wedged-listener timeout.
+        //
+        // Key written by `TURNCredsStore.save(_:)` alongside the JSON
+        // payload — see step C of feat/turn-autonomous-refresh.
+        if let acquiredAt = defaults?.object(forKey: "tamizdat.vkTURNCredsAcquiredAt") as? Date {
+            let age = Date().timeIntervalSince(acquiredAt)
+            ExtLog.info("[vkturn] attach: creds acquiredAt age = \(Int(age))s")
+            if age >= 3480 {
+                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ 3480s). Wait for refresh, then reconnect.")
+                return
+            }
+        } else {
+            ExtLog.warn("[vkturn] attach: no vkTURNCredsAcquiredAt stamp — proceeding without age check (legacy creds?)")
+        }
+
+        ExtLog.info("[vkturn] attach: BEFORE SocksstubStartVKTurnUpstream peer=\(peer), listenPort=9000")
+        let beforeMs = Date()
         let err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000)
+        let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
+        ExtLog.info("[vkturn] attach: AFTER SocksstubStartVKTurnUpstream dur=\(durMs)ms err=\"\(err)\"")
         if !err.isEmpty {
-            log("error: [vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
+            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
             return
         }
-        log("info: [vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
+        ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
 
         Task.detached(priority: .utility) {
-            log("info: [vkturn] async polling task started")
+            ExtLog.info("[vkturn] async polling task started")
             var attempts = 0
             for _ in 0..<120 { // 120 * 250 ms = 30 s
                 attempts += 1
                 let wg = SocksstubTURNUpstreamWGConfig()
                 let running = SocksstubTURNUpstreamRunning()
                 if !wg.isEmpty {
-                    log("info: [vkturn] WG config received after \(attempts*250)ms:\n\(wg)")
-                    log("info: [vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
+                    ExtLog.info("[vkturn] WG config received after \(attempts*250)ms:\n\(wg)")
+                    ExtLog.info("[vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
                     return
                 }
                 if attempts % 8 == 0 { // every 2 sec
-                    log("info: [vkturn] still waiting for WG config (running=\(running), \(attempts*250)ms)")
+                    ExtLog.info("[vkturn] still waiting for WG config (running=\(running), \(attempts*250)ms)")
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
-            log("warn: [vkturn] WG config NOT received within 30 s. running=\(SocksstubTURNUpstreamRunning())")
+            ExtLog.warn("[vkturn] WG config NOT received within 30 s. running=\(SocksstubTURNUpstreamRunning())")
         }
     }
 

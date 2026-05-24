@@ -43,8 +43,13 @@ struct SettingsView: View {
     @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
     @State private var vkPeerAddrDraft: String = VKCredsPreferences.peerAddr
     @State private var vkConnectPasswordDraft: String = VKCredsPreferences.connectPassword
-    @State private var endpointTurnMode: EndpointTurnMode = EndpointTurnMode.current
     @State private var vkCallHashFeedback: String = ""
+
+    /// Debounce token for the auto-persist refresh trigger. The three
+    /// VK TURN fields fire `onChange` on every keystroke; we
+    /// schedule a forceRefresh 1 s after the last edit, cancelling
+    /// any pending one. Tap "Clear" to bail out cleanly.
+    @State private var vkRefreshDebounceTask: Task<Void, Never>?
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -243,6 +248,8 @@ struct SettingsView: View {
                     .padding(.vertical, 11)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { persistAndMaybeRefresh() }
+                    .onChange(of: vkCallHashDraft) { _, _ in persistAndMaybeRefresh() }
 
                 Text("Сервер (peer)")
                     .font(.geist(.medium, size: 12))
@@ -257,8 +264,8 @@ struct SettingsView: View {
                     .padding(.vertical, 11)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { saveVKTurnPreferences() }
-                    .onChange(of: vkPeerAddrDraft) { _, _ in saveVKTurnPreferences() }
+                    .onSubmit { persistAndMaybeRefresh() }
+                    .onChange(of: vkPeerAddrDraft) { _, _ in persistAndMaybeRefresh() }
 
                 Text("Пароль подключения")
                     .font(.geist(.medium, size: 12))
@@ -272,17 +279,17 @@ struct SettingsView: View {
                     .padding(.vertical, 11)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { saveVKTurnPreferences() }
-                    .onChange(of: vkConnectPasswordDraft) { _, _ in saveVKTurnPreferences() }
+                    .onSubmit { persistAndMaybeRefresh() }
+                    .onChange(of: vkConnectPasswordDraft) { _, _ in persistAndMaybeRefresh() }
 
-                // Phase 2G — the Off/VK picker that lived here was removed in
-                // build 249. It used to gate attachVKTurnUpstream via a
-                // separate EndpointTurnMode store, but the extension now
-                // reads WhitelistMode directly (the segmented "H2 / TURN"
-                // picker in the Whitelist detection card). Two pickers for
-                // one knob confused the operator and let them drift out of
-                // sync.
-                Text("Туннель включается, когда «Whitelist mode = TURN» в разделе Whitelist detection и активный режим = Whitelist.")
+                // The legacy mode picker and the manual save button were
+                // both removed on the autonomous-refresh pass. Persistence
+                // happens on every `onChange`; a debounced forceRefresh
+                // fires 1 s after the last edit when all three fields are
+                // populated. The Whitelist-mode picker (H2 / TURN) in the
+                // Whitelist detection card is the single source of truth
+                // for whether VK TURN is engaged.
+                Text("Поля сохраняются автоматически. VK TURN включается, когда «Whitelist mode = TURN» в разделе Whitelist detection.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
                     .padding(.top, 4)
@@ -293,33 +300,21 @@ struct SettingsView: View {
                         .foregroundStyle(theme.textDim)
                 }
 
-                HStack(spacing: 8) {
-                    Button(action: saveVKHash) {
-                        Text("Save & refresh")
-                            .font(.geist(.semibold, size: 13))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(theme.mint)
-                            .foregroundStyle(theme.mintInk)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                    Button(action: clearVKHash) {
-                        Text("Clear")
-                            .font(.geist(.semibold, size: 13))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(theme.chip)
-                            .foregroundStyle(theme.text)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
+                Button(action: clearVKHash) {
+                    Text("Clear")
+                        .font(.geist(.semibold, size: 13))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(theme.chip)
+                        .foregroundStyle(theme.text)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
+                .buttonStyle(.plain)
                 // Emergency reset for the "stuck refresh" state. If a
                 // previous refresh wedged (network hang, WKWebView never
                 // completing) `isRefreshing` stays true forever and every
-                // subsequent Save just skips. This button cancels the
-                // in-flight Task and flips the flag back.
+                // subsequent forceRefresh just skips. This button cancels
+                // the in-flight Task and flips the flag back.
                 Button(action: resetRefreshState) {
                     Text("Reset refresh state")
                         .font(.geist(.semibold, size: 13))
@@ -348,30 +343,56 @@ struct SettingsView: View {
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
-    private func saveVKTurnPreferences() {
+    /// Silent persist + debounced refresh. Called from each TextField's
+    /// `onChange`. Trims peer, normalises hash, writes all three keys
+    /// to App Group UserDefaults, then schedules a single forceRefresh
+    /// 1 second after the last edit settles. Empty fields don't trip
+    /// the refresh — we just save the partial state so the user can
+    /// come back and complete it later.
+    ///
+    /// Doesn't touch EndpointTurnMode any more — the Whitelist-mode
+    /// picker (H2 / TURN) is the single source of truth.
+    private func persistAndMaybeRefresh() {
         let peer = vkPeerAddrDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         VKCredsPreferences.peerAddr = peer
         VKCredsPreferences.connectPassword = vkConnectPasswordDraft
-        EndpointTurnMode.current = endpointTurnMode
-        if vkPeerAddrDraft != peer {
-            vkPeerAddrDraft = peer
-        }
-    }
 
-    private func saveVKHash() {
-        saveVKTurnPreferences()
         let hash = Self.normalizeVKHash(vkCallHashDraft)
-        guard !hash.isEmpty else {
-            vkCallHashFeedback = "Хеш пуст"
+        VKCredsPreferences.primaryCallHash = hash
+
+        // Re-sync drafts if normalisation changed them — but only when
+        // the user has paused typing, otherwise we fight against their
+        // edit position. Detect "paused" by deferring the rewrite to
+        // after the debounce timer fires.
+
+        // Cancel any pending debounce.
+        vkRefreshDebounceTask?.cancel()
+        vkCallHashFeedback = ""
+
+        // Only fire the refresh once all three fields are populated.
+        let allFilled = !hash.isEmpty && !peer.isEmpty && !vkConnectPasswordDraft.isEmpty
+        guard allFilled else {
             return
         }
-        VKCredsPreferences.primaryCallHash = hash
-        vkCallHashDraft = hash
-        vkCallHashFeedback = "Сохранено: \(hash). Запускаю обновление..."
-        TURNCredsRefresher.shared.forceRefresh()
+
+        vkRefreshDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if Task.isCancelled { return }
+            // Snap normalised forms back into the drafts now that the
+            // user has paused typing.
+            if vkCallHashDraft != hash {
+                vkCallHashDraft = hash
+            }
+            if vkPeerAddrDraft != peer {
+                vkPeerAddrDraft = peer
+            }
+            vkCallHashFeedback = "Автообновление..."
+            TURNCredsRefresher.shared.forceRefresh()
+        }
     }
 
     private func clearVKHash() {
+        vkRefreshDebounceTask?.cancel()
         VKCredsPreferences.primaryCallHash = ""
         vkCallHashDraft = ""
         vkCallHashFeedback = "Очищено"
@@ -488,11 +509,10 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 .onChange(of: whitelistMode) { _, newValue in
                     WhitelistMode.current = newValue
-                    // For symmetry with the existing VK TURN section's
-                    // legacy `EndpointTurnMode` toggle: keep the two
-                    // stores aligned so the extension never sees them
-                    // disagree.
-                    EndpointTurnMode.current = (newValue == .vkTurn) ? .vk : .off
+                    // EndpointTurnMode mirror REMOVED on the autonomous-
+                    // refresh pass — `WhitelistMode` is now the single
+                    // source of truth and the extension reads it
+                    // directly in attachVKTurnUpstream.
                 }
 
                 Text("Test host")
