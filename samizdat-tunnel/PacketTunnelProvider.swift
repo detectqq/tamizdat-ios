@@ -253,10 +253,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // MUST stay in sync. (TODO: lift WhitelistMode into a shared
         // sources directory listed by both targets in project.yml.)
         let appGroupID = "group.com.anarki.samizdat-test"
-        let whitelistModeRaw = UserDefaults(suiteName: appGroupID)?
+        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
+        let whitelistModeRaw = appGroupDefaults?
             .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+        log("info: WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
         if whitelistModeRaw == "vkTurn" {
             Self.attachVKTurnUpstream(log: log)
+        } else {
+            log("info: VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
         }
         return true
     }
