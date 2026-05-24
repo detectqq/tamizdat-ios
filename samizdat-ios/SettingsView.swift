@@ -275,19 +275,17 @@ struct SettingsView: View {
                     .onSubmit { saveVKTurnPreferences() }
                     .onChange(of: vkConnectPasswordDraft) { _, _ in saveVKTurnPreferences() }
 
-                HStack(spacing: 10) {
-                    Text("TURN upstream:")
-                        .font(.geist(.medium, size: 12))
-                        .foregroundStyle(theme.textMuted)
-                    Picker("TURN upstream", selection: $endpointTurnMode) {
-                        Text("Off").tag(EndpointTurnMode.off)
-                        Text("VK").tag(EndpointTurnMode.vk)
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: endpointTurnMode) { _, newValue in
-                        EndpointTurnMode.current = newValue
-                    }
-                }
+                // Phase 2G — the Off/VK picker that lived here was removed in
+                // build 249. It used to gate attachVKTurnUpstream via a
+                // separate EndpointTurnMode store, but the extension now
+                // reads WhitelistMode directly (the segmented "H2 / TURN"
+                // picker in the Whitelist detection card). Two pickers for
+                // one knob confused the operator and let them drift out of
+                // sync.
+                Text("Туннель включается, когда «Whitelist mode = TURN» в разделе Whitelist detection и активный режим = Whitelist.")
+                    .font(.geistMono(.regular, size: 10))
+                    .foregroundStyle(theme.textDim)
+                    .padding(.top, 4)
 
                 if !vkCallHashFeedback.isEmpty {
                     Text(vkCallHashFeedback)
