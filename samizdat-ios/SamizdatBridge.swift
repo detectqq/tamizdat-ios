@@ -145,12 +145,10 @@ final class SamizdatBridge: ObservableObject {
     ///
     /// NOTE: the VK TURN runner lives in the EXTENSION process, not the
     /// main app. A call from the main app reaches the main app's own
-    /// (always-nil) runner and returns "not running" — that is
-    /// expected and the caller silently logs + ignores. To make live
-    /// refresh land in the running extension a follow-up patch needs
-    /// to plumb a `refreshVKTurnCreds` provider message through
-    /// `handleAppMessage`. For now the Go-side API is in place so the
-    /// extension binding regen + that plumbing can land in one step.
+    /// runner and usually returns "not running". `TURNCredsRefresher`
+    /// therefore also sends a `refreshVKTurnCreds` provider message so
+    /// the extension re-reads the App Group mirror and updates the live
+    /// Go runner in the correct process.
     ///
     /// TODO(gomobile-rebuild): `SocksstubUpdateVKTurnCreds` is a new
     /// export; the SamizdatClient.xcframework currently checked into

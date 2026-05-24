@@ -48,6 +48,113 @@ type connectedUDPConn struct{ *net.UDPConn }
 
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c.Write(p) }
 
+type turnEndpoint struct {
+	Addr      string
+	Scheme    string
+	Transport string
+	Proto     string
+	UseUDP    bool
+	UseTLS    bool
+}
+
+func selectTurnEndpoint(creds *Credentials, sessionID int, preferUDP bool) (turnEndpoint, error) {
+	if creds == nil {
+		return turnEndpoint{}, fmt.Errorf("пустые TURN учетные данные")
+	}
+	if len(creds.TurnServers) > 0 {
+		matching := make([]turnEndpoint, 0, len(creds.TurnServers))
+		fallback := make([]turnEndpoint, 0, len(creds.TurnServers))
+		for _, server := range creds.TurnServers {
+			ep, ok := endpointFromTurnServer(server)
+			if !ok {
+				continue
+			}
+			if ep.UseUDP == preferUDP {
+				matching = append(matching, ep)
+			} else {
+				fallback = append(fallback, ep)
+			}
+		}
+		if len(matching) == 0 {
+			matching = fallback
+		}
+		if len(matching) == 0 {
+			return turnEndpoint{}, fmt.Errorf("нет поддерживаемых TURN endpoints")
+		}
+		return matching[positiveModulo(sessionID, len(matching))], nil
+	}
+	if len(creds.TurnURLs) == 0 {
+		return turnEndpoint{}, fmt.Errorf("нет TURN URL в учетных данных")
+	}
+	addr := strings.TrimSpace(creds.TurnURLs[positiveModulo(sessionID, len(creds.TurnURLs))])
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return turnEndpoint{}, fmt.Errorf("разбор TURN URL %q: %w", addr, err)
+	}
+	proto := "TCP"
+	transport := "tcp"
+	if preferUDP {
+		proto = "UDP"
+		transport = "udp"
+	}
+	return turnEndpoint{
+		Addr:      addr,
+		Scheme:    "turn",
+		Transport: transport,
+		Proto:     proto,
+		UseUDP:    preferUDP,
+	}, nil
+}
+
+func endpointFromTurnServer(server TurnServer) (turnEndpoint, bool) {
+	host := strings.TrimSpace(server.Host)
+	if host == "" || server.Port <= 0 {
+		return turnEndpoint{}, false
+	}
+	scheme := strings.ToLower(strings.TrimSpace(server.Scheme))
+	if scheme == "" {
+		scheme = "turn"
+	}
+	transport := strings.ToLower(strings.TrimSpace(server.Transport))
+	if transport == "" {
+		if scheme == "turns" {
+			transport = "tcp"
+		} else {
+			transport = "udp"
+		}
+	}
+	if transport != "udp" && transport != "tcp" {
+		transport = "udp"
+	}
+	useTLS := scheme == "turns"
+	useUDP := transport == "udp" && !useTLS
+	proto := "TCP"
+	if useUDP {
+		proto = "UDP"
+	} else if useTLS {
+		proto = "TLS"
+		transport = "tcp"
+	}
+	return turnEndpoint{
+		Addr:      net.JoinHostPort(host, fmt.Sprintf("%d", server.Port)),
+		Scheme:    scheme,
+		Transport: transport,
+		Proto:     proto,
+		UseUDP:    useUDP,
+		UseTLS:    useTLS,
+	}, true
+}
+
+func positiveModulo(value, mod int) int {
+	if mod <= 0 {
+		return 0
+	}
+	result := value % mod
+	if result < 0 {
+		result += mod
+	}
+	return result
+}
+
 func RunSession(
 	ctx context.Context,
 	tp *TurnParams,
@@ -64,14 +171,14 @@ func RunSession(
 ) (bool, error) {
 	configDelivered := false
 
-	if len(creds.TurnURLs) == 0 {
-		return false, fmt.Errorf("нет TURN URL в учетных данных")
-	}
-	selectedURL := creds.TurnURLs[sessionID%len(creds.TurnURLs)]
-
-	urlhost, urlport, err := net.SplitHostPort(selectedURL)
+	endpoint, err := selectTurnEndpoint(creds, sessionID, useUDP)
 	if err != nil {
-		return false, fmt.Errorf("разбор TURN URL %q: %w", selectedURL, err)
+		return false, err
+	}
+
+	urlhost, urlport, err := net.SplitHostPort(endpoint.Addr)
+	if err != nil {
+		return false, fmt.Errorf("разбор TURN URL %q: %w", endpoint.Addr, err)
 	}
 	if tp.Host != "" {
 		urlhost = tp.Host
@@ -81,12 +188,11 @@ func RunSession(
 	}
 	turnAddr := net.JoinHostPort(urlhost, urlport)
 
-	// Транспорт: TCP или UDP
+	// Транспорт: UDP, TCP, или TURNS/TLS over TCP.
 	var turnConn net.PacketConn
-	proto := "TCP"
+	proto := endpoint.Proto
 
-	if useUDP {
-		proto = "UDP"
+	if endpoint.UseUDP {
 		resolved, err := net.ResolveUDPAddr("udp", turnAddr)
 		if err != nil {
 			return false, fmt.Errorf("резолв TURN: %w", err)
@@ -100,9 +206,19 @@ func RunSession(
 		_ = c.SetWriteBuffer(socketBufSize)
 		turnConn = &connectedUDPConn{c}
 	} else {
-		c, err := net.DialTimeout("tcp", turnAddr, 10*time.Second)
-		if err != nil {
-			return false, fmt.Errorf("подключение TURN TCP: %w", err)
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		var c net.Conn
+		var dialErr error
+		if endpoint.UseTLS {
+			c, dialErr = tls.DialWithDialer(dialer, "tcp", turnAddr, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				ServerName: strings.Trim(urlhost, "[]"),
+			})
+		} else {
+			c, dialErr = dialer.Dial("tcp", turnAddr)
+		}
+		if dialErr != nil {
+			return false, fmt.Errorf("подключение TURN %s: %w", proto, dialErr)
 		}
 		defer c.Close()
 		if tc, ok := c.(*net.TCPConn); ok {
@@ -112,7 +228,7 @@ func RunSession(
 		}
 		turnConn = turn.NewSTUNConn(c)
 	}
-	log.Printf("[СЕССИЯ #%d] TURN %s (%s)", sessionID, turnAddr, proto)
+	log.Printf("[СЕССИЯ #%d] TURN %s (scheme=%s transport=%s proto=%s)", sessionID, turnAddr, endpoint.Scheme, endpoint.Transport, proto)
 
 	// TURN Client (pion/turn/v5)
 	tc, err := turn.NewClient(&turn.ClientConfig{

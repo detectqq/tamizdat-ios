@@ -146,6 +146,21 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshWhitelistProbes")
     }
 
+    /// Pushes freshly-saved VK TURN credentials into the live Network
+    /// Extension process. The main app cannot update the runner by
+    /// calling the gomobile bridge directly: the active runner lives in
+    /// the extension's separate process and Go runtime. This RPC carries
+    /// only the command string; the extension re-reads the App Group JSON
+    /// itself, so raw TURN credentials never travel through logs here.
+    func refreshVKTurnCreds() async -> String {
+        do {
+            return try await sendProviderMessage("refreshVKTurnCreds")
+        } catch {
+            SamizdatAddLog("warn: refreshVKTurnCreds provider message failed: \(error.localizedDescription)")
+            return "sendError"
+        }
+    }
+
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.
     /// Returns `.offline` on any failure (extension not running, RPC

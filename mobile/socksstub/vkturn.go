@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,13 +300,26 @@ func parseVKTurnCredsJSON(credsJSON string) (*wgturnclient.Credentials, error) {
 			if s.Host == "" || s.Port == 0 {
 				continue
 			}
-			scheme := s.Scheme
+			scheme := strings.ToLower(strings.TrimSpace(s.Scheme))
 			if scheme == "" {
 				scheme = "turn"
 			}
-			transport := s.Transport
+			transport := strings.ToLower(strings.TrimSpace(s.Transport))
 			if transport == "" {
+				if scheme == "turns" {
+					transport = "tcp"
+				} else {
+					transport = "udp"
+				}
+			}
+			if transport != "udp" && transport != "tcp" {
 				transport = "udp"
+			}
+			if scheme == "turns" {
+				// This client implements TURNS as TLS over TCP. VK may omit
+				// transport or send mixed-case/legacy values; never let a
+				// turns: URL fall into the UDP dial path.
+				transport = "tcp"
 			}
 			turnServers = append(turnServers, wgturnclient.TurnServer{
 				Host:      s.Host,
@@ -349,7 +363,10 @@ func shouldUseUDP(creds *wgturnclient.Credentials) bool {
 		return true
 	}
 	for _, s := range creds.TurnServers {
-		if s.Transport == "udp" {
+		if strings.ToLower(strings.TrimSpace(s.Scheme)) == "turns" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(s.Transport)) == "udp" {
 			return true
 		}
 	}

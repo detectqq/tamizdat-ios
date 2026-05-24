@@ -215,11 +215,11 @@ final class TURNCredsRefresher: ObservableObject {
                 // the original 3600 s lifetime elapsed.
                 //
                 // The runner lives in the extension process, not the
-                // main app, so this call against the main-app's own
-                // (always-nil) runner returns "not running" — we
-                // swallow that quietly and rely on the App Group
-                // mirror + a follow-up provider message for the
-                // cross-process plumbing.
+                // main app, so this in-process call usually returns
+                // "not running". We still keep it for simulator/unit
+                // paths, then send a provider message so the extension
+                // re-reads the App Group mirror and updates its live
+                // Go runner in the correct process.
                 let credsJSON = vkCredsAsJSON(creds: creds)
                 let updateErr = SamizdatBridge.updateVKTurnCreds(credsJSON)
                 if updateErr.isEmpty {
@@ -228,6 +228,15 @@ final class TURNCredsRefresher: ObservableObject {
                     TURNLog.info("turncreds", "VK TURN runner not running in this process — App Group mirror still updated")
                 } else {
                     TURNLog.warn("turncreds", "SocksstubUpdateVKTurnCreds returned: \(updateErr)")
+                }
+                let extUpdate = await VPNProfileStore.shared.refreshVKTurnCreds()
+                if extUpdate == "ok" || extUpdate.isEmpty {
+                    let extStatus = extUpdate.isEmpty ? "not-running" : extUpdate
+                    TURNLog.info("turncreds", "extension VK TURN creds refresh result=\(extStatus)")
+                } else if extUpdate == "not running" {
+                    TURNLog.info("turncreds", "extension VK TURN runner not running — fresh creds saved for next attach")
+                } else {
+                    TURNLog.warn("turncreds", "extension VK TURN creds refresh returned: \(extUpdate)")
                 }
                 self.lastSaveAt = Date()
                 self.lastError = nil
