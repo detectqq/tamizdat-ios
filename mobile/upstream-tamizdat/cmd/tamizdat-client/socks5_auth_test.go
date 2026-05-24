@@ -16,6 +16,10 @@ func (authTestDialer) DialContext(context.Context, string, string) (net.Conn, er
 	return nil, errors.New("test should not dial upstream during auth negotiation")
 }
 
+func (authTestDialer) DialUDP(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("test should not dial UDP upstream during auth negotiation")
+}
+
 func TestSocks5AuthSuccess(t *testing.T) {
 	methodResp, authResp := exerciseSocks5Auth(t, []byte{0x05, 0x01, 0x02}, rfc1929AuthRequest("user", "pass"))
 	if want := []byte{0x05, 0x02}; !bytes.Equal(methodResp, want) {
