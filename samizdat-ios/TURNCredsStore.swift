@@ -125,6 +125,12 @@ final class TURNCredsStore {
             // if it does we drop the write rather than crash so the app
             // remains usable.
         }
+        // Also mirror as a plain-string JSON under a fixed key the
+        // Network Extension reads inline (extension can't import
+        // VKTURNCredentials so it can't decode the binary blob above).
+        // Wire shape matches what mobile/socksstub::parseVKTurnCredsJSON
+        // expects: {username, password, turn_servers, lifetime_sec}.
+        defaults.set(vkCredsAsJSON(creds: creds), forKey: "tamizdat.vkTURNCredsJSON")
     }
 
     /// Drop the cached entry. Used when the user signs out, when VK
