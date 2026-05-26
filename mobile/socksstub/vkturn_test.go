@@ -54,6 +54,22 @@ func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
 	}
 }
 
+func TestCurrentSamizdatShortIDHexUsesActiveProfile(t *testing.T) {
+	rt.mu.Lock()
+	oldBlob := rt.samizdatBlob
+	rt.samizdatBlob = "samizdat://AABBCCDDEEFF0011@ru.example:443?pbk=" + strings.Repeat("1", 64) + "&sni=ya.ru&fp=chrome"
+	rt.mu.Unlock()
+	defer func() {
+		rt.mu.Lock()
+		rt.samizdatBlob = oldBlob
+		rt.mu.Unlock()
+	}()
+
+	if got, want := currentSamizdatShortIDHex(), "aabbccddeeff0011"; got != want {
+		t.Fatalf("currentSamizdatShortIDHex = %q, want %q", got, want)
+	}
+}
+
 func TestParseVKTurnCredsJSONNormalizesV2SchemeAndTransport(t *testing.T) {
 	creds, err := parseVKTurnCredsJSON(`{
 		"username":"user",

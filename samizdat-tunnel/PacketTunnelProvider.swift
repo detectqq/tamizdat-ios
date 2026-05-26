@@ -346,19 +346,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
         let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        // Legacy manual wgturn password. Current builds pass it only as a
+        // fallback: the Go runner prefers the active tamizdat:// shortID from
+        // SocksstubSetSamizdatConfig so TURN becomes a normal per-user
+        // Tamizdat inbound (routing/accounting/status match H2).
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let hashPrefix = String((defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").prefix(8))
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
+        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" legacyPasswordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
 
         guard !peer.isEmpty else {
             let msg = "Сервер TURN пустой. Обнови профиль с панели или открой Settings."
-            setVKTurnLastError(msg)
-            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
-            return
-        }
-        guard !password.isEmpty else {
-            let msg = "Пароль подключения TURN пустой. Обнови профиль с панели или открой Settings."
             setVKTurnLastError(msg)
             ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
