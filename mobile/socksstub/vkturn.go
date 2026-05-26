@@ -242,6 +242,16 @@ func TURNUpstreamRunning() bool {
 	return vkturnRunning.Load()
 }
 
+// TURNUpstreamLastError returns the last VK/wgturn runner error, if any. The
+// value is intentionally a short diagnostic string; credentials JSON and TURN
+// passwords are never stored here.
+func TURNUpstreamLastError() string {
+	if p := vkturnErr.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 // VKTurnNetstack returns the userspace WireGuard netstack the upstream
 // is currently bound to, or nil if there is none. Callers route every
 // TCP/UDP dial through this stack — its underlying packets traverse

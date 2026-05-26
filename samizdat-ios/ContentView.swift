@@ -18,6 +18,7 @@ struct ContentView: View {
     @StateObject private var bridge = SamizdatBridge()
     @StateObject private var lampStore = TamizdatStatusStore()
     @StateObject private var serverNotif = ServerNotificationObserver()
+    @StateObject private var turnProfileUpdates = TurnProfileUpdateObserver()
     @StateObject private var exitIP = ExitIPStore()
     // IPA-D28: main-app WhitelistMonitor — runs while VPN is OFF +
     // auto mode + foreground, so WhitelistStatusStore.activeEndpoint
@@ -395,6 +396,14 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
+                if let turnWarning = turnRoomWarning {
+                    Text(turnWarning)
+                        .font(.geist(.regular, size: 13))
+                        .foregroundStyle(theme.amber)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                        .padding(.horizontal, 24)
+                }
                 if !hasConfig {
                     Text("Paste a tamizdat:// link in Settings → Proxies to begin.")
                         .font(.geist(.regular, size: 13))
@@ -430,6 +439,9 @@ struct ContentView: View {
     ///   "✓" — creds cached but not actively used
     ///   "—" — no creds, no upstream
     private var turnTileValue: String {
+        if turnRoomWarning != nil {
+            return "!"
+        }
         if lampStore.turnUpstreamRunning {
             return "▲"
         }
@@ -437,6 +449,29 @@ struct ContentView: View {
             return "✓"
         }
         return "—"
+    }
+
+    private var turnRoomWarning: String? {
+        if let err = turnRefresher.lastError?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !err.isEmpty {
+            return "VK TURN room error: \(Self.compactTurnError(err))"
+        }
+        let extErr = lampStore.snapshot.turnError.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !extErr.isEmpty {
+            return "VK TURN room error: \(Self.compactTurnError(extErr))"
+        }
+        if turnRefresher.isRefreshing {
+            return "VK TURN room: refreshing credentials…"
+        }
+        return nil
+    }
+
+    private static func compactTurnError(_ text: String) -> String {
+        let singleLine = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        if singleLine.count <= 140 { return singleLine }
+        return String(singleLine.prefix(137)) + "…"
     }
 
     /// "Effective" endpoint for label purposes:
@@ -691,6 +726,38 @@ struct ContentView: View {
 // NE-side `NotificationBridge` whenever a server-pushed
 // `CoverConfigBundle.Notification` has been persisted into App Group
 // UserDefaults.
+final class TurnProfileUpdateObserver: ObservableObject {
+    init() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        CFNotificationCenterAddObserver(
+            center, observer,
+            { _, observerPtr, _, _, _ in
+                guard let observerPtr = observerPtr else { return }
+                let me = Unmanaged<TurnProfileUpdateObserver>
+                    .fromOpaque(observerPtr).takeUnretainedValue()
+                DispatchQueue.main.async { me.refreshNow() }
+            },
+            TurnProfileUpdateConstants.darwinNotificationName,
+            nil, .deliverImmediately
+        )
+    }
+
+    deinit {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        CFNotificationCenterRemoveEveryObserver(center, observer)
+    }
+
+    private func refreshNow() {
+        // The extension already persisted the new VK room/hash and cleared old
+        // credentials. If the main app is alive, refresh immediately and push
+        // the new creds back to the extension; if not, App.swift's scenePhase
+        // hook will refresh on next foreground.
+        TURNCredsRefresher.shared.forceRefreshAfterProfileUpdate()
+    }
+}
+
 final class ServerNotificationObserver: ObservableObject {
     @Published var latest: NotificationPayload?
 

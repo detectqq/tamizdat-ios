@@ -173,6 +173,7 @@ func SetVerboseFlowLogs(enabled bool) {
 // Swift registers a sink once at startup; the sink is looked up per-call so
 // it survives rebuildClient / rewireUpstream which reconstructs samizdat.NewClient.
 var notificationSink atomic.Value // NotificationCallback
+var turnProfileSink atomic.Value  // TurnProfileCallback
 
 // NotificationCallback is the gomobile-friendly callback shape (only scalar
 // string args; gomobile binds Go interfaces to Swift protocols cleanly,
@@ -195,6 +196,27 @@ func SetNotificationCallback(cb NotificationCallback) {
 
 func currentNotificationCallback() NotificationCallback {
 	v, _ := notificationSink.Load().(NotificationCallback)
+	return v
+}
+
+// TurnProfileCallback receives operator-staged VK room/profile updates. Scalar
+// args keep the gomobile bridge reliable; secrets are intentionally not logged.
+type TurnProfileCallback interface {
+	OnTurnProfile(provider, roomLink, roomHash, peer string, version int)
+}
+
+func SetTurnProfileCallback(cb TurnProfileCallback) {
+	if cb == nil {
+		turnProfileSink.Store((TurnProfileCallback)(nil))
+		rt.appendLog("info: turn profile sink cleared")
+		return
+	}
+	turnProfileSink.Store(cb)
+	rt.appendLog("info: turn profile sink registered")
+}
+
+func currentTurnProfileCallback() TurnProfileCallback {
+	v, _ := turnProfileSink.Load().(TurnProfileCallback)
 	return v
 }
 
@@ -537,6 +559,15 @@ func SetSamizdatConfig(blob string) error {
 		OnNotification: func(e samizdat.NotificationEntry) {
 			if cb := currentNotificationCallback(); cb != nil {
 				cb.OnNotification(e.Code, e.Title, e.Body, e.Locale)
+			}
+		},
+		OnTURNProfile: func(e samizdat.TURNProfileEntry, peer string) {
+			if cb := currentTurnProfileCallback(); cb != nil {
+				provider := e.Provider
+				if provider == "" {
+					provider = "vk"
+				}
+				cb.OnTurnProfile(provider, e.RoomLink, e.RoomHash, peer, e.Version)
 			}
 		},
 		// IPA-Y: Performance mode toggle removed. Plan B+'s realtime

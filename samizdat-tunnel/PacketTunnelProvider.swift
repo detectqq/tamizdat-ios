@@ -224,6 +224,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // immediately after SetSamizdatConfig, so a user who is already
         // over-quota at connect time still gets the notification.
         SocksstubSetNotificationCallback(NotificationBridge.shared)
+        SocksstubSetTurnProfileCallback(NotificationBridge.shared)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -266,6 +267,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let running = SocksstubTURNUpstreamRunning()
         SocksstubStopVKTurnUpstream()
+        setVKTurnLastError("")
         if running {
             log("info: [vkturn] policy stopped TURN upstream; active path is H2")
             ExtLog.info("[vkturn] policy stopped TURN upstream; active path is H2")
@@ -296,6 +298,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         hasBackup || whitelistModeRaw() == "vkTurn"
     }
 
+    private static let vkTurnLastErrorKey = "tamizdat.vkTurnLastError"
+
+    private static func setVKTurnLastError(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        if trimmed.isEmpty {
+            defaults?.removeObject(forKey: vkTurnLastErrorKey)
+        } else {
+            defaults?.set(String(trimmed.prefix(240)), forKey: vkTurnLastErrorKey)
+        }
+        defaults?.synchronize()
+    }
+
+    private static func currentVKTurnLastError() -> String {
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        let stored = defaults?.string(forKey: vkTurnLastErrorKey) ?? ""
+        let runner = SocksstubTURNUpstreamLastError()
+        return runner.isEmpty ? stored : runner
+    }
+
     /// Spin up the VK TURN runner if the operator selected it.
     /// All inputs come from App Group UserDefaults — the user fills
     /// them in Settings → VK TURN before flipping the picker on.
@@ -313,6 +337,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// survives the block.
     private static func attachVKTurnUpstream() {
         ExtLog.info("[vkturn] attach: entering helper")
+        setVKTurnLastError("")
 
         // Read everything from App Group UserDefaults INLINED — the
         // extension target doesn't compile against VKCredsPreferences
@@ -327,11 +352,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
 
         guard !peer.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
+            let msg = "Сервер TURN пустой. Обнови профиль с панели или открой Settings."
+            setVKTurnLastError(msg)
+            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
         }
         guard !password.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
+            let msg = "Пароль подключения TURN пустой. Обнови профиль с панели или открой Settings."
+            setVKTurnLastError(msg)
+            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
         }
 
@@ -339,7 +368,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // TURNCredsStore lives in main-app target.
         guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
               !credsJSON.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — no creds JSON in App Group. Открой приложение и подожди автообновление (5-минутный heartbeat) или сделай ручной refresh.")
+            let msg = "Нет VK TURN credentials. Открой приложение: комната VK должна обновиться автоматически."
+            setVKTurnLastError(msg)
+            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
         }
         ExtLog.info("[vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
@@ -378,7 +409,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let age = Date().timeIntervalSince(acquiredAt)
             ExtLog.info("[vkturn] attach: creds age=\(Int(age))s (lifetime=\(Int(lifetimeSec))s, cushion=\(Int(cushionSec))s)")
             if age >= safeBound {
-                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ \(Int(safeBound))s). Wait for refresh, then reconnect.")
+                let msg = "VK TURN credentials устарели. Открой приложение и дождись обновления комнаты."
+                setVKTurnLastError(msg)
+                ExtLog.warn("[vkturn] attach SKIPPED — \(msg) age=\(Int(age))s ≥ \(Int(safeBound))s")
                 return
             }
         } else {
@@ -391,9 +424,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
         ExtLog.info("[vkturn] attach: AFTER SocksstubStartVKTurnUpstream dur=\(durMs)ms err=\"\(err)\"")
         if !err.isEmpty {
-            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
+            setVKTurnLastError(err)
+            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: "\(err)"")
             return
         }
+        setVKTurnLastError("")
         ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
 
         Task.detached(priority: .utility) {
@@ -782,6 +817,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // in the main app only touches that process' idle Go runtime.
             appendExtLog("info: app requested VK TURN creds refresh")
             let result = Self.refreshVKTurnCredsFromAppGroup()
+            if result == "not running" {
+                appendExtLog("info: VK TURN runner not running after creds refresh; re-applying transport policy")
+                Self.applyWhitelistTransportPolicy(context: "refreshVKTurnCreds", log: self.appendExtLog)
+            }
             completionHandler?(result.data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
@@ -836,6 +875,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // the Go side as a no-op fallback for now but is no
                 // longer the source of truth.
                 "hasTURNCreds": TURNCredsStore.shared.isFresh,
+                "turnError": Self.currentVKTurnLastError(),
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

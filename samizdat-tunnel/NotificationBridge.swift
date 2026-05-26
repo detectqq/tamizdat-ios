@@ -21,7 +21,7 @@ import UserNotifications
 /// `SocksstubNotificationCallbackProtocol`) can call us. The single Go
 /// callback method `OnNotification(code, title, body, locale string)` is
 /// surfaced in Swift as `onNotification(_:title:body:locale:)`.
-final class NotificationBridge: NSObject, SocksstubNotificationCallbackProtocol {
+final class NotificationBridge: NSObject, SocksstubNotificationCallbackProtocol, SocksstubTurnProfileCallbackProtocol {
     static let shared = NotificationBridge()
 
     /// Called from a Go goroutine. Bounce to a Swift dispatch queue before
@@ -38,6 +38,18 @@ final class NotificationBridge: NSObject, SocksstubNotificationCallbackProtocol 
             Self.persist(payload)
             Self.postLocal(payload)
             Self.postDarwin()
+        }
+    }
+
+    func onTurnProfile(_ provider: String?, roomLink: String?, roomHash: String?, peer: String?, version: Int) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            Self.persistTurnProfile(
+                provider: provider ?? "vk",
+                roomLink: roomLink ?? "",
+                roomHash: roomHash ?? "",
+                peer: peer ?? "",
+                version: version
+            )
         }
     }
 
@@ -76,5 +88,60 @@ final class NotificationBridge: NSObject, SocksstubNotificationCallbackProtocol 
             CFNotificationName(ServerNotificationConstants.darwinNotificationName),
             nil, nil, true
         )
+    }
+
+    private static func persistTurnProfile(provider: String, roomLink: String, roomHash: String, peer: String, version: Int) {
+        guard let defaults = UserDefaults(suiteName: TurnProfileUpdateConstants.appGroupID) else { return }
+        let normalizedProvider = provider.isEmpty ? "vk" : provider
+        let hash = firstNonEmpty(roomHash, normalizeVKRoomHash(roomLink), normalizeVKRoomHash(roomHash))
+        defaults.set(normalizedProvider, forKey: "tamizdat.turnProvider")
+        if !hash.isEmpty {
+            VKCredsPreferences.primaryCallHash = hash
+        }
+        if !peer.isEmpty {
+            VKCredsPreferences.peerAddr = peer
+        }
+        // Room rotation invalidates cached VK credentials; force main-app
+        // refresher to fetch fresh credentials for the new room/hash.
+        TURNCredsStore.shared.clear()
+        SocksstubStopVKTurnUpstream()
+        let payload = TurnProfileUpdatePayload(
+            provider: normalizedProvider,
+            roomHashPrefix: String(hash.prefix(8)),
+            peer: peer,
+            version: version,
+            postedAt: Date().timeIntervalSince1970
+        )
+        if let data = try? JSONEncoder().encode(payload) {
+            defaults.set(data, forKey: TurnProfileUpdateConstants.userDefaultsKey)
+        }
+        defaults.synchronize()
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName(TurnProfileUpdateConstants.darwinNotificationName),
+            nil, nil, true
+        )
+    }
+
+    private static func normalizeVKRoomHash(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        if let r = s.range(of: "/call/join/") {
+            s = String(s[r.upperBound...])
+        } else if s.contains("/") || s.contains(":") {
+            return ""
+        }
+        if let i = s.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            s = String(s[..<i])
+        }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/?#"))
+    }
+
+    private static func firstNonEmpty(_ values: String...) -> String {
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return ""
     }
 }

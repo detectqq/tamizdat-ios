@@ -39,6 +39,11 @@ type CoverConfigBundle struct {
 	// transport use these to establish relay connections through VK
 	// infrastructure. Older clients silently ignore the field.
 	TURNCreds *TURNCredsEntry `json:"turn_creds,omitempty"`
+
+	// TURNProfile is an operator-staged room/profile update. It lets the
+	// Tamizdat panel rotate a VK room/hash for this user without asking the
+	// user to paste anything on-device. Older clients silently ignore it.
+	TURNProfile *TURNProfileEntry `json:"turn_profile,omitempty"`
 }
 
 // TURNCredsEntry carries TURN relay credentials for client-side TURN
@@ -52,15 +57,27 @@ type TURNCredsEntry struct {
 	Lifetime int      `json:"lifetime"`
 }
 
+// TURNProfileEntry carries room/profile data that the client can persist into
+// its local VK TURN preferences. wgturn_port is the server-side TURN port from
+// Tamizdat settings; the client derives the peer host from the active Tamizdat
+// server it is already connected to.
+type TURNProfileEntry struct {
+	Version    int    `json:"version,omitempty"`
+	Provider   string `json:"provider,omitempty"`
+	RoomLink   string `json:"room_link,omitempty"`
+	RoomHash   string `json:"room_hash,omitempty"`
+	WGTurnPort int    `json:"wgturn_port,omitempty"`
+}
+
 // NotificationEntry is a one-shot user-facing message delivered via the
 // bundle (Phase C iOS-notify, Stage 3, 2026-05-10).
 //
 //   - Code:   machine-readable cause, e.g. "quota_exhausted", "expired",
-//             "admin_broadcast". Stable across versions.
+//     "admin_broadcast". Stable across versions.
 //   - Title:  short human-readable title for an OS-level banner.
 //   - Body:   longer free-form text, may be empty.
 //   - Locale: BCP-47 hint ("ru", "en", …) for the title/body the server
-//             picked. Client may ignore and pick by Code.
+//     picked. Client may ignore and pick by Code.
 type NotificationEntry struct {
 	Code   string `json:"code"`
 	Title  string `json:"title,omitempty"`
@@ -130,6 +147,18 @@ func (b *CoverConfigBundle) Validate(masqPool map[string]string, checkMasq bool)
 	if b.Notification != nil {
 		if strings.TrimSpace(b.Notification.Code) == "" {
 			return fmt.Errorf("cover config: notification.code must be non-empty")
+		}
+	}
+	if b.TURNProfile != nil {
+		provider := strings.TrimSpace(b.TURNProfile.Provider)
+		if provider != "" && provider != "vk" {
+			return fmt.Errorf("cover config: turn_profile.provider unsupported: %q", provider)
+		}
+		if strings.TrimSpace(b.TURNProfile.RoomLink) == "" && strings.TrimSpace(b.TURNProfile.RoomHash) == "" {
+			return fmt.Errorf("cover config: turn_profile requires room_link or room_hash")
+		}
+		if b.TURNProfile.WGTurnPort < 0 || b.TURNProfile.WGTurnPort > 65535 {
+			return fmt.Errorf("cover config: turn_profile.wgturn_port out of range")
 		}
 	}
 	if b.CoverGapMinMS != 0 || b.CoverGapMaxMS != 0 {
