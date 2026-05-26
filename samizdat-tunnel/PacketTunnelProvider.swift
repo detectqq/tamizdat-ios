@@ -278,6 +278,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return false
     }
 
+    private static func stopVKTurnIfPolicyDisables(context: String, log: @escaping (String) -> Void = { ExtLog.info($0) }) {
+        let mode = EndpointModeStore.current
+        let shouldUseTURN = Self.whitelistEndpointActive(mode: mode) && Self.whitelistModeRaw() == "vkTurn"
+        guard !shouldUseTURN else { return }
+
+        let running = SocksstubTURNUpstreamRunning()
+        SocksstubStopVKTurnUpstream()
+        setVKTurnLastError("")
+        let closed = SocksstubCloseAllFlows()
+        if running || closed > 0 {
+            log("info: [vkturn] policy pre-stop context=\(context): TURN off for endpoint=\(mode.rawValue); closed \(closed) stale flows")
+            ExtLog.info("[vkturn] policy pre-stop context=\(context): TURN off for endpoint=\(mode.rawValue); closed \(closed) stale flows")
+        }
+    }
+
     private static func whitelistModeRaw() -> String {
         let appGroupDefaults = UserDefaults(suiteName: appGroupID)
         return appGroupDefaults?.string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
@@ -644,6 +659,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
+        // Kill any stale TURN overlay synchronously BEFORE rebuilding the H2
+        // client. Waiting until after SocksstubSetSamizdatConfig leaves a
+        // window where VKTurnNetstack() still has absolute precedence in
+        // dialUpstream(), so a Main/H2 switch can keep using TURN and keep the
+        // panel badge stuck on TURN.
+        Self.stopVKTurnIfPolicyDisables(context: "rewire-pre", log: appendExtLog)
         // IPA-D22: flip the isRewiring flag so the main-app shield can
         // render "Reconnecting…" instantly. Cleared in `defer` below.
         isRewiring = true
@@ -770,6 +791,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // IPA-P: main app updated EndpointModeStore in App Group
             // UserDefaults; we re-read and rewire to the new endpoint.
             let mode = EndpointModeStore.current
+            if mode != .auto {
+                WhitelistStatusStore.activeEndpoint = mode
+            }
             appendExtLog("info: app requested endpoint switch → \(mode.rawValue)")
             // IPA-Q: also start/stop the WhitelistDetector based on
             // whether auto mode is now selected.

@@ -68,6 +68,7 @@ enum WhitelistStatusStore {
         }
         set {
             defaults?.set(newValue.rawValue, forKey: activeEndpointKey)
+            defaults?.synchronize()
         }
     }
 

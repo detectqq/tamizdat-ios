@@ -46,6 +46,7 @@ enum EndpointModeStore {
         }
         set {
             defaults?.set(newValue.rawValue, forKey: key)
+            defaults?.synchronize()
         }
     }
 }

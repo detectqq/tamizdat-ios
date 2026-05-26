@@ -114,6 +114,13 @@ final class VPNProfileStore {
     /// and rewires its samizdat client over the current network.
     func switchEndpoint(to mode: EndpointMode) async {
         EndpointModeStore.current = mode
+        if mode != .auto {
+            // Manual Main/Whitelist is also the effective endpoint. Keep the
+            // App Group mirror in sync before poking the extension; otherwise
+            // a stale auto/whitelist verdict can make the extension keep TURN
+            // alive while the UI says Main/H2.
+            WhitelistStatusStore.activeEndpoint = mode
+        }
         _ = try? await sendProviderMessage("switchEndpoint")
     }
 
