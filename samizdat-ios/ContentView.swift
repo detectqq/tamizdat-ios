@@ -754,7 +754,9 @@ final class TurnProfileUpdateObserver: ObservableObject {
         // credentials. If the main app is alive, refresh immediately and push
         // the new creds back to the extension; if not, App.swift's scenePhase
         // hook will refresh on next foreground.
-        TURNCredsRefresher.shared.forceRefreshAfterProfileUpdate()
+        Task { @MainActor in
+            TURNCredsRefresher.shared.forceRefreshAfterProfileUpdate()
+        }
     }
 }
 
