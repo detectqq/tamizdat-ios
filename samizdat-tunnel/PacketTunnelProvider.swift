@@ -425,7 +425,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: AFTER SocksstubStartVKTurnUpstream dur=\(durMs)ms err=\"\(err)\"")
         if !err.isEmpty {
             setVKTurnLastError(err)
-            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: "\(err)"")
+            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
             return
         }
         setVKTurnLastError("")
