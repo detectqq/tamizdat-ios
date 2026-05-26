@@ -231,44 +231,69 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return false
         }
 
-        // Phase 2D-PART-C: attach VK TURN upstream when the operator
-        // selected "Whitelist mode = TURN" in Settings.
-        //
-        // Static helper because startInProcessSocks itself is static —
-        // it has no `self`, only the log closure threaded through from
-        // the instance-level caller. Failure paths log + fall through
-        // silently so the hev tunnel still serves traffic.
-        //
-        // WhitelistMode is the single source of truth (the picker the
-        // operator actually touches). EndpointTurnMode was a separate
-        // legacy store that we used to read here, but the two could
-        // drift out of sync — when WhitelistMode flipped to .vkTurn
-        // via UserDefaults from another process, EndpointTurnMode
-        // stayed at .off and attach silently skipped. Read the picker
-        // store directly to remove that whole class of bug.
-        //
-        // Inlined because WhitelistMode.swift lives in the main-app
-        // target, not in samizdat-tunnel; the enum's storage key is
-        // copy-pasted from `samizdat-ios/WhitelistMode.swift` and
-        // MUST stay in sync. (TODO: lift WhitelistMode into a shared
-        // sources directory listed by both targets in project.yml.)
-        let appGroupID = "group.com.anarki.samizdat-test"
-        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
-        let whitelistModeRaw = appGroupDefaults?
-            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
-        log("info: [vkturn] WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
-        ExtLog.info("[vkturn] WhitelistMode read = \"\(whitelistModeRaw)\"")
-        if whitelistModeRaw == "vkTurn" {
-            log("info: [vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            ExtLog.info("[vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
+        // Apply whitelist transport policy after the H2 client is ready.
+        // Main endpoint always stays H2. Only an active whitelist endpoint
+        // may engage TURN, and even then only when the H2/TURN picker says TURN.
+        Self.applyWhitelistTransportPolicy(context: "startInProcessSocks", log: log)
+        return true
+    }
+
+    /// Applies the operator-facing whitelist transport matrix:
+    ///
+    ///   Endpoint Main / Auto-primary  → always H2, TURN stopped
+    ///   Endpoint Whitelist active     → H2 backup URI OR TURN, per picker
+    ///
+    /// This is intentionally independent from the detector itself. The
+    /// detector only decides whether the whitelist endpoint is active;
+    /// this function decides what transport that endpoint means.
+    @discardableResult
+    private static func applyWhitelistTransportPolicy(context: String, log: @escaping (String) -> Void = { ExtLog.info($0) }) -> Bool {
+        let mode = EndpointModeStore.current
+        let whitelistActive = Self.whitelistEndpointActive(mode: mode)
+        let whitelistModeRaw = Self.whitelistModeRaw()
+        let shouldUseTURN = whitelistActive && whitelistModeRaw == "vkTurn"
+        log("info: [vkturn] policy context=\(context) endpoint=\(mode.rawValue) activeWhitelist=\(whitelistActive) whitelistMode=\(whitelistModeRaw) shouldUseTURN=\(shouldUseTURN)")
+        ExtLog.info("[vkturn] policy context=\(context) endpoint=\(mode.rawValue) activeWhitelist=\(whitelistActive) whitelistMode=\(whitelistModeRaw) shouldUseTURN=\(shouldUseTURN)")
+
+        if shouldUseTURN {
+            log("info: [vkturn] whitelist endpoint uses TURN → attach")
+            ExtLog.info("[vkturn] whitelist endpoint uses TURN → attach")
             Self.attachVKTurnUpstream()
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
-        } else {
-            log("info: [vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
-            ExtLog.info("[vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
+            return true
         }
-        return true
+
+        let running = SocksstubTURNUpstreamRunning()
+        SocksstubStopVKTurnUpstream()
+        if running {
+            log("info: [vkturn] policy stopped TURN upstream; active path is H2")
+            ExtLog.info("[vkturn] policy stopped TURN upstream; active path is H2")
+        } else {
+            log("info: [vkturn] policy keeps TURN off; active path is H2")
+            ExtLog.info("[vkturn] policy keeps TURN off; active path is H2")
+        }
+        return false
+    }
+
+    private static func whitelistModeRaw() -> String {
+        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
+        return appGroupDefaults?.string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+    }
+
+    private static func whitelistEndpointActive(mode: EndpointMode) -> Bool {
+        switch mode {
+        case .primary:
+            return false
+        case .backup:
+            return true
+        case .auto:
+            return WhitelistStatusStore.activeEndpoint == .backup
+        }
+    }
+
+    private static func whitelistTransportConfigured(hasBackup: Bool) -> Bool {
+        hasBackup || whitelistModeRaw() == "vkTurn"
     }
 
     /// Spin up the VK TURN runner if the operator selected it.
@@ -601,6 +626,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+            Self.applyWhitelistTransportPolicy(context: "rewire", log: self.appendExtLog)
 
             // IPA-D17: after the new client is in place, force-close
             // every loopback SOCKS5 flow that hev opened over the OLD
@@ -653,7 +679,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startWhitelistDetectorIfNeeded() {
         let mode = EndpointModeStore.current
         let hasBackup = (backupBlob != nil)
-        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(hasBackup) running=\(whitelistDetector != nil)")
+        let hasWhitelistTransport = Self.whitelistTransportConfigured(hasBackup: hasBackup)
+        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(hasBackup) whitelistMode=\(Self.whitelistModeRaw()) hasWhitelistTransport=\(hasWhitelistTransport) running=\(whitelistDetector != nil)")
         guard mode == .auto else {
             // Mode is not auto → stop if it was running, paint badge as unknown
             // so the UI doesn't keep showing a stale verdict.
@@ -665,11 +692,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             WhitelistStatusStore.current = .unknown
             return
         }
-        guard hasBackup else {
-            // Auto requested but no backup blob to fail over TO. Be loud
-            // about this — main app shows "Whitelist: monitoring..." silent
-            // forever otherwise. User must Save backup config and reconnect.
-            appendExtLog("warn: detector NOT started — auto mode requested but no backup configured (Save backup URL in Config and reconnect)")
+        guard hasWhitelistTransport else {
+            // Auto requested but no H2 backup URI and TURN mode is not selected.
+            // Be loud about this — main app shows "Whitelist: monitoring..."
+            // silent forever otherwise. User must either save backup config or
+            // switch whitelist transport to TURN.
+            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist transport configured (Save whitelist H2 URI or select TURN)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
@@ -742,6 +770,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested whitelist probes refresh → testHost=\(WhitelistProbePreferences.testHost) whitelistHost=\(WhitelistProbePreferences.whitelistHost)")
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
+        case "refreshWhitelistTransportMode":
+            appendExtLog("info: app requested whitelist H2/TURN transport refresh")
+            startWhitelistDetectorIfNeeded()
+            rewireUpstream()
+            completionHandler?("whitelistTransportRefreshed".data(using: .utf8))
         case "refreshVKTurnCreds":
             // Main app fetched fresh VK TURN creds and wrote them to the
             // App Group. The active runner lives in THIS extension

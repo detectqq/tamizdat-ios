@@ -146,6 +146,14 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshWhitelistProbes")
     }
 
+    /// Applies a live change of the H2/TURN picker for the whitelist endpoint.
+    /// If the effective endpoint is Main, the extension forcibly keeps H2 and
+    /// stops any stale TURN runner. If the effective endpoint is Whitelist,
+    /// it attaches/stops TURN according to WhitelistMode.current.
+    func refreshWhitelistTransportMode() async {
+        _ = try? await sendProviderMessage("refreshWhitelistTransportMode")
+    }
+
     /// Pushes freshly-saved VK TURN credentials into the live Network
     /// Extension process. The main app cannot update the runner by
     /// calling the gomobile bridge directly: the active runner lives in

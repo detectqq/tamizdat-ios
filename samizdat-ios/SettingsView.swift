@@ -655,10 +655,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 .onChange(of: whitelistMode) { _, newValue in
                     WhitelistMode.current = newValue
-                    // EndpointTurnMode mirror REMOVED on the autonomous-
-                    // refresh pass — `WhitelistMode` is now the single
-                    // source of truth and the extension reads it
-                    // directly in attachVKTurnUpstream.
+                    Task { await VPNProfileStore.shared.refreshWhitelistTransportMode() }
                 }
 
                 Text("Test host")
