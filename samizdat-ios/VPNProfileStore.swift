@@ -114,6 +114,13 @@ final class VPNProfileStore {
     /// and rewires its samizdat client over the current network.
     func switchEndpoint(to mode: EndpointMode) async {
         EndpointModeStore.current = mode
+        if mode != .auto {
+            // Manual Main/Whitelist is also the effective endpoint. Keep the
+            // App Group mirror in sync before poking the extension; otherwise
+            // a stale auto/whitelist verdict can make the extension keep TURN
+            // alive while the UI says Main/H2.
+            WhitelistStatusStore.activeEndpoint = mode
+        }
         _ = try? await sendProviderMessage("switchEndpoint")
     }
 
@@ -144,6 +151,14 @@ final class VPNProfileStore {
     /// a disclaimer about that.
     func refreshWhitelistProbes() async {
         _ = try? await sendProviderMessage("refreshWhitelistProbes")
+    }
+
+    /// Applies a live change of the H2/TURN picker for the whitelist endpoint.
+    /// If the effective endpoint is Main, the extension forcibly keeps H2 and
+    /// stops any stale TURN runner. If the effective endpoint is Whitelist,
+    /// it attaches/stops TURN according to WhitelistMode.current.
+    func refreshWhitelistTransportMode() async {
+        _ = try? await sendProviderMessage("refreshWhitelistTransportMode")
     }
 
     /// Pushes freshly-saved VK TURN credentials into the live Network

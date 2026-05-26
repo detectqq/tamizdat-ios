@@ -109,7 +109,7 @@ type runtimeState struct {
 	// before re-calling SocksstubSetSamizdatConfig with the same blob.
 	// When variant is "v1" we also flip StrictSingleH2=true to match
 	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
-	poolVariant      atomic.Value // string
+	poolVariant atomic.Value // string
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -173,6 +173,7 @@ func SetVerboseFlowLogs(enabled bool) {
 // Swift registers a sink once at startup; the sink is looked up per-call so
 // it survives rebuildClient / rewireUpstream which reconstructs samizdat.NewClient.
 var notificationSink atomic.Value // NotificationCallback
+var turnProfileSink atomic.Value  // TurnProfileCallback
 
 // NotificationCallback is the gomobile-friendly callback shape (only scalar
 // string args; gomobile binds Go interfaces to Swift protocols cleanly,
@@ -195,6 +196,27 @@ func SetNotificationCallback(cb NotificationCallback) {
 
 func currentNotificationCallback() NotificationCallback {
 	v, _ := notificationSink.Load().(NotificationCallback)
+	return v
+}
+
+// TurnProfileCallback receives operator-staged VK room/profile updates. Scalar
+// args keep the gomobile bridge reliable; secrets are intentionally not logged.
+type TurnProfileCallback interface {
+	OnTurnProfile(provider, roomLink, roomHash, peer string, version int)
+}
+
+func SetTurnProfileCallback(cb TurnProfileCallback) {
+	if cb == nil {
+		turnProfileSink.Store((TurnProfileCallback)(nil))
+		rt.appendLog("info: turn profile sink cleared")
+		return
+	}
+	turnProfileSink.Store(cb)
+	rt.appendLog("info: turn profile sink registered")
+}
+
+func currentTurnProfileCallback() TurnProfileCallback {
+	v, _ := turnProfileSink.Load().(TurnProfileCallback)
 	return v
 }
 
@@ -309,22 +331,34 @@ func Stop() {
 	ln := rt.listener
 	cancel := rt.cancel
 	path := rt.socketPath
+	oldClient := rt.samizdatClient
 	rt.listener = nil
 	rt.cancel = nil
 	rt.ctx = nil
+	rt.samizdatBlob = ""
+	rt.samizdatClient = nil
 	rt.mu.Unlock()
+
+	// Stop the TURN overlay first so VK/Yandex netstack precedence cannot
+	// leak into the next plain H2 start after a failed manual TURN attempt.
+	StopVKTurnUpstream()
 	if cancel != nil {
 		cancel()
 	}
 	if ln != nil {
 		_ = ln.Close()
 	}
+	closed := CloseAllFlows()
+	stopPingProber()
+	if oldClient != nil {
+		_ = oldClient.Close()
+	}
 	// Remove only if it looks like a UDS path (TCP "127.0.0.1:1080"
 	// would not be a valid path).
 	if path != "" && len(path) > 0 && path[0] == '/' {
 		_ = os.Remove(path)
 	}
-	rt.appendLog("info: socks listener stopped")
+	rt.appendLog(fmt.Sprintf("info: socks listener stopped; closed %d flows", closed))
 }
 
 // Status returns "stopped" or "listening".
@@ -525,6 +559,15 @@ func SetSamizdatConfig(blob string) error {
 		OnNotification: func(e samizdat.NotificationEntry) {
 			if cb := currentNotificationCallback(); cb != nil {
 				cb.OnNotification(e.Code, e.Title, e.Body, e.Locale)
+			}
+		},
+		OnTURNProfile: func(e samizdat.TURNProfileEntry, peer string) {
+			if cb := currentTurnProfileCallback(); cb != nil {
+				provider := e.Provider
+				if provider == "" {
+					provider = "vk"
+				}
+				cb.OnTurnProfile(provider, e.RoomLink, e.RoomHash, peer, e.Version)
 			}
 		},
 		// IPA-Y: Performance mode toggle removed. Plan B+'s realtime
@@ -1111,11 +1154,15 @@ func (a *connectedNetConnUDPAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
 func (a *connectedNetConnUDPAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return a.conn.Write(p)
 }
-func (a *connectedNetConnUDPAdapter) Close() error                       { return a.conn.Close() }
-func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr                { return a.conn.LocalAddr() }
-func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error      { return a.conn.SetDeadline(t) }
-func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
-func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
+func (a *connectedNetConnUDPAdapter) Close() error                  { return a.conn.Close() }
+func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr           { return a.conn.LocalAddr() }
+func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error { return a.conn.SetDeadline(t) }
+func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error {
+	return a.conn.SetReadDeadline(t)
+}
+func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error {
+	return a.conn.SetWriteDeadline(t)
+}
 
 // connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
 // net.PacketConn with the connected peer as the constant remote addr.

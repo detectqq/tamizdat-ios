@@ -32,3 +32,18 @@ enum ServerNotificationConstants {
     static let unCategoryIdentifier = "TAMIZDAT_SERVER_MSG"
     static let unIdentifierPrefix = "tamizdat.server."
 }
+
+struct TurnProfileUpdatePayload: Codable, Equatable {
+    let provider: String
+    let roomHashPrefix: String
+    let peer: String
+    let version: Int
+    let postedAt: TimeInterval
+}
+
+enum TurnProfileUpdateConstants {
+    static let appGroupID = ServerNotificationConstants.appGroupID
+    static let userDefaultsKey = "tamizdat.lastTurnProfileUpdate"
+    static let darwinNotificationName: CFString =
+        "com.anarki.samizdat-test.turn-profile.updated" as CFString
+}

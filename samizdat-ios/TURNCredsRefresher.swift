@@ -116,13 +116,25 @@ final class TURNCredsRefresher: ObservableObject {
             TURNLog.warn("turncreds", "forceRefresh debounced (\(elapsedMs) ms since last save)")
             return
         }
-        TURNLog.info("turncreds", "forceRefresh called")
+        startForcedRefresh(reason: "forceRefresh")
+    }
+
+    /// Called after the extension receives a server-pushed room/profile update.
+    /// Room rotation intentionally bypasses the post-save debounce: a new room
+    /// invalidates the old cached credentials even if the previous save was a
+    /// split second ago.
+    func forceRefreshAfterProfileUpdate() {
+        startForcedRefresh(reason: "turnProfileUpdate")
+    }
+
+    private func startForcedRefresh(reason: String) {
+        TURNLog.info("turncreds", "\(reason) called")
         guard !isRefreshing else {
-            TURNLog.warn("turncreds", "forceRefresh: skipped — isRefreshing is true")
+            TURNLog.warn("turncreds", "\(reason): skipped — isRefreshing is true")
             return
         }
         guard VKCredsPreferences.isConfigured else {
-            TURNLog.warn("turncreds", "forceRefresh: skipped — isConfigured is false")
+            TURNLog.warn("turncreds", "\(reason): skipped — isConfigured is false")
             return
         }
         startRefresh()

@@ -67,13 +67,27 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	// "Allocate: timeout" path users see on long-lived sessions.
 	useUDP := shouldUseUDP(creds)
 
+	// First-class Tamizdat wgturn auth: prefer the active tamizdat://
+	// profile's shortID over the legacy manual wgturn password field.
+	// The server maps this shortID through the normal panel userdb, opens a
+	// user_sessions row with transport='turn', and routes flows with the same
+	// per-user rules as H2. Keep the passed password only as a compatibility
+	// fallback for older standalone wgturn deployments.
+	connPassword := strings.TrimSpace(wgPassword)
+	if shortID := currentSamizdatShortIDHex(); shortID != "" {
+		connPassword = shortID
+		rt.appendLog("info: [vkturn] wgturn auth source = tamizdat shortID")
+	} else if connPassword != "" {
+		rt.appendLog("info: [vkturn] wgturn auth source = legacy password")
+	}
+
 	runner, err := wgturnclient.New(wgturnclient.Config{
 		Listen:         fmt.Sprintf("127.0.0.1:%d", listenPort),
 		PeerAddr:       peerAddr,
 		Workers:        12,
 		UseUDP:         useUDP,
 		DeviceID:       deviceID,
-		ConnPassword:   wgPassword,
+		ConnPassword:   connPassword,
 		PreloadedCreds: creds,
 		OnConfig: func(conf string) {
 			vkturnWGConfig.Store(&conf)
@@ -196,7 +210,8 @@ func StopVKTurnUpstream() {
 	vkturnMu.Lock()
 	defer vkturnMu.Unlock()
 
-	if !vkturnRunning.Load() {
+	if !vkturnRunning.Load() && vkturnRunner == nil && vkturnAttachStop == nil {
+		resetVKTurnAtomicsLocked()
 		return
 	}
 	if vkturnCancel != nil {
@@ -241,6 +256,16 @@ func TURNUpstreamRunning() bool {
 	return vkturnRunning.Load()
 }
 
+// TURNUpstreamLastError returns the last VK/wgturn runner error, if any. The
+// value is intentionally a short diagnostic string; credentials JSON and TURN
+// passwords are never stored here.
+func TURNUpstreamLastError() string {
+	if p := vkturnErr.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 // VKTurnNetstack returns the userspace WireGuard netstack the upstream
 // is currently bound to, or nil if there is none. Callers route every
 // TCP/UDP dial through this stack — its underlying packets traverse
@@ -250,6 +275,29 @@ func TURNUpstreamRunning() bool {
 // in this same module use it.
 func VKTurnNetstack() *netstack.Net {
 	return vkturnNet.Load()
+}
+
+func currentSamizdatShortIDHex() string {
+	rt.mu.Lock()
+	blob := rt.samizdatBlob
+	rt.mu.Unlock()
+	if strings.TrimSpace(blob) == "" {
+		return ""
+	}
+	cfg, err := parseSamizdatURL(blob)
+	if err != nil || cfg == nil {
+		return ""
+	}
+	shortID := strings.ToLower(strings.TrimSpace(cfg.ShortIDHex))
+	if len(shortID) != 16 {
+		return ""
+	}
+	for _, r := range shortID {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return ""
+		}
+	}
+	return shortID
 }
 
 // stopVKTurnAttachLocked tears down the userspace WG + netstack the
@@ -377,6 +425,7 @@ func resetVKTurnAtomicsLocked() {
 	vkturnWGConfig.Store(nil)
 	vkturnStats.Store(nil)
 	vkturnErr.Store(nil)
+	vkturnNet.Store(nil)
 	vkturnRunning.Store(false)
 }
 

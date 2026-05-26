@@ -1,13 +1,17 @@
 import Foundation
 
-/// When the whitelist detector flips the tunnel onto the "whitelist"
-/// endpoint, this enum decides WHAT that endpoint actually is.
+/// When whitelist handling is OFF (endpoint mode Main), traffic always uses
+/// the main H2 `tamizdat://` URI, regardless of this picker.
 ///
-///   - `.h2Backup` — the long-standing behaviour: dial the secondary
-///                   `tamizdat://...` URI the user pasted in Settings.
-///   - `.vkTurn`   — new (Phase 2G): route the same traffic through
-///                   VK TURN instead. The backup URI is unused (but
-///                   NOT deleted — the operator may flip back).
+/// When whitelist handling is active (manual Whitelist endpoint, or Auto after
+/// the detector switched to Whitelist), this enum decides what that whitelist
+/// endpoint means.
+///
+///   - `.h2Backup` — dial the secondary/whitelist `tamizdat://` URI the user
+///                   pasted in Config/Endpoints.
+///   - `.vkTurn`   — route traffic through the configured TURN relay instead.
+///                   The H2 whitelist URI is preserved but not required for
+///                   TURN mode.
 ///
 /// Stored in App Group UserDefaults so the Network Extension and the
 /// main app see the same value through a shared suite.

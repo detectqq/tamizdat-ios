@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -156,31 +157,32 @@ func (c *Client) pickShortID() [8]byte {
 // Client dials connections through a Samizdat server. Multiple calls to
 // DialContext share the same underlying TLS+H2 connection via multiplexing.
 type Client struct {
-	config              ClientConfig
-	pool                *connPool
-	shaper              *Shaper
-	fragmenter          *RecordFragmenter
-	fingerprintChooser  *fingerprintRotator
-	cover               *coverDriver
-	handshakeLimiter    *handshakeLimiter
-	realtime            *RealtimeController
-	derivedShortIDs     atomic.Pointer[[][8]byte]
-	serverPushedSNIPool   atomic.Pointer[[]SNIEntry]
-	serverPushedTURNCreds atomic.Pointer[TURNCredsEntry]
-	coverCtx              context.Context
-	coverCancel         context.CancelFunc
-	bundleCtx           context.Context
-	bundleCancel        context.CancelFunc
+	config                  ClientConfig
+	pool                    *connPool
+	shaper                  *Shaper
+	fragmenter              *RecordFragmenter
+	fingerprintChooser      *fingerprintRotator
+	cover                   *coverDriver
+	handshakeLimiter        *handshakeLimiter
+	realtime                *RealtimeController
+	derivedShortIDs         atomic.Pointer[[][8]byte]
+	serverPushedSNIPool     atomic.Pointer[[]SNIEntry]
+	serverPushedTURNCreds   atomic.Pointer[TURNCredsEntry]
+	serverPushedTURNProfile atomic.Pointer[TURNProfileEntry]
+	coverCtx                context.Context
+	coverCancel             context.CancelFunc
+	bundleCtx               context.Context
+	bundleCancel            context.CancelFunc
 	// v1FlipChan delivers async ShapeMode flips for the V1 single-transport
 	// hot path. Audit #6: Promote -> onRealtimeOpen runs on the first RTP
 	// packet and previously held pool.mu + did syscalls inline; that delay
 	// hits the latency-critical packet. We now signal a goroutine via a
 	// buffered chan so the observer returns immediately.
-	v1FlipChan          chan ShapeMode
-	rttProbe            *rttProbe
-	v1FlipDone          chan struct{}
-	mu                  sync.Mutex
-	closed              bool
+	v1FlipChan chan ShapeMode
+	rttProbe   *rttProbe
+	v1FlipDone chan struct{}
+	mu         sync.Mutex
+	closed     bool
 }
 
 // NewClient creates a new Samizdat client.
@@ -755,6 +757,17 @@ func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
 		entry := *bundle.TURNCreds
 		c.serverPushedTURNCreds.Store(&entry)
 	}
+	if bundle.TURNProfile != nil {
+		entry := *bundle.TURNProfile
+		c.serverPushedTURNProfile.Store(&entry)
+		if c.config.OnTURNProfile != nil {
+			peer := c.turnProfilePeer(entry)
+			go func() {
+				defer func() { _ = recover() }()
+				c.config.OnTURNProfile(entry, peer)
+			}()
+		}
+	}
 	// Phase C iOS-notify: forward a one-shot user-facing notification to any
 	// registered consumer (iOS NE bridges this to a local notification).
 	// Fire on a goroutine to keep the bundle-apply path non-blocking; the
@@ -773,6 +786,23 @@ func (c *Client) applyCoverConfigBundle(bundle *CoverConfigBundle) {
 			c.config.OnNotification(entry)
 		}()
 	}
+}
+
+func (c *Client) turnProfilePeer(entry TURNProfileEntry) string {
+	if c == nil || entry.WGTurnPort <= 0 || entry.WGTurnPort > 65535 {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(c.config.ServerAddr)
+	if err != nil || host == "" {
+		host = c.config.ServerAddr
+		if i := strings.LastIndex(host, ":"); i >= 0 {
+			host = host[:i]
+		}
+	}
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, fmt.Sprintf("%d", entry.WGTurnPort))
 }
 
 type tlsConnWrapper struct {
@@ -808,6 +838,15 @@ func (c *Client) ServerPushedTURNCreds() *TURNCredsEntry {
 		return nil
 	}
 	return c.serverPushedTURNCreds.Load()
+}
+
+// ServerPushedTURNProfile returns the most recently received operator-staged
+// TURN room/profile update.
+func (c *Client) ServerPushedTURNProfile() *TURNProfileEntry {
+	if c == nil {
+		return nil
+	}
+	return c.serverPushedTURNProfile.Load()
 }
 
 // RTTProbeSnapshot returns the current RTT probe stats — last p50 in ms for

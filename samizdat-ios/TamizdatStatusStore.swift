@@ -82,12 +82,17 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// VK TURN relay credentials available from the server.
     let hasTURNCreds: Bool
 
+    /// Last VK room / TURN attach error reported by the extension. Empty when
+    /// there is no active error. Main app credential-refresh errors are exposed
+    /// separately by TURNCredsRefresher.lastError.
+    let turnError: String
+
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
         rttLiteMs: -1, rttBulkMs: -1,
         pingMs: -1, pingOK: false, pingFailed: false, pingURL: "",
         rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
-        hasTURNCreds: false
+        hasTURNCreds: false, turnError: ""
     )
 
     // IPA-D21: tolerate older extension JSON (pre-D21 lacks ping*
@@ -99,14 +104,14 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case realShape, lockedFlows, liteAlive, rttLiteMs, rttBulkMs
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
-        case hasTURNCreds
+        case hasTURNCreds, turnError
     }
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
          rttLiteMs: Int, rttBulkMs: Int,
          pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String,
          rxBytes: Int64, txBytes: Int64, uptimeSec: Int64, isRewiring: Int,
-         hasTURNCreds: Bool = false) {
+         hasTURNCreds: Bool = false, turnError: String = "") {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
         self.liteAlive = liteAlive
@@ -121,6 +126,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.uptimeSec = uptimeSec
         self.isRewiring = isRewiring
         self.hasTURNCreds = hasTURNCreds
+        self.turnError = turnError
     }
 
     init(from decoder: Decoder) throws {
@@ -139,6 +145,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.uptimeSec   = (try? c.decode(Int64.self,  forKey: .uptimeSec))   ?? 0
         self.isRewiring  = (try? c.decode(Int.self,    forKey: .isRewiring))  ?? 0
         self.hasTURNCreds = (try? c.decode(Bool.self,  forKey: .hasTURNCreds)) ?? false
+        self.turnError = (try? c.decode(String.self, forKey: .turnError)) ?? ""
     }
 }
 

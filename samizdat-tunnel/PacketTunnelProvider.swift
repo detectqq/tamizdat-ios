@@ -224,6 +224,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // immediately after SetSamizdatConfig, so a user who is already
         // over-quota at connect time still gets the notification.
         SocksstubSetNotificationCallback(NotificationBridge.shared)
+        SocksstubSetTurnProfileCallback(NotificationBridge.shared)
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -231,44 +232,107 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return false
         }
 
-        // Phase 2D-PART-C: attach VK TURN upstream when the operator
-        // selected "Whitelist mode = TURN" in Settings.
-        //
-        // Static helper because startInProcessSocks itself is static —
-        // it has no `self`, only the log closure threaded through from
-        // the instance-level caller. Failure paths log + fall through
-        // silently so the hev tunnel still serves traffic.
-        //
-        // WhitelistMode is the single source of truth (the picker the
-        // operator actually touches). EndpointTurnMode was a separate
-        // legacy store that we used to read here, but the two could
-        // drift out of sync — when WhitelistMode flipped to .vkTurn
-        // via UserDefaults from another process, EndpointTurnMode
-        // stayed at .off and attach silently skipped. Read the picker
-        // store directly to remove that whole class of bug.
-        //
-        // Inlined because WhitelistMode.swift lives in the main-app
-        // target, not in samizdat-tunnel; the enum's storage key is
-        // copy-pasted from `samizdat-ios/WhitelistMode.swift` and
-        // MUST stay in sync. (TODO: lift WhitelistMode into a shared
-        // sources directory listed by both targets in project.yml.)
-        let appGroupID = "group.com.anarki.samizdat-test"
-        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
-        let whitelistModeRaw = appGroupDefaults?
-            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
-        log("info: [vkturn] WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
-        ExtLog.info("[vkturn] WhitelistMode read = \"\(whitelistModeRaw)\"")
-        if whitelistModeRaw == "vkTurn" {
-            log("info: [vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            ExtLog.info("[vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
+        // Apply whitelist transport policy after the H2 client is ready.
+        // Main endpoint always stays H2. Only an active whitelist endpoint
+        // may engage TURN, and even then only when the H2/TURN picker says TURN.
+        Self.applyWhitelistTransportPolicy(context: "startInProcessSocks", log: log)
+        return true
+    }
+
+    /// Applies the operator-facing whitelist transport matrix:
+    ///
+    ///   Endpoint Main / Auto-primary  → always H2, TURN stopped
+    ///   Endpoint Whitelist active     → H2 backup URI OR TURN, per picker
+    ///
+    /// This is intentionally independent from the detector itself. The
+    /// detector only decides whether the whitelist endpoint is active;
+    /// this function decides what transport that endpoint means.
+    @discardableResult
+    private static func applyWhitelistTransportPolicy(context: String, log: @escaping (String) -> Void = { ExtLog.info($0) }) -> Bool {
+        let mode = EndpointModeStore.current
+        let whitelistActive = Self.whitelistEndpointActive(mode: mode)
+        let whitelistModeRaw = Self.whitelistModeRaw()
+        let shouldUseTURN = whitelistActive && whitelistModeRaw == "vkTurn"
+        log("info: [vkturn] policy context=\(context) endpoint=\(mode.rawValue) activeWhitelist=\(whitelistActive) whitelistMode=\(whitelistModeRaw) shouldUseTURN=\(shouldUseTURN)")
+        ExtLog.info("[vkturn] policy context=\(context) endpoint=\(mode.rawValue) activeWhitelist=\(whitelistActive) whitelistMode=\(whitelistModeRaw) shouldUseTURN=\(shouldUseTURN)")
+
+        if shouldUseTURN {
+            log("info: [vkturn] whitelist endpoint uses TURN → attach")
+            ExtLog.info("[vkturn] whitelist endpoint uses TURN → attach")
             Self.attachVKTurnUpstream()
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
-        } else {
-            log("info: [vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
-            ExtLog.info("[vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
+            return true
         }
-        return true
+
+        let running = SocksstubTURNUpstreamRunning()
+        SocksstubStopVKTurnUpstream()
+        setVKTurnLastError("")
+        if running {
+            log("info: [vkturn] policy stopped TURN upstream; active path is H2")
+            ExtLog.info("[vkturn] policy stopped TURN upstream; active path is H2")
+        } else {
+            log("info: [vkturn] policy keeps TURN off; active path is H2")
+            ExtLog.info("[vkturn] policy keeps TURN off; active path is H2")
+        }
+        return false
+    }
+
+    private static func stopVKTurnIfPolicyDisables(context: String, log: @escaping (String) -> Void = { ExtLog.info($0) }) {
+        let mode = EndpointModeStore.current
+        let shouldUseTURN = Self.whitelistEndpointActive(mode: mode) && Self.whitelistModeRaw() == "vkTurn"
+        guard !shouldUseTURN else { return }
+
+        let running = SocksstubTURNUpstreamRunning()
+        SocksstubStopVKTurnUpstream()
+        setVKTurnLastError("")
+        let closed = SocksstubCloseAllFlows()
+        if running || closed > 0 {
+            log("info: [vkturn] policy pre-stop context=\(context): TURN off for endpoint=\(mode.rawValue); closed \(closed) stale flows")
+            ExtLog.info("[vkturn] policy pre-stop context=\(context): TURN off for endpoint=\(mode.rawValue); closed \(closed) stale flows")
+        }
+    }
+
+    private static func whitelistModeRaw() -> String {
+        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
+        return appGroupDefaults?.string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+    }
+
+    private static func whitelistEndpointActive(mode: EndpointMode) -> Bool {
+        switch mode {
+        case .primary:
+            return false
+        case .backup:
+            return true
+        case .auto:
+            return WhitelistStatusStore.activeEndpoint == .backup
+        }
+    }
+
+    private static func whitelistTransportConfigured(hasBackup: Bool) -> Bool {
+        hasBackup || whitelistModeRaw() == "vkTurn"
+    }
+
+    private static let vkTurnLastErrorKey = "tamizdat.vkTurnLastError"
+
+    private static func setVKTurnLastError(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        if trimmed.isEmpty {
+            defaults?.removeObject(forKey: vkTurnLastErrorKey)
+        } else {
+            defaults?.set(String(trimmed.prefix(240)), forKey: vkTurnLastErrorKey)
+        }
+        defaults?.synchronize()
+    }
+
+    private static func currentVKTurnLastError() -> String {
+        let groupID = "group.com.anarki.samizdat-test"
+        let defaults = UserDefaults(suiteName: groupID)
+        let stored = defaults?.string(forKey: vkTurnLastErrorKey) ?? ""
+        let runner = SocksstubTURNUpstreamLastError()
+        return runner.isEmpty ? stored : runner
     }
 
     /// Spin up the VK TURN runner if the operator selected it.
@@ -288,6 +352,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// survives the block.
     private static func attachVKTurnUpstream() {
         ExtLog.info("[vkturn] attach: entering helper")
+        setVKTurnLastError("")
 
         // Read everything from App Group UserDefaults INLINED — the
         // extension target doesn't compile against VKCredsPreferences
@@ -296,17 +361,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
         let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        // Legacy manual wgturn password. Current builds pass it only as a
+        // fallback: the Go runner prefers the active tamizdat:// shortID from
+        // SocksstubSetSamizdatConfig so TURN becomes a normal per-user
+        // Tamizdat inbound (routing/accounting/status match H2).
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let hashPrefix = String((defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").prefix(8))
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
+        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" legacyPasswordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
 
         guard !peer.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
-            return
-        }
-        guard !password.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
+            let msg = "Сервер TURN пустой. Обнови профиль с панели или открой Settings."
+            setVKTurnLastError(msg)
+            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
         }
 
@@ -314,7 +381,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // TURNCredsStore lives in main-app target.
         guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
               !credsJSON.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — no creds JSON in App Group. Открой приложение и подожди автообновление (5-минутный heartbeat) или сделай ручной refresh.")
+            let msg = "Нет VK TURN credentials. Открой приложение: комната VK должна обновиться автоматически."
+            setVKTurnLastError(msg)
+            ExtLog.warn("[vkturn] attach SKIPPED — \(msg)")
             return
         }
         ExtLog.info("[vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
@@ -353,7 +422,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let age = Date().timeIntervalSince(acquiredAt)
             ExtLog.info("[vkturn] attach: creds age=\(Int(age))s (lifetime=\(Int(lifetimeSec))s, cushion=\(Int(cushionSec))s)")
             if age >= safeBound {
-                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ \(Int(safeBound))s). Wait for refresh, then reconnect.")
+                let msg = "VK TURN credentials устарели. Открой приложение и дождись обновления комнаты."
+                setVKTurnLastError(msg)
+                ExtLog.warn("[vkturn] attach SKIPPED — \(msg) age=\(Int(age))s ≥ \(Int(safeBound))s")
                 return
             }
         } else {
@@ -366,9 +437,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
         ExtLog.info("[vkturn] attach: AFTER SocksstubStartVKTurnUpstream dur=\(durMs)ms err=\"\(err)\"")
         if !err.isEmpty {
+            setVKTurnLastError(err)
             ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
             return
         }
+        setVKTurnLastError("")
         ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
 
         Task.detached(priority: .utility) {
@@ -471,6 +544,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Phase 2D-PART-C: stop the VK TURN runner if it was attached.
         // Idempotent on the Go side — safe to call even when never started.
         SocksstubStopVKTurnUpstream()
+        let closed = SocksstubCloseAllFlows()
+        appendExtLog("info: stopTunnel force-closed \(closed) SOCKS flows before listener shutdown")
+        SocksstubStop()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
@@ -583,6 +659,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let mode = EndpointModeStore.current
         let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
         guard !blob.isEmpty else { return }
+        // Kill any stale TURN overlay synchronously BEFORE rebuilding the H2
+        // client. Waiting until after SocksstubSetSamizdatConfig leaves a
+        // window where VKTurnNetstack() still has absolute precedence in
+        // dialUpstream(), so a Main/H2 switch can keep using TURN and keep the
+        // panel badge stuck on TURN.
+        Self.stopVKTurnIfPolicyDisables(context: "rewire-pre", log: appendExtLog)
         // IPA-D22: flip the isRewiring flag so the main-app shield can
         // render "Reconnecting…" instantly. Cleared in `defer` below.
         isRewiring = true
@@ -598,6 +680,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
+            Self.applyWhitelistTransportPolicy(context: "rewire", log: self.appendExtLog)
 
             // IPA-D17: after the new client is in place, force-close
             // every loopback SOCKS5 flow that hev opened over the OLD
@@ -650,7 +733,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startWhitelistDetectorIfNeeded() {
         let mode = EndpointModeStore.current
         let hasBackup = (backupBlob != nil)
-        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(hasBackup) running=\(whitelistDetector != nil)")
+        let hasWhitelistTransport = Self.whitelistTransportConfigured(hasBackup: hasBackup)
+        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(hasBackup) whitelistMode=\(Self.whitelistModeRaw()) hasWhitelistTransport=\(hasWhitelistTransport) running=\(whitelistDetector != nil)")
         guard mode == .auto else {
             // Mode is not auto → stop if it was running, paint badge as unknown
             // so the UI doesn't keep showing a stale verdict.
@@ -662,11 +746,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             WhitelistStatusStore.current = .unknown
             return
         }
-        guard hasBackup else {
-            // Auto requested but no backup blob to fail over TO. Be loud
-            // about this — main app shows "Whitelist: monitoring..." silent
-            // forever otherwise. User must Save backup config and reconnect.
-            appendExtLog("warn: detector NOT started — auto mode requested but no backup configured (Save backup URL in Config and reconnect)")
+        guard hasWhitelistTransport else {
+            // Auto requested but no H2 backup URI and TURN mode is not selected.
+            // Be loud about this — main app shows "Whitelist: monitoring..."
+            // silent forever otherwise. User must either save backup config or
+            // switch whitelist transport to TURN.
+            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist transport configured (Save whitelist H2 URI or select TURN)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
@@ -706,6 +791,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // IPA-P: main app updated EndpointModeStore in App Group
             // UserDefaults; we re-read and rewire to the new endpoint.
             let mode = EndpointModeStore.current
+            if mode != .auto {
+                WhitelistStatusStore.activeEndpoint = mode
+            }
             appendExtLog("info: app requested endpoint switch → \(mode.rawValue)")
             // IPA-Q: also start/stop the WhitelistDetector based on
             // whether auto mode is now selected.
@@ -739,6 +827,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested whitelist probes refresh → testHost=\(WhitelistProbePreferences.testHost) whitelistHost=\(WhitelistProbePreferences.whitelistHost)")
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
+        case "refreshWhitelistTransportMode":
+            appendExtLog("info: app requested whitelist H2/TURN transport refresh")
+            startWhitelistDetectorIfNeeded()
+            rewireUpstream()
+            completionHandler?("whitelistTransportRefreshed".data(using: .utf8))
         case "refreshVKTurnCreds":
             // Main app fetched fresh VK TURN creds and wrote them to the
             // App Group. The active runner lives in THIS extension
@@ -746,6 +839,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // in the main app only touches that process' idle Go runtime.
             appendExtLog("info: app requested VK TURN creds refresh")
             let result = Self.refreshVKTurnCredsFromAppGroup()
+            if result == "not running" {
+                appendExtLog("info: VK TURN runner not running after creds refresh; re-applying transport policy")
+                Self.applyWhitelistTransportPolicy(context: "refreshVKTurnCreds", log: self.appendExtLog)
+            }
             completionHandler?(result.data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
@@ -800,6 +897,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // the Go side as a no-op fallback for now but is no
                 // longer the source of truth.
                 "hasTURNCreds": TURNCredsStore.shared.isFresh,
+                "turnError": Self.currentVKTurnLastError(),
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

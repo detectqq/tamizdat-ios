@@ -113,6 +113,12 @@ type ClientConfig struct {
 	// safe and MUST NOT panic (panics are recovered). Phase C iOS-notify
 	// pipeline — iOS NE bridges this to a local UNNotification.
 	OnNotification func(NotificationEntry)
+
+	// OnTURNProfile is invoked once per applied bundle when the server
+	// piggy-backed an operator-staged TURN room/profile update. The peer
+	// string is already derived as <current-tamizdat-host>:<wgturn_port>
+	// when wgturn_port is present.
+	OnTURNProfile func(entry TURNProfileEntry, peer string)
 }
 
 func (c *ClientConfig) applyDefaults() {
