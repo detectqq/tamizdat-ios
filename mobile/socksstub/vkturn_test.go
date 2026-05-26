@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/detectqq/tamizdat/wgturnclient"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 func TestShouldUseUDPIgnoresTurnsEndpoints(t *testing.T) {
@@ -15,6 +16,41 @@ func TestShouldUseUDPIgnoresTurnsEndpoints(t *testing.T) {
 	}
 	if shouldUseUDP(creds) {
 		t.Fatal("shouldUseUDP returned true for turns endpoint; TURNS must use TLS/TCP in this client")
+	}
+}
+
+func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
+	vkturnMu.Lock()
+	vkturnRunner = nil
+	vkturnCancel = nil
+	vkturnAttachStop = nil
+	vkturnRunning.Store(false)
+	staleNet := &netstack.Net{}
+	vkturnNet.Store(staleNet)
+	staleConfig := "stale-wg-config"
+	staleStats := `{"active":1,"running":false}`
+	staleErr := "stale-error"
+	vkturnWGConfig.Store(&staleConfig)
+	vkturnStats.Store(&staleStats)
+	vkturnErr.Store(&staleErr)
+	vkturnMu.Unlock()
+
+	StopVKTurnUpstream()
+
+	if got := vkturnNet.Load(); got != nil {
+		t.Fatalf("vkturnNet after StopVKTurnUpstream = %p, want nil", got)
+	}
+	if got := vkturnWGConfig.Load(); got != nil {
+		t.Fatalf("vkturnWGConfig after StopVKTurnUpstream = %q, want nil", *got)
+	}
+	if got := vkturnStats.Load(); got != nil {
+		t.Fatalf("vkturnStats after StopVKTurnUpstream = %q, want nil", *got)
+	}
+	if got := vkturnErr.Load(); got != nil {
+		t.Fatalf("vkturnErr after StopVKTurnUpstream = %q, want nil", *got)
+	}
+	if vkturnRunning.Load() {
+		t.Fatal("vkturnRunning after StopVKTurnUpstream = true, want false")
 	}
 }
 

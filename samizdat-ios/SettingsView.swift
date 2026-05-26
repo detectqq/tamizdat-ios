@@ -43,6 +43,10 @@ struct SettingsView: View {
     @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
     @State private var vkPeerAddrDraft: String = VKCredsPreferences.peerAddr
     @State private var vkConnectPasswordDraft: String = VKCredsPreferences.connectPassword
+    @State private var turnProvider: TURNRelayProvider = TURNRelayPreferences.provider
+    @State private var yandexTelemostDraft: String = TURNRelayPreferences.yandexLink
+    @State private var turnActivationDraft: String = ""
+    @State private var turnManualCredsDraft: String = ""
     @State private var vkCallHashFeedback: String = ""
 
     /// Debounce token for the auto-persist refresh trigger. The three
@@ -228,28 +232,64 @@ struct SettingsView: View {
                     IconCard(systemName: "phone.connection",
                              bg: theme.mintDim, fg: theme.mint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Call invite hash")
+                        Text("TURN relay")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("VK → group → call → invite link → slug after /join/")
+                        Text("Room link → credentials → live Network Extension update")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
                     Spacer()
                 }
 
-                TextField("https://vk.ru/call/join/...", text: $vkCallHashDraft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .keyboardType(.URL)
-                    .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(theme.text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
-                    .background(theme.chip)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { persistAndMaybeRefresh() }
-                    .onChange(of: vkCallHashDraft) { _, _ in persistAndMaybeRefresh() }
+                Text("Provider")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Picker("", selection: $turnProvider) {
+                    ForEach(TURNRelayProvider.allCases) { provider in
+                        Text(provider.label).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: turnProvider) { _, newValue in
+                    TURNRelayPreferences.provider = newValue
+                    vkRefreshDebounceTask?.cancel()
+                    vkCallHashFeedback = newValue == .vk ? "" : "Yandex: paste Telemost link or credentials JSON; automatic extraction is intentionally not run in-app."
+                }
+
+                if turnProvider == .vk {
+                    Text("Call invite hash")
+                        .font(.geist(.medium, size: 12))
+                        .foregroundStyle(theme.textMuted)
+                    TextField("https://vk.ru/call/join/...", text: $vkCallHashDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .keyboardType(.URL)
+                        .font(.geistMono(.regular, size: 12.5))
+                        .foregroundStyle(theme.text)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 11)
+                        .background(theme.chip)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .onSubmit { persistAndMaybeRefresh() }
+                        .onChange(of: vkCallHashDraft) { _, _ in persistAndMaybeRefresh() }
+                } else {
+                    Text("Yandex Telemost link")
+                        .font(.geist(.medium, size: 12))
+                        .foregroundStyle(theme.textMuted)
+                    TextField("https://telemost.yandex.ru/j/...", text: $yandexTelemostDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .keyboardType(.URL)
+                        .font(.geistMono(.regular, size: 12.5))
+                        .foregroundStyle(theme.text)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 11)
+                        .background(theme.chip)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .onSubmit { persistYandexLink() }
+                        .onChange(of: yandexTelemostDraft) { _, _ in persistYandexLink() }
+                }
 
                 Text("Сервер (peer)")
                     .font(.geist(.medium, size: 12))
@@ -282,14 +322,36 @@ struct SettingsView: View {
                     .onSubmit { persistAndMaybeRefresh() }
                     .onChange(of: vkConnectPasswordDraft) { _, _ in persistAndMaybeRefresh() }
 
-                // The legacy mode picker and the manual save button were
-                // both removed on the autonomous-refresh pass. Persistence
-                // happens on every `onChange`; a debounced forceRefresh
-                // fires 1 s after the last edit when all three fields are
-                // populated. The Whitelist-mode picker (H2 / TURN) in the
-                // Whitelist detection card is the single source of truth
-                // for whether VK TURN is engaged.
-                Text("Поля сохраняются автоматически. VK TURN включается, когда «Whitelist mode = TURN» в разделе Whitelist detection.")
+                Text("Activation / TURN URI")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("wgturn://host:5000?password=...&hash=...", text: $turnActivationDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { applyTURNActivation() }
+
+                Text("Manual credentials JSON / credentialed turn:// URI")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                TextField("{ username, password, turn_servers_v2, lifetime_sec }", text: $turnManualCredsDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .onSubmit { applyManualTURNCreds() }
+
+                Text("Поля сохраняются автоматически. VK refresh запускается только для VK provider. Для Yandex link/URI сохраняются и применяются human-in-loop credentials без скрытой автоматизации.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
                     .padding(.top, 4)
@@ -298,6 +360,29 @@ struct SettingsView: View {
                     Text(vkCallHashFeedback)
                         .font(.geistMono(.regular, size: 11))
                         .foregroundStyle(theme.textDim)
+                }
+
+                HStack(spacing: 8) {
+                    Button(action: applyTURNActivation) {
+                        Text("Apply URI")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.chip)
+                            .foregroundStyle(theme.text)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: applyManualTURNCreds) {
+                        Text("Apply creds")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 Button(action: clearVKHash) {
@@ -310,11 +395,6 @@ struct SettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-                // Emergency reset for the "stuck refresh" state. If a
-                // previous refresh wedged (network hang, WKWebView never
-                // completing) `isRefreshing` stays true forever and every
-                // subsequent forceRefresh just skips. This button cancels
-                // the in-flight Task and flips the flag back.
                 Button(action: resetRefreshState) {
                     Text("Reset refresh state")
                         .font(.geist(.semibold, size: 13))
@@ -353,21 +433,21 @@ struct SettingsView: View {
     /// Doesn't touch EndpointTurnMode any more — the Whitelist-mode
     /// picker (H2 / TURN) is the single source of truth.
     private func persistAndMaybeRefresh() {
+        TURNRelayPreferences.provider = turnProvider
         let peer = vkPeerAddrDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         VKCredsPreferences.peerAddr = peer
         VKCredsPreferences.connectPassword = vkConnectPasswordDraft
 
-        let hash = Self.normalizeVKHash(vkCallHashDraft)
-        VKCredsPreferences.primaryCallHash = hash
-
-        // Re-sync drafts if normalisation changed them — but only when
-        // the user has paused typing, otherwise we fight against their
-        // edit position. Detect "paused" by deferring the rewrite to
-        // after the debounce timer fires.
-
-        // Cancel any pending debounce.
         vkRefreshDebounceTask?.cancel()
         vkCallHashFeedback = ""
+
+        guard turnProvider == .vk else {
+            persistYandexLink()
+            return
+        }
+
+        let hash = Self.normalizeVKHash(vkCallHashDraft)
+        VKCredsPreferences.primaryCallHash = hash
 
         // Only fire the refresh once all three fields are populated.
         let allFilled = !hash.isEmpty && !peer.isEmpty && !vkConnectPasswordDraft.isEmpty
@@ -391,10 +471,76 @@ struct SettingsView: View {
         }
     }
 
+    private func persistYandexLink() {
+        TURNRelayPreferences.provider = turnProvider
+        TURNRelayPreferences.yandexLink = yandexTelemostDraft
+        VKCredsPreferences.peerAddr = vkPeerAddrDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        VKCredsPreferences.connectPassword = vkConnectPasswordDraft
+    }
+
+    private func applyTURNActivation() {
+        let cfg = TURNActivationParser.parse(turnActivationDraft)
+        var changed = false
+        if let provider = cfg.provider {
+            turnProvider = provider
+            TURNRelayPreferences.provider = provider
+            changed = true
+        }
+        if let peer = cfg.peer {
+            vkPeerAddrDraft = peer
+            VKCredsPreferences.peerAddr = peer
+            changed = true
+        }
+        if let password = cfg.password {
+            vkConnectPasswordDraft = password
+            VKCredsPreferences.connectPassword = password
+            changed = true
+        }
+        if let hash = cfg.vkCallHash {
+            turnProvider = .vk
+            TURNRelayPreferences.provider = .vk
+            vkCallHashDraft = hash
+            VKCredsPreferences.primaryCallHash = hash
+            changed = true
+        }
+        if let yandex = cfg.yandexLink {
+            turnProvider = .yandex
+            TURNRelayPreferences.provider = .yandex
+            yandexTelemostDraft = yandex
+            TURNRelayPreferences.yandexLink = yandex
+            changed = true
+        }
+        vkCallHashFeedback = changed ? "URI применён" : "URI не распознан"
+        persistAndMaybeRefresh()
+    }
+
+    private func applyManualTURNCreds() {
+        guard let creds = TURNCredentialParser.parse(turnManualCredsDraft) else {
+            vkCallHashFeedback = "Не удалось разобрать credentials JSON / turn:// URI"
+            return
+        }
+        TURNCredsStore.shared.save(creds)
+        let credsJSON = vkCredsAsJSON(creds: creds)
+        let local = SamizdatBridge.updateVKTurnCreds(credsJSON)
+        Task { @MainActor in
+            let ext = await VPNProfileStore.shared.refreshVKTurnCreds()
+            if ext == "ok" || ext.isEmpty || ext == "not running" {
+                let detail = ext.isEmpty ? "extension not running" : ext
+                vkCallHashFeedback = "TURN credentials сохранены; live update: \(detail); local=\(local)"
+            } else {
+                vkCallHashFeedback = "TURN credentials сохранены; extension update: \(ext); local=\(local)"
+            }
+        }
+    }
+
     private func clearVKHash() {
         vkRefreshDebounceTask?.cancel()
         VKCredsPreferences.primaryCallHash = ""
+        TURNRelayPreferences.yandexLink = ""
         vkCallHashDraft = ""
+        yandexTelemostDraft = ""
+        turnActivationDraft = ""
+        turnManualCredsDraft = ""
         vkCallHashFeedback = "Очищено"
         TURNCredsStore.shared.clear()
     }

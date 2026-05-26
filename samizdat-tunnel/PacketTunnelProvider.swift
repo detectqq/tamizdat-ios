@@ -471,6 +471,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Phase 2D-PART-C: stop the VK TURN runner if it was attached.
         // Idempotent on the Go side — safe to call even when never started.
         SocksstubStopVKTurnUpstream()
+        let closed = SocksstubCloseAllFlows()
+        appendExtLog("info: stopTunnel force-closed \(closed) SOCKS flows before listener shutdown")
+        SocksstubStop()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil

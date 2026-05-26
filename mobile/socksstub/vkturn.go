@@ -196,7 +196,8 @@ func StopVKTurnUpstream() {
 	vkturnMu.Lock()
 	defer vkturnMu.Unlock()
 
-	if !vkturnRunning.Load() {
+	if !vkturnRunning.Load() && vkturnRunner == nil && vkturnAttachStop == nil {
+		resetVKTurnAtomicsLocked()
 		return
 	}
 	if vkturnCancel != nil {
@@ -377,6 +378,7 @@ func resetVKTurnAtomicsLocked() {
 	vkturnWGConfig.Store(nil)
 	vkturnStats.Store(nil)
 	vkturnErr.Store(nil)
+	vkturnNet.Store(nil)
 	vkturnRunning.Store(false)
 }
 

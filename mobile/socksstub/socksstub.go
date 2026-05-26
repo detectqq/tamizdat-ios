@@ -109,7 +109,7 @@ type runtimeState struct {
 	// before re-calling SocksstubSetSamizdatConfig with the same blob.
 	// When variant is "v1" we also flip StrictSingleH2=true to match
 	// Windows-GUI behaviour ("V1 radio engages strict-single-h2").
-	poolVariant      atomic.Value // string
+	poolVariant atomic.Value // string
 }
 
 var rt = &runtimeState{logsMax: 500}
@@ -309,22 +309,34 @@ func Stop() {
 	ln := rt.listener
 	cancel := rt.cancel
 	path := rt.socketPath
+	oldClient := rt.samizdatClient
 	rt.listener = nil
 	rt.cancel = nil
 	rt.ctx = nil
+	rt.samizdatBlob = ""
+	rt.samizdatClient = nil
 	rt.mu.Unlock()
+
+	// Stop the TURN overlay first so VK/Yandex netstack precedence cannot
+	// leak into the next plain H2 start after a failed manual TURN attempt.
+	StopVKTurnUpstream()
 	if cancel != nil {
 		cancel()
 	}
 	if ln != nil {
 		_ = ln.Close()
 	}
+	closed := CloseAllFlows()
+	stopPingProber()
+	if oldClient != nil {
+		_ = oldClient.Close()
+	}
 	// Remove only if it looks like a UDS path (TCP "127.0.0.1:1080"
 	// would not be a valid path).
 	if path != "" && len(path) > 0 && path[0] == '/' {
 		_ = os.Remove(path)
 	}
-	rt.appendLog("info: socks listener stopped")
+	rt.appendLog(fmt.Sprintf("info: socks listener stopped; closed %d flows", closed))
 }
 
 // Status returns "stopped" or "listening".
@@ -1111,11 +1123,15 @@ func (a *connectedNetConnUDPAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
 func (a *connectedNetConnUDPAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return a.conn.Write(p)
 }
-func (a *connectedNetConnUDPAdapter) Close() error                       { return a.conn.Close() }
-func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr                { return a.conn.LocalAddr() }
-func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error      { return a.conn.SetDeadline(t) }
-func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
-func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
+func (a *connectedNetConnUDPAdapter) Close() error                  { return a.conn.Close() }
+func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr           { return a.conn.LocalAddr() }
+func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error { return a.conn.SetDeadline(t) }
+func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error {
+	return a.conn.SetReadDeadline(t)
+}
+func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error {
+	return a.conn.SetWriteDeadline(t)
+}
 
 // connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
 // net.PacketConn with the connected peer as the constant remote addr.
