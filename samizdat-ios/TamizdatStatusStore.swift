@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-import SamizdatClient   // IPA-D25 fix7: for SocksstubNoteForegroundPoll()
 
 /// IPA-Z: live tunnel-shape + RTT view-model for the main-screen lamp.
 ///
@@ -78,6 +77,17 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// being torn down + rebuilt after a path change). The shield flips
     /// to amber "Reconnecting…" during this window. 0 otherwise.
     let isRewiring: Int
+    /// Extension-side rewire generation, useful for proving which
+    /// endpoint/transport transition won.
+    let rewireGeneration: Int
+    /// Ground-truth extension mode/policy fields. UI preferences alone are
+    /// not enough to prove where traffic is actually going.
+    let endpointMode: String
+    let effectiveEndpoint: String
+    let desiredUpstream: String
+    let upstreamKind: String
+    let turnRunning: Int
+    let turnNetstackReady: Int
 
     /// VK TURN relay credentials available from the server.
     let hasTURNCreds: Bool
@@ -87,6 +97,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         rttLiteMs: -1, rttBulkMs: -1,
         pingMs: -1, pingOK: false, pingFailed: false, pingURL: "",
         rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
+        rewireGeneration: 0, endpointMode: "primary", effectiveEndpoint: "primary",
+        desiredUpstream: "h2", upstreamKind: "h2", turnRunning: 0, turnNetstackReady: 0,
         hasTURNCreds: false
     )
 
@@ -99,6 +111,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case realShape, lockedFlows, liteAlive, rttLiteMs, rttBulkMs
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
+        case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
+        case turnRunning, turnNetstackReady
         case hasTURNCreds
     }
 
@@ -106,6 +120,13 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          rttLiteMs: Int, rttBulkMs: Int,
          pingMs: Int, pingOK: Bool, pingFailed: Bool, pingURL: String,
          rxBytes: Int64, txBytes: Int64, uptimeSec: Int64, isRewiring: Int,
+         rewireGeneration: Int = 0,
+         endpointMode: String = "primary",
+         effectiveEndpoint: String = "primary",
+         desiredUpstream: String = "h2",
+         upstreamKind: String = "h2",
+         turnRunning: Int = 0,
+         turnNetstackReady: Int = 0,
          hasTURNCreds: Bool = false) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
@@ -120,6 +141,13 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.txBytes = txBytes
         self.uptimeSec = uptimeSec
         self.isRewiring = isRewiring
+        self.rewireGeneration = rewireGeneration
+        self.endpointMode = endpointMode
+        self.effectiveEndpoint = effectiveEndpoint
+        self.desiredUpstream = desiredUpstream
+        self.upstreamKind = upstreamKind
+        self.turnRunning = turnRunning
+        self.turnNetstackReady = turnNetstackReady
         self.hasTURNCreds = hasTURNCreds
     }
 
@@ -136,9 +164,16 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.pingURL     = (try? c.decode(String.self, forKey: .pingURL))     ?? ""
         self.rxBytes     = (try? c.decode(Int64.self,  forKey: .rxBytes))     ?? 0
         self.txBytes     = (try? c.decode(Int64.self,  forKey: .txBytes))     ?? 0
-        self.uptimeSec   = (try? c.decode(Int64.self,  forKey: .uptimeSec))   ?? 0
-        self.isRewiring  = (try? c.decode(Int.self,    forKey: .isRewiring))  ?? 0
-        self.hasTURNCreds = (try? c.decode(Bool.self,  forKey: .hasTURNCreds)) ?? false
+        self.uptimeSec   = (try? c.decode(Int64.self, forKey: .uptimeSec))   ?? 0
+        self.isRewiring  = (try? c.decode(Int.self,   forKey: .isRewiring))  ?? 0
+        self.rewireGeneration = (try? c.decode(Int.self, forKey: .rewireGeneration)) ?? 0
+        self.endpointMode = (try? c.decode(String.self, forKey: .endpointMode)) ?? "primary"
+        self.effectiveEndpoint = (try? c.decode(String.self, forKey: .effectiveEndpoint)) ?? "primary"
+        self.desiredUpstream = (try? c.decode(String.self, forKey: .desiredUpstream)) ?? "h2"
+        self.upstreamKind = (try? c.decode(String.self, forKey: .upstreamKind)) ?? "h2"
+        self.turnRunning = (try? c.decode(Int.self, forKey: .turnRunning)) ?? 0
+        self.turnNetstackReady = (try? c.decode(Int.self, forKey: .turnNetstackReady)) ?? 0
+        self.hasTURNCreds = (try? c.decode(Bool.self, forKey: .hasTURNCreds)) ?? false
     }
 }
 
@@ -181,12 +216,11 @@ final class TamizdatStatusStore: ObservableObject {
     /// the VPN is offline.
     @Published private(set) var turnCredsValid: Bool = TURNCredsStore.shared.isFresh
 
-    /// Phase 2D-PART-C: true when the in-process VK TURN runner
-    /// (mobile/socksstub/vkturn.go) reports itself alive. The runner
-    /// lives in the EXTENSION process, not the main app, so this
-    /// always returns false in the main app — wire it up here so a
-    /// future RPC field can light up the home-screen TURN tile.
-    var turnUpstreamRunning: Bool { SocksstubTURNUpstreamRunning() }
+    /// Extension-ground-truth TURN runner state from the status RPC.
+    /// Main-app gomobile calls hit a separate idle Go runtime, so never
+    /// read SocksstubTURNUpstreamRunning() here.
+    var turnUpstreamRunning: Bool { snapshot.turnRunning != 0 }
+    var turnNetstackReady: Bool { snapshot.turnNetstackReady != 0 }
 
     /// Pollling cadence. 500 ms is the same value sing-box-for-apple
     /// uses for its connection-stat polling. Drop to 250 ms or lower
@@ -244,15 +278,6 @@ final class TamizdatStatusStore: ObservableObject {
     }
 
     private func poll() async {
-        // IPA-D25 fix7: foreground heartbeat to the Go-side ping
-        // prober. Every status poll tells the extension "user is
-        // watching" so the prober speeds up to 3s cadence. After
-        // the heartbeat goes stale (>5s), prober slows to 30s.
-        // This poll only runs while the view is visible (.onAppear /
-        // .onDisappear lifecycle), so backgrounding the app stops
-        // the heartbeat naturally.
-        SocksstubNoteForegroundPoll()
-
         let result = await VPNProfileStore.shared.fetchTamizdatStatus()
         // Avoid re-publishing identical snapshots — saves SwiftUI
         // re-render work when nothing changed.

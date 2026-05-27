@@ -97,6 +97,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var primaryBlob: String = ""
     private var backupBlob: String?
 
+    private enum EffectiveUpstream: String {
+        case h2
+        case turn
+    }
+
+    private struct UpstreamPolicy {
+        let endpointMode: EndpointMode
+        let effectiveEndpoint: EndpointMode
+        let whitelistModeRaw: String
+        let upstream: EffectiveUpstream
+
+        var usesTURN: Bool { upstream == .turn }
+    }
+
+    private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
+    private let rewireGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
+    private var rewireGeneration: Int {
+        get { rewireGenerationLock.withLock { $0 } }
+        set { rewireGenerationLock.withLock { $0 = newValue } }
+    }
+
     // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
     // that flips to backup when TSPU whitelist mode is detected and
     // back to primary when it lifts.
@@ -142,14 +163,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.backupBlob = split.backup
         let mode = EndpointModeStore.current
         let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
-        appendExtLog("info: endpoint mode = \(mode.rawValue) (backup configured: \(split.backup != nil))")
+        let policy = Self.upstreamPolicy(mode: mode, backup: split.backup)
+        appendExtLog("info: endpoint mode = \(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue) (backup configured: \(split.backup != nil))")
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
         // of the loopback bridge live in this extension, so there is no
         // cross-process sandbox issue and the listener can never get
         // host-app-suspended out from under us.
         appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: activeBlob, log: appendExtLog) {
+        if !Self.startInProcessSocks(configBlob: activeBlob, policy: policy, log: appendExtLog) {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
@@ -185,7 +207,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
     /// run inside this extension process. Returns true on success.
-    private static func startInProcessSocks(configBlob: String, log: @escaping (String) -> Void) -> Bool {
+    private static func startInProcessSocks(configBlob: String, policy: UpstreamPolicy, log: @escaping (String) -> Void) -> Bool {
         // Mirror Go-shim logs to the App Group file so the bridge sees them
         // alongside extension logs.
         if let containerURL = FileManager.default.containerURL(
@@ -231,42 +253,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return false
         }
 
-        // Phase 2D-PART-C: attach VK TURN upstream when the operator
-        // selected "Whitelist mode = TURN" in Settings.
-        //
-        // Static helper because startInProcessSocks itself is static —
-        // it has no `self`, only the log closure threaded through from
-        // the instance-level caller. Failure paths log + fall through
-        // silently so the hev tunnel still serves traffic.
-        //
-        // WhitelistMode is the single source of truth (the picker the
-        // operator actually touches). EndpointTurnMode was a separate
-        // legacy store that we used to read here, but the two could
-        // drift out of sync — when WhitelistMode flipped to .vkTurn
-        // via UserDefaults from another process, EndpointTurnMode
-        // stayed at .off and attach silently skipped. Read the picker
-        // store directly to remove that whole class of bug.
-        //
-        // Inlined because WhitelistMode.swift lives in the main-app
-        // target, not in samizdat-tunnel; the enum's storage key is
-        // copy-pasted from `samizdat-ios/WhitelistMode.swift` and
-        // MUST stay in sync. (TODO: lift WhitelistMode into a shared
-        // sources directory listed by both targets in project.yml.)
-        let appGroupID = "group.com.anarki.samizdat-test"
-        let appGroupDefaults = UserDefaults(suiteName: appGroupID)
-        let whitelistModeRaw = appGroupDefaults?
-            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
-        log("info: [vkturn] WhitelistMode read = \"\(whitelistModeRaw)\" (defaults nil = \(appGroupDefaults == nil))")
-        ExtLog.info("[vkturn] WhitelistMode read = \"\(whitelistModeRaw)\"")
-        if whitelistModeRaw == "vkTurn" {
-            log("info: [vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            ExtLog.info("[vkturn] WhitelistMode=vkTurn → calling attachVKTurnUpstream")
+        // TURN/H2 policy is derived from the effective endpoint, not from
+        // WhitelistMode alone. WhitelistMode.vkTurn only applies when the
+        // effective endpoint is the backup/Whitelist endpoint; Main always
+        // uses H2 and must clear any stale VK TURN netstack before flows
+        // reconnect.
+        log("info: [vkturn] upstream policy mode=\(policy.endpointMode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw) desired=\(policy.upstream.rawValue)")
+        ExtLog.info("[vkturn] upstream policy mode=\(policy.endpointMode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw) desired=\(policy.upstream.rawValue)")
+        if policy.usesTURN {
+            log("info: [vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
+            ExtLog.info("[vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
             Self.attachVKTurnUpstream()
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
-            log("info: [vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
-            ExtLog.info("[vkturn] VK TURN not engaged — Whitelist mode must be TURN (currently \(whitelistModeRaw))")
+            SocksstubStopVKTurnUpstream()
+            log("info: [vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
+            ExtLog.info("[vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
         }
         return true
     }
@@ -298,8 +301,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
-        let hashPrefix = String((defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").prefix(8))
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
+        let hashLen = (defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").count
+        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) hashLen=\(hashLen)")
 
         guard !peer.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — H2 tamizdat:// server not mirrored yet. Open Settings → Proxies and save a Whitelist H2 URI (or Main URI fallback).")
@@ -380,7 +383,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let wg = SocksstubTURNUpstreamWGConfig()
                 let running = SocksstubTURNUpstreamRunning()
                 if !wg.isEmpty {
-                    ExtLog.info("[vkturn] WG config received after \(attempts*250)ms:\n\(wg)")
+                    ExtLog.info("[vkturn] WG config received after \(attempts*250)ms (\(wg.count) chars; content redacted)")
                     ExtLog.info("[vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
                     return
                 }
@@ -589,46 +592,89 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// default interface. The SOCKS5 listener itself stays up, so hev
     /// can keep using 127.0.0.1:\(socksPort) without restart.
     private func rewireUpstream() {
-        let mode = EndpointModeStore.current
-        let blob = Self.pick(mode: mode, primary: primaryBlob, backup: backupBlob)
-        guard !blob.isEmpty else { return }
-        // IPA-D22: flip the isRewiring flag so the main-app shield can
-        // render "Reconnecting…" instantly. Cleared in `defer` below.
+        let generation = nextRewireGeneration()
         isRewiring = true
-        // Run off the path monitor queue to avoid serializing further
-        // updates while we sit inside Go-side teardown.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        appendExtLog("info: rewire gen=\(generation) queued")
+
+        rewireQueue.async { [weak self] in
             guard let self else { return }
-            defer { self.isRewiring = false }
+            let mode = EndpointModeStore.current
+            let policy = Self.upstreamPolicy(mode: mode, backup: self.backupBlob)
+            let blob = Self.pick(mode: mode, primary: self.primaryBlob, backup: self.backupBlob)
+            guard !blob.isEmpty else {
+                self.appendExtLog("warn: rewire gen=\(generation) skipped — empty config blob")
+                self.finishRewireGeneration(generation)
+                return
+            }
+
+            self.appendExtLog("info: rewire gen=\(generation) start mode=\(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue)")
+
+            // Main/H2 must win over any stale VK TURN netstack before the
+            // Go bridge starts accepting fresh flows. Go dialUpstream()
+            // prefers VKTurnNetstack() whenever it is non-nil.
+            if !policy.usesTURN {
+                SocksstubStopVKTurnUpstream()
+            }
+
             var err: NSError?
             SocksstubSetSamizdatConfig(blob, &err)
             if let err {
-                self.appendExtLog("error: rewire SetSamizdatConfig: \(err.localizedDescription)")
+                self.appendExtLog("error: rewire gen=\(generation) SetSamizdatConfig: \(err.localizedDescription)")
+                self.finishRewireGeneration(generation)
                 return
             }
-            self.appendExtLog("info: rewire ok (mode=\(mode.rawValue)) — fresh samizdat client warmed")
 
-            // IPA-D17: after the new client is in place, force-close
-            // every loopback SOCKS5 flow that hev opened over the OLD
-            // path. Apps see RST → reconnect immediately on the fresh
-            // client, instead of hanging on dead H/2 streams until
-            // per-stream read timeout (~30-60 s).
-            //
-            // Order matters: swap first, close flows second. Otherwise
-            // the close would race with retries that have nowhere to go.
-            //
-            // Reference patterns:
-            //   sing-box-for-apple: onUpdateDefaultInterface in libbox
-            //     causes the route NetworkManager to flush per-flow
-            //     DefaultMarker, propagating EOF to in-flight conns.
-            //   Shadowrocket: -[DLWPacketTunnelProvider closeAllTunnels]
-            //     (Ghidra @ 0x1000e43f4) walks 7 tunnel singletons.
-            //
-            // Our equivalent is the single SocksstubCloseAllFlows() over
-            // the unified flowRegistry — same effect, less ceremony.
+            if policy.usesTURN {
+                Self.attachVKTurnUpstream()
+            }
+
+            self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
+
+            // IPA-D17: after the new upstream policy is in place,
+            // force-close every loopback SOCKS5 flow that hev opened over
+            // the OLD path. Apps see RST → reconnect immediately on the
+            // fresh H2 or TURN path instead of hanging on dead streams.
             let closed = SocksstubCloseAllFlows()
-            self.appendExtLog("info: rewire force-closed \(closed) stale flows")
+            self.appendExtLog("info: rewire gen=\(generation) force-closed \(closed) stale flows")
+            self.finishRewireGeneration(generation)
         }
+    }
+
+    private func nextRewireGeneration() -> Int {
+        rewireGenerationLock.withLock {
+            $0 += 1
+            return $0
+        }
+    }
+
+    private func finishRewireGeneration(_ generation: Int) {
+        if rewireGeneration == generation {
+            isRewiring = false
+        }
+    }
+
+    private static func whitelistModeRaw() -> String {
+        UserDefaults(suiteName: appGroupID)?
+            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+    }
+
+    private static func effectiveEndpoint(mode: EndpointMode, backup: String?) -> EndpointMode {
+        switch mode {
+        case .primary:
+            return .primary
+        case .backup:
+            return backup == nil ? .primary : .backup
+        case .auto:
+            guard backup != nil else { return .primary }
+            return WhitelistStatusStore.activeEndpoint == .backup ? .backup : .primary
+        }
+    }
+
+    private static func upstreamPolicy(mode: EndpointMode, backup: String?) -> UpstreamPolicy {
+        let effective = effectiveEndpoint(mode: mode, backup: backup)
+        let whitelist = whitelistModeRaw()
+        let upstream: EffectiveUpstream = (effective == .backup && whitelist == "vkTurn") ? .turn : .h2
+        return UpstreamPolicy(endpointMode: mode, effectiveEndpoint: effective, whitelistModeRaw: whitelist, upstream: upstream)
     }
 
     /// Picks the appropriate blob for a given mode. In manual modes
@@ -754,22 +800,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // process, so update it here; calling the gomobile bridge
             // in the main app only touches that process' idle Go runtime.
             appendExtLog("info: app requested VK TURN creds refresh")
+            let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+            guard policy.usesTURN else {
+                SocksstubStopVKTurnUpstream()
+                appendExtLog("info: VK TURN creds refresh ignored by policy — effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw), H2 active")
+                completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
+                return
+            }
+
             let result = Self.refreshVKTurnCredsFromAppGroup()
             if result == "not running" {
                 // If the tunnel started before VK creds existed,
                 // attachVKTurnUpstream() skipped. A later successful
-                // refresh should start the runner immediately instead
-                // of waiting for a reconnect.
-                let groupID = "group.com.anarki.samizdat-test"
-                let mode = UserDefaults(suiteName: groupID)?
-                    .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
-                if mode == "vkTurn" {
-                    appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                    Self.attachVKTurnUpstream()
-                    completionHandler?("attachStarted".data(using: .utf8))
-                } else {
-                    completionHandler?(result.data(using: .utf8))
-                }
+                // refresh should start the runner immediately, but only
+                // while the effective endpoint is Whitelist+TURN.
+                appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
+                Self.attachVKTurnUpstream()
+                completionHandler?("attachStarted".data(using: .utf8))
             } else {
                 completionHandler?(result.data(using: .utf8))
             }
@@ -785,6 +832,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // now uses the ping snapshot fields. Old fields will be
             // dropped in a future cleanup commit once the v0.2.D21 IPA is
             // rolled out and no skewed clients remain in the wild.
+            SocksstubNoteForegroundPoll()
             let pingSnap = SocksstubPingProbeSnapshot()
             // IPA-D22: include hev cumulative byte counters + uptime so
             // the main-app Data + Uptime stat tiles can render without
@@ -801,6 +849,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 uptime = 0
             }
+            let mode = EndpointModeStore.current
+            let policy = Self.upstreamPolicy(mode: mode, backup: backupBlob)
+            let turnRunning = SocksstubTURNUpstreamRunning()
+            let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
+            let actualUpstream = turnNetstackReady ? "turn" : "h2"
             let payload: [String: Any] = [
                 "realShape":   SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
@@ -817,6 +870,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "txBytes":     Int64(tx_bytes),
                 "uptimeSec":   uptime,
                 "isRewiring":  self.isRewiring ? 1 : 0,
+                "rewireGeneration": self.rewireGeneration,
+                "endpointMode": mode.rawValue,
+                "effectiveEndpoint": policy.effectiveEndpoint.rawValue,
+                "desiredUpstream": policy.upstream.rawValue,
+                "upstreamKind": actualUpstream,
+                "turnRunning": turnRunning ? 1 : 0,
+                "turnNetstackReady": turnNetstackReady ? 1 : 0,
                 // VK TURN relay credential status. IPA-D65b: the main
                 // app now acquires creds itself via WKWebView captcha
                 // solving and writes them to App Group UserDefaults

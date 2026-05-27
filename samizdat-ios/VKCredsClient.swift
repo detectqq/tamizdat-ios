@@ -544,7 +544,7 @@ actor VKCredsClient {
         }
         TURNLog.info("vkcreds", "step 5 ok — turn_server received")
         let creds = try Self.parseTurnBlock(turnBlock)
-        TURNLog.info("vkcreds", "creds JSON: \(vkCredsAsJSON(creds: creds))")
+        TURNLog.info("vkcreds", "creds ready: \(vkCredsLogSummary(creds: creds))")
         return creds
     }
 

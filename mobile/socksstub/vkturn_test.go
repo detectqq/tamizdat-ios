@@ -2,10 +2,32 @@ package socksstub
 
 import (
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/detectqq/tamizdat/wgturnclient"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
+
+func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
+	vkturnMu.Lock()
+	vkturnRunner = nil
+	vkturnCancel = nil
+	vkturnAttachStop = nil
+	vkturnAttachOnce = sync.Once{}
+	vkturnRunning.Store(false)
+	vkturnNet.Store(&netstack.Net{})
+	vkturnWGConfig.Store(nil)
+	vkturnStats.Store(nil)
+	vkturnErr.Store(nil)
+	vkturnMu.Unlock()
+
+	StopVKTurnUpstream()
+
+	if got := VKTurnNetstack(); got != nil {
+		t.Fatalf("VKTurnNetstack() after StopVKTurnUpstream with running=false = %p, want nil", got)
+	}
+}
 
 func TestShouldUseUDPIgnoresTurnsEndpoints(t *testing.T) {
 	creds := &wgturnclient.Credentials{

@@ -119,6 +119,16 @@ jobs:
               <<< "$(security cms -D -i "$p")"
           done
 
+      - name: Compute versioned IPA name
+        id: ipa_name
+        # Match the operator's milestone naming convention exactly and
+        # bake the same filename into Info.plist for the main-screen label.
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Artifact will be: ${NAME}.ipa"
+
       - name: Archive
         run: |
           set -o pipefail
@@ -128,7 +138,8 @@ jobs:
           GIT_SHA=$(git rev-parse --short HEAD)
           MARKETING="0.2.${GITHUB_RUN_NUMBER}-${GIT_SHA}"
           BUILD_NUM="${GITHUB_RUN_NUMBER}"
-          echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM"
+          IPA_ARTIFACT_NAME="${{ steps.ipa_name.outputs.name }}.ipa"
+          echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM IPA_ARTIFACT_NAME=$IPA_ARTIFACT_NAME"
           xcodebuild archive \
             -project samizdat-ios.xcodeproj \
             -scheme "$SCHEME" \
@@ -140,6 +151,7 @@ jobs:
             CODE_SIGN_IDENTITY="Apple Distribution" \
             MARKETING_VERSION="$MARKETING" \
             CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            IPA_ARTIFACT_NAME="$IPA_ARTIFACT_NAME" \
             | xcpretty
 
       - name: Export IPA
@@ -176,19 +188,11 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/tunnel-profile.plist
           rm -rf _inspect
 
-      - name: Compute versioned IPA name
-        id: ipa_name
-        # Match the operator's existing milestone naming convention
-        # (e.g. `Tamizdat-0.2.219-a511029-build-219.ipa`) so downloaded
-        # artifacts can be moved straight into the `samizdat-ios/ipa/
-        # milestones/` archive without renaming. Bundle MARKETING_VERSION
-        # is `0.2.<run>-<sha7>` per the Archive step above.
+      - name: Copy versioned IPA filename
         run: |
-          SHORT_SHA=${GITHUB_SHA:0:7}
-          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-          echo "Artifact will be: ${NAME}"
+          NAME="${{ steps.ipa_name.outputs.name }}"
           cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+          ls -la "${{ env.EXPORT_PATH }}/${NAME}.ipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4

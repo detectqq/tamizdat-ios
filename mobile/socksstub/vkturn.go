@@ -165,14 +165,14 @@ func UpdateVKTurnCreds(credsJSON string) string {
 	return ""
 }
 
-// StopVKTurnUpstream stops the in-flight runner. Idempotent.
+// StopVKTurnUpstream stops the in-flight runner and clears any stale
+// userspace-WireGuard netstack. It is intentionally idempotent: a prior
+// runner can leave vkturnRunning=false while vkturnNet is still non-nil,
+// and dialUpstream gives that netstack priority over H2.
 func StopVKTurnUpstream() {
 	vkturnMu.Lock()
 	defer vkturnMu.Unlock()
 
-	if !vkturnRunning.Load() {
-		return
-	}
 	if vkturnCancel != nil {
 		vkturnCancel()
 	}

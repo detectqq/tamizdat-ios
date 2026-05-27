@@ -64,9 +64,6 @@ struct ContentView: View {
         return SamizdatURLCodec.split(blob).backup != nil
     }
 
-    /// IPA milestone tag rendered in the build caption.
-    private static let milestoneTag = "D66-VKTURN"
-
     // MARK: – Derived state
 
     /// 6-state derivation. Order of precedence:
@@ -411,7 +408,7 @@ struct ContentView: View {
     private var statTiles: some View {
         HStack(spacing: 8) {
             StatTile(label: "Mode",
-                     value: TamizdatStatusStore.modeLabel(active: effectiveEndpoint),
+                     value: modeTileValue,
                      unit: nil)
             StatTile(label: "Uptime",
                      value: lampStore.uptimeText,
@@ -425,13 +422,37 @@ struct ContentView: View {
         }
     }
 
-    /// TURN tile glyph based on three states:
-    ///   "▲" — upstream runner alive (creds + lifecycle attached)
+    /// Mode tile uses extension status ground truth while the tunnel is
+    /// online. Local EndpointMode/UserDefaults are only a fallback before
+    /// the Network Extension has replied.
+    private var modeTileValue: String {
+        let snap = lampStore.snapshot
+        if !snap.realShape.isEmpty {
+            if snap.upstreamKind == "turn" {
+                return "TURN"
+            }
+            if snap.desiredUpstream == "turn" {
+                return "TURN…"
+            }
+            if snap.effectiveEndpoint == EndpointMode.backup.rawValue {
+                return "Whitelist"
+            }
+            return "Main"
+        }
+        return TamizdatStatusStore.modeLabel(active: effectiveEndpoint)
+    }
+
+    /// TURN tile glyph based on four states:
+    ///   "▲" — TURN netstack ready and routing can use it
+    ///   "…" — runner alive, waiting for WG config/netstack
     ///   "✓" — creds cached but not actively used
     ///   "—" — no creds, no upstream
     private var turnTileValue: String {
-        if lampStore.turnUpstreamRunning {
+        if lampStore.turnNetstackReady {
             return "▲"
+        }
+        if lampStore.turnUpstreamRunning {
+            return "…"
         }
         if lampStore.turnCredsValid || lampStore.snapshot.hasTURNCreds {
             return "✓"
@@ -625,7 +646,7 @@ struct ContentView: View {
     // MARK: – Build caption
 
     private var buildCaption: some View {
-        Text(buildLabel.uppercased())
+        Text(buildLabel)
             .font(.geistMono(.semibold, size: 10.5))
             .tracking(0.42)
             .foregroundStyle(theme.textMuted)
@@ -633,9 +654,14 @@ struct ContentView: View {
 
     private var buildLabel: String {
         let info = Bundle.main.infoDictionary
+        if let ipaName = info?["IPAArtifactName"] as? String,
+           !ipaName.isEmpty,
+           !ipaName.contains("$(") {
+            return ipaName
+        }
         let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "Tamizdat · v\(marketing) (build \(build)) · IPA-\(Self.milestoneTag)"
+        return "Tamizdat-\(marketing)-build-\(build).ipa"
     }
 
     // MARK: – Actions

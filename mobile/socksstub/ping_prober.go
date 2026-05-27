@@ -54,8 +54,8 @@ const (
 	// foreground (signalled by its 500ms status-RPC heartbeat), probe
 	// every 3s so the UI feels live. When backgrounded (no heartbeat
 	// for >5s), drop to 30s for battery — user can't see it anyway.
-	pingProbeIntervalFG = 3 * time.Second
-	pingProbeIntervalBG = 30 * time.Second
+	pingProbeIntervalFG  = 3 * time.Second
+	pingProbeIntervalBG  = 30 * time.Second
 	foregroundStaleAfter = 5 * time.Second
 	// IPA-D28 fix: steady-state back to 3s per operator request — TLS
 	// to upstream is already established at this point, so probes only
@@ -64,19 +64,20 @@ const (
 	// to absorb cold TLS handshake to upstream.
 	pingProbeTimeout      = 3 * time.Second
 	pingProbeTimeoutFirst = 5 * time.Second
-	pingFailedThreshold = 2 // consecutive misses to enter Failed state
+	pingFailedThreshold   = 2 // consecutive misses to enter Failed state
 )
 
 // lastForegroundPollAtNanos is bumped to time.Now().UnixNano() every
-// time Swift calls NoteForegroundPoll (= every status-RPC tick while
-// the user is watching the screen). The prober loop checks this to
-// decide its cadence.
+// time the extension handles a foreground status RPC. The prober loop
+// checks this to decide its cadence.
 var lastForegroundPollAtNanos atomic.Int64
 
 // NoteForegroundPoll is the foreground heartbeat from Swift. Called
-// once per 500ms status RPC fetch in TamizdatStatusStore.poll(). The
-// ping prober uses this to switch between fast (foreground) and slow
-// (background) cadence.
+// once per 500ms status RPC fetch while the main screen is visible.
+// PacketTunnelProvider handles the provider message in the extension
+// process, so the heartbeat updates the same Go runtime that owns the
+// ping prober. The ping prober uses this to switch between fast
+// (foreground) and slow (background) cadence.
 //
 // Exported for gomobile binding as SocksstubNoteForegroundPoll().
 func NoteForegroundPoll() {
@@ -107,10 +108,10 @@ type pingProberState struct {
 }
 
 var (
-	proberMu      sync.Mutex
-	proberCancel  context.CancelFunc // cancels the current goroutine; nil if no prober running
-	proberURL     atomic.Value       // string — current probe URL (set on init, updated by SetPingProbeURL)
-	proberState   = &pingProberState{}
+	proberMu     sync.Mutex
+	proberCancel context.CancelFunc // cancels the current goroutine; nil if no prober running
+	proberURL    atomic.Value       // string — current probe URL (set on init, updated by SetPingProbeURL)
+	proberState  = &pingProberState{}
 )
 
 func init() {
@@ -229,8 +230,8 @@ func stopPingProber() {
 }
 
 // runPingProbeLoop is the goroutine body. Cadence is dynamic — 3 s
-// while the main app is in the foreground (Swift hits NoteForegroundPoll
-// every 500 ms status RPC), 30 s when backgrounded. Each tick re-reads
+// while the extension receives status RPCs from the visible main app,
+// 30 s when backgrounded. Each tick re-reads
 // the configured URL so live URL changes via SetPingProbeURL take effect
 // on the next probe without restarting.
 func runPingProbeLoop(ctx context.Context, client probeDialer) {
@@ -431,4 +432,3 @@ func maybeRequestRewire() {
 	rt.appendLog("info: ping prober → auto-rewire requested (consecutive fails)")
 	go cb.RequestRewire()
 }
-

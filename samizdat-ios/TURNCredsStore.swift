@@ -117,7 +117,7 @@ func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
     // backward-compat with extension builds that still parse the old
     // v1 schema; `turn_servers_v2` is the authoritative source for
     // the post-fix runner.
-    struct LogShape: Encodable {
+    struct WireShape: Encodable {
         let username: String
         let password: String
         let turn_servers: [String]
@@ -129,7 +129,7 @@ func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
         TurnServerWire(host: s.host, port: s.port, scheme: s.scheme, transport: s.transport)
     }
 
-    let shape = LogShape(
+    let shape = WireShape(
         username: creds.username,
         password: creds.password,
         turn_servers: creds.turnURLs,
@@ -146,6 +146,21 @@ func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
     } catch {
         return "<encode-failed: \(error)>"
     }
+}
+
+func vkCredsLogSummary(creds: VKTURNCredentials) -> String {
+    let servers: [String]
+    if let turnServers = creds.turnServers, !turnServers.isEmpty {
+        servers = turnServers.map { server in
+            "\(server.scheme)://\(server.host):\(server.port)?transport=\(server.transport)"
+        }
+    } else {
+        servers = creds.turnURLs.map { "turn://\($0)?transport=udp" }
+    }
+    let preview = servers.prefix(3).joined(separator: ",")
+    let suffix = servers.count > 3 ? ",+\(servers.count - 3)" : ""
+    let jsonLen = vkCredsAsJSON(creds: creds).utf8.count
+    return "username=\(creds.username) passwordLen=\(creds.password.count) lifetimeSec=\(Int(creds.lifetime)) servers=\(servers.count)[\(preview)\(suffix)] jsonLen=\(jsonLen)"
 }
 
 /// Singleton helper around the App Group UserDefaults.
