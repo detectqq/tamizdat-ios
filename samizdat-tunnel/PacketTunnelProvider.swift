@@ -281,8 +281,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Logging changed from a captured `(String) -> Void` closure to
     /// direct `ExtLog.*` calls. The closure path (which fans out to
     /// `FileHandle.write` + `synchronize`) was eating every line we
-    /// emitted AFTER `SocksstubStartVKTurnUpstream` — that gomobile
-    /// call blocks for up to 15 s while VK Allocate handshakes, and
+    /// emitted around `SocksstubStartVKTurnUpstream`. That gomobile
+    /// call used to block while VK Allocate / DTLS / GETCONF ran, and
     /// Foundation's buffered handle silently dropped post-block lines.
     /// `ExtLog` open/write/fsync/close every call, so the timeline
     /// survives the block.
@@ -369,12 +369,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
             return
         }
-        ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 30 s)")
+        ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 60 s)")
 
         Task.detached(priority: .utility) {
             ExtLog.info("[vkturn] async polling task started")
+            struct TurnStatsShape: Decodable { let error: String? }
             var attempts = 0
-            for _ in 0..<120 { // 120 * 250 ms = 30 s
+            for _ in 0..<240 { // 240 * 250 ms = 60 s
                 attempts += 1
                 let wg = SocksstubTURNUpstreamWGConfig()
                 let running = SocksstubTURNUpstreamRunning()
@@ -383,12 +384,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     ExtLog.info("[vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
                     return
                 }
+                let stats = SocksstubTURNUpstreamStatsJSON()
+                if let data = stats.data(using: .utf8),
+                   let shape = try? JSONDecoder().decode(TurnStatsShape.self, from: data),
+                   let error = shape.error,
+                   !error.isEmpty {
+                    ExtLog.error("[vkturn] async attach failed: \(error)")
+                    return
+                }
                 if attempts % 8 == 0 { // every 2 sec
                     ExtLog.info("[vkturn] still waiting for WG config (running=\(running), \(attempts*250)ms)")
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
-            ExtLog.warn("[vkturn] WG config NOT received within 30 s. running=\(SocksstubTURNUpstreamRunning())")
+            ExtLog.warn("[vkturn] WG config NOT received within 60 s. running=\(SocksstubTURNUpstreamRunning()) stats=\(SocksstubTURNUpstreamStatsJSON())")
         }
     }
 

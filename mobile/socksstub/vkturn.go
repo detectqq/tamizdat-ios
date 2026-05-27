@@ -41,14 +41,21 @@ var (
 	vkturnMu         sync.Mutex
 )
 
+const vkturnConfigAttachTimeout = 60 * time.Second
+
 // StartVKTurnUpstream starts the VK TURN upstream. On success it returns "".
-// On error it returns the error message. It waits up to 15 seconds for
-// GETCONF before declaring "GETCONF timeout".
+// On immediate setup error it returns the error message. GETCONF and
+// userspace-WireGuard attach continue asynchronously so Network Extension
+// startup is not blocked on TURN Allocate / DTLS handshakes. Calling it
+// again while the runner is alive is treated as success.
 func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int) string {
 	vkturnMu.Lock()
 	if vkturnRunning.Load() {
 		vkturnMu.Unlock()
-		return "already running"
+		if p := vkturnErr.Load(); p != nil {
+			return *p
+		}
+		return ""
 	}
 
 	creds, err := parseVKTurnCredsJSON(credsJSON)
@@ -66,6 +73,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	// hard-forcing UDP against a TCP-only relay produces the
 	// "Allocate: timeout" path users see on long-lived sessions.
 	useUDP := shouldUseUDP(creds)
+	configCh := make(chan string, 1)
 
 	runner, err := wgturnclient.New(wgturnclient.Config{
 		Listen:         fmt.Sprintf("127.0.0.1:%d", listenPort),
@@ -76,7 +84,10 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 		ConnPassword:   wgPassword,
 		PreloadedCreds: creds,
 		OnConfig: func(conf string) {
-			vkturnWGConfig.Store(&conf)
+			select {
+			case configCh <- conf:
+			default:
+			}
 		},
 	})
 	if err != nil {
@@ -91,7 +102,9 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	storeVKTurnStats(0, true)
 	vkturnMu.Unlock()
 
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		err := runner.Start(ctx)
 
 		vkturnMu.Lock()
@@ -113,48 +126,9 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 		vkturnCancel = nil
 	}()
 
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if p := vkturnWGConfig.Load(); p != nil {
-			if !vkturnRunning.Load() {
-				return "not running"
-			}
-
-			var res *wgturnclient.AttachResult
-			var attachErr error
-			vkturnAttachOnce.Do(func() {
-				res, attachErr = runner.AttachWireGuardUserspace(*p)
-			})
-			if attachErr != nil {
-				cancel()
-				runner.Shutdown()
-				return "wg attach: " + attachErr.Error()
-			}
-			if res != nil {
-				vkturnMu.Lock()
-				if vkturnRunner != runner || !vkturnRunning.Load() {
-					vkturnMu.Unlock()
-					res.Stop()
-					return "not running"
-				}
-				vkturnNet.Store(res.Net)
-				vkturnAttachStop = res.Stop
-				vkturnMu.Unlock()
-			}
-			return ""
-		}
-		if p := vkturnErr.Load(); p != nil {
-			return *p
-		}
-		if !vkturnRunning.Load() {
-			return "not running"
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	cancel()
-	runner.Shutdown()
-	return "GETCONF timeout"
+	rt.appendLog("info: vkturn runner started; waiting for GETCONF in background")
+	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh)
+	return ""
 }
 
 // UpdateVKTurnCreds swaps fresh credentials into the running runner so
@@ -224,12 +198,13 @@ func TURNUpstreamWGConfig() string {
 }
 
 // TURNUpstreamStatsJSON returns the latest stats snapshot as a single-line
-// JSON string. Empty string if not running.
+// JSON string. After startup failures it keeps the last error visible even
+// if the runner has already stopped.
 func TURNUpstreamStatsJSON() string {
-	if !vkturnRunning.Load() {
-		return ""
+	running := vkturnRunning.Load()
+	if running {
+		storeVKTurnStats(0, true)
 	}
-	storeVKTurnStats(0, true)
 	if p := vkturnStats.Load(); p != nil {
 		return *p
 	}
@@ -380,7 +355,84 @@ func resetVKTurnAtomicsLocked() {
 	vkturnRunning.Store(false)
 }
 
+func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string) {
+	timer := time.NewTimer(vkturnConfigAttachTimeout)
+	defer timer.Stop()
+
+	select {
+	case conf := <-configCh:
+		attachVKTurnConfig(runner, cancel, conf)
+	case <-runDone:
+		if ctx.Err() == nil && vkturnErr.Load() == nil {
+			storeVKTurnError("not running before GETCONF")
+		}
+	case <-ctx.Done():
+	case <-timer.C:
+		errText := fmt.Sprintf("GETCONF timeout after %s", vkturnConfigAttachTimeout)
+		storeVKTurnError(errText)
+		rt.appendLog("error: vkturn " + errText)
+		cancel()
+		runner.Shutdown()
+	}
+}
+
+func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, conf string) {
+	if conf == "" {
+		return
+	}
+	rt.appendLog("info: vkturn GETCONF received; attaching userspace WireGuard")
+
+	var res *wgturnclient.AttachResult
+	var attachErr error
+	vkturnAttachOnce.Do(func() {
+		res, attachErr = runner.AttachWireGuardUserspace(conf)
+	})
+	if attachErr != nil {
+		errText := "wg attach: " + attachErr.Error()
+		storeVKTurnError(errText)
+		rt.appendLog("error: vkturn " + errText)
+		cancel()
+		runner.Shutdown()
+		return
+	}
+	if res == nil {
+		return
+	}
+
+	vkturnMu.Lock()
+	defer vkturnMu.Unlock()
+	if vkturnRunner != runner || !vkturnRunning.Load() {
+		res.Stop()
+		return
+	}
+	vkturnNet.Store(res.Net)
+	vkturnWGConfig.Store(&conf)
+	vkturnAttachStop = res.Stop
+	storeVKTurnStats(0, true)
+	rt.appendLog("info: vkturn userspace WireGuard attached; netstack ready")
+}
+
+func storeVKTurnError(errText string) {
+	vkturnErr.Store(&errText)
+	storeVKTurnStats(0, vkturnRunning.Load())
+}
+
 func storeVKTurnStats(active int, running bool) {
-	snapshot := fmt.Sprintf(`{"active":%d,"running":%t}`, active, running)
+	var errText string
+	if p := vkturnErr.Load(); p != nil {
+		errText = *p
+	}
+	payload := struct {
+		Active  int    `json:"active"`
+		Running bool   `json:"running"`
+		Error   string `json:"error,omitempty"`
+	}{Active: active, Running: running, Error: errText}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		snapshot := fmt.Sprintf(`{"active":%d,"running":%t}`, active, running)
+		vkturnStats.Store(&snapshot)
+		return
+	}
+	snapshot := string(b)
 	vkturnStats.Store(&snapshot)
 }
