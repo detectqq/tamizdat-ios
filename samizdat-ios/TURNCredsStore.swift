@@ -330,6 +330,23 @@ enum VKCredsPreferences {
         set { defaults?.set(newValue, forKey: connectPasswordKey) }
     }
 
+    /// Mirror derived H2 identity into App Group keys consumed by the
+    /// Network Extension. VK TURN does not have its own peer/password:
+    /// peer is the Whitelist/H2 Tamizdat server (or primary fallback) and
+    /// password is that URI's shortid. Passing nil clears the mirror so stale manual values cannot
+    /// survive after the H2 config is removed.
+    @discardableResult
+    static func applyDerivedH2PeerConfig(_ config: SamizdatURLCodec.H2PeerConfig?) -> Bool {
+        guard let config else {
+            defaults?.set("", forKey: peerAddrKey)
+            defaults?.set("", forKey: connectPasswordKey)
+            return false
+        }
+        defaults?.set(config.server, forKey: peerAddrKey)
+        defaults?.set(config.shortID, forKey: connectPasswordKey)
+        return true
+    }
+
     /// Stable per-install UUID — lazy-initialised on first read so the
     /// extension and the main app see the same value through the App
     /// Group store.

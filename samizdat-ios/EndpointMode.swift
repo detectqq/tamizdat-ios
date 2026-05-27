@@ -55,6 +55,11 @@ enum EndpointModeStore {
 /// <base64url(samizdat://...backup...)>`. Returns the backup only if
 /// the `&backup=` parameter was present and decoded successfully.
 enum SamizdatURLCodec {
+    struct H2PeerConfig: Equatable {
+        let server: String
+        let shortID: String
+    }
+
     /// Extracts the primary URL (everything except &backup=...) and
     /// the backup URL (base64url-decoded) from a combined blob.
     /// If no &backup= is present, returns (combined, nil).
@@ -93,6 +98,39 @@ enum SamizdatURLCodec {
         let encoded = base64URLEncode(backup)
         let sep = primary.contains("?") ? "&" : "?"
         return primary + sep + "backup=" + encoded
+    }
+
+    /// Extract the H2 peer tuple used by VK TURN: server comes from the
+    /// H2 tamizdat:// URI authority, password comes from that URI's shortid.
+    /// Prefer the Whitelist/backup H2 URI because TURN replaces that endpoint;
+    /// fall back to primary for single-endpoint configs.
+    static func h2PeerConfig(from combined: String) -> H2PeerConfig? {
+        let parts = split(combined)
+        if let backup = parts.backup?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !backup.isEmpty {
+            return h2PeerConfigFromSingleURL(backup)
+        }
+        let primary = parts.primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return h2PeerConfigFromSingleURL(primary)
+    }
+
+    private static func h2PeerConfigFromSingleURL(_ raw: String) -> H2PeerConfig? {
+        guard let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "tamizdat" || scheme == "samizdat",
+              let host = components.host,
+              !host.isEmpty else {
+            return nil
+        }
+        let shortID = components.queryItems?
+            .first { $0.name.lowercased() == "shortid" }?
+            .value?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !shortID.isEmpty else { return nil }
+
+        let displayHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        let port = components.port ?? 443
+        return H2PeerConfig(server: "\(displayHost):\(port)", shortID: shortID)
     }
 
     /// base64url with no padding (RFC 4648 §5).

@@ -41,8 +41,8 @@ struct SettingsView: View {
     // either the full URL or just the hash into this field. The hash is
     // persisted in App Group UserDefaults so the NE can also see it.
     @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
-    @State private var vkPeerAddrDraft: String = VKCredsPreferences.peerAddr
-    @State private var vkConnectPasswordDraft: String = VKCredsPreferences.connectPassword
+    @State private var vkDerivedPeerAddr: String = VKCredsPreferences.peerAddr
+    @State private var vkDerivedPasswordConfigured: Bool = !VKCredsPreferences.connectPassword.isEmpty
     @State private var vkCallHashFeedback: String = ""
 
     /// Debounce token for the auto-persist refresh trigger. The three
@@ -153,6 +153,7 @@ struct SettingsView: View {
         .preferredColorScheme(theme.isDark ? .dark : .light)
         .task {
             permissionStatus = await NotificationPreferences.currentSystemAuthorization()
+            syncVKDerivedH2Config()
         }
         .alert("Notifications were not granted", isPresented: $permissionDeniedAlert) {
             Button("Open iOS Settings") { openSystemSettings() }
@@ -163,6 +164,7 @@ struct SettingsView: View {
         .sheet(isPresented: $showEndpoints) {
             EndpointsView { saved in
                 onConfigChanged(saved)
+                syncVKDerivedH2Config()
             }
             .environment(\.themeTokens, theme)
         }
@@ -251,45 +253,39 @@ struct SettingsView: View {
                     .onSubmit { persistAndMaybeRefresh() }
                     .onChange(of: vkCallHashDraft) { _, _ in persistAndMaybeRefresh() }
 
-                Text("Сервер (peer)")
+                Text("Сервер (из H2 URI)")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
-                TextField("46.8.19.173:5000", text: $vkPeerAddrDraft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .keyboardType(.URL)
+                Text(vkDerivedPeerAddr.isEmpty ? "Нет Whitelist/Main H2 URI" : vkDerivedPeerAddr)
                     .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(theme.text)
+                    .foregroundStyle(vkDerivedPeerAddr.isEmpty ? theme.textDim : theme.text)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { persistAndMaybeRefresh() }
-                    .onChange(of: vkPeerAddrDraft) { _, _ in persistAndMaybeRefresh() }
 
                 Text("Пароль подключения")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
-                SecureField("wgturn server password", text: $vkConnectPasswordDraft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+                Text(vkDerivedPasswordConfigured ? "shortid из Whitelist/Main H2 URI" : "Нет shortid в Whitelist/Main H2 URI")
                     .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(theme.text)
+                    .foregroundStyle(vkDerivedPasswordConfigured ? theme.text : theme.textDim)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { persistAndMaybeRefresh() }
-                    .onChange(of: vkConnectPasswordDraft) { _, _ in persistAndMaybeRefresh() }
 
-                // The legacy mode picker and the manual save button were
-                // both removed on the autonomous-refresh pass. Persistence
-                // happens on every `onChange`; a debounced forceRefresh
-                // fires 1 s after the last edit when all three fields are
-                // populated. The Whitelist-mode picker (H2 / TURN) in the
-                // Whitelist detection card is the single source of truth
-                // for whether VK TURN is engaged.
-                Text("Поля сохраняются автоматически. VK TURN включается, когда «Whitelist mode = TURN» в разделе Whitelist detection.")
+                // VK TURN peer/password are derived from the H2
+                // tamizdat:// URI: server = URI authority, password =
+                // shortid. Prefer Whitelist/H2, fallback to Main.
+                // Persistence happens on every hash change; a debounced
+                // forceRefresh fires 1 s after the last edit when hash +
+                // derived H2 tuple are available. The Whitelist-mode
+                // picker (H2 / TURN) in the Whitelist detection card is
+                // the single source of truth for whether VK TURN is engaged.
+                Text("Hash сохраняется автоматически. Сервер берётся из H2 tamizdat:// URI, пароль = shortid из этого URI. VK TURN включается, когда «Whitelist mode = TURN» в разделе Whitelist detection.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
                     .padding(.top, 4)
@@ -343,19 +339,26 @@ struct SettingsView: View {
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
-    /// Silent persist + debounced refresh. Called from each TextField's
-    /// `onChange`. Trims peer, normalises hash, writes all three keys
-    /// to App Group UserDefaults, then schedules a single forceRefresh
-    /// 1 second after the last edit settles. Empty fields don't trip
-    /// the refresh — we just save the partial state so the user can
-    /// come back and complete it later.
+    private func syncVKDerivedH2Config() -> SamizdatURLCodec.H2PeerConfig? {
+        let blob = ConfigStore.shared.load() ?? ""
+        let derived = SamizdatURLCodec.h2PeerConfig(from: blob)
+        VKCredsPreferences.applyDerivedH2PeerConfig(derived)
+        vkDerivedPeerAddr = derived?.server ?? ""
+        vkDerivedPasswordConfigured = derived?.shortID.isEmpty == false
+        return derived
+    }
+
+    /// Silent persist + debounced refresh. Called from the hash TextField's
+    /// `onChange`. Normalises hash, mirrors H2 URI authority+shortid
+    /// into the App Group keys consumed by the Network Extension, then
+    /// schedules a single forceRefresh 1 second after the last edit settles.
+    /// Empty hash or missing H2 URI doesn't trip refresh — we just save the
+    /// partial state so the user can come back and complete it later.
     ///
     /// Doesn't touch EndpointTurnMode any more — the Whitelist-mode
     /// picker (H2 / TURN) is the single source of truth.
     private func persistAndMaybeRefresh() {
-        let peer = vkPeerAddrDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        VKCredsPreferences.peerAddr = peer
-        VKCredsPreferences.connectPassword = vkConnectPasswordDraft
+        let derived = syncVKDerivedH2Config()
 
         let hash = Self.normalizeVKHash(vkCallHashDraft)
         VKCredsPreferences.primaryCallHash = hash
@@ -369,9 +372,9 @@ struct SettingsView: View {
         vkRefreshDebounceTask?.cancel()
         vkCallHashFeedback = ""
 
-        // Only fire the refresh once all three fields are populated.
-        let allFilled = !hash.isEmpty && !peer.isEmpty && !vkConnectPasswordDraft.isEmpty
-        guard allFilled else {
+        // Only fire the refresh once hash and derived H2 peer config exist.
+        let ready = !hash.isEmpty && derived != nil
+        guard ready else {
             return
         }
 
@@ -383,9 +386,10 @@ struct SettingsView: View {
             if vkCallHashDraft != hash {
                 vkCallHashDraft = hash
             }
-            if vkPeerAddrDraft != peer {
-                vkPeerAddrDraft = peer
+            if vkDerivedPeerAddr != (derived?.server ?? "") {
+                vkDerivedPeerAddr = derived?.server ?? ""
             }
+            vkDerivedPasswordConfigured = derived?.shortID.isEmpty == false
             vkCallHashFeedback = "Автообновление..."
             TURNCredsRefresher.shared.forceRefresh()
         }

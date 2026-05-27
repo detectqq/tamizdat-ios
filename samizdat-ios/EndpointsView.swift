@@ -256,10 +256,12 @@ struct EndpointsView: View {
         let b = backupURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if p.isEmpty && b.isEmpty {
             ConfigStore.shared.delete()
+            VKCredsPreferences.applyDerivedH2PeerConfig(nil)
             return
         }
         let combined = SamizdatURLCodec.compose(primary: p, backup: b.isEmpty ? nil : b)
         ConfigStore.shared.save(combined)
+        VKCredsPreferences.applyDerivedH2PeerConfig(SamizdatURLCodec.h2PeerConfig(from: combined))
     }
 
     private func closeAndPersist() {

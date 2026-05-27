@@ -302,11 +302,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceID=\"\(deviceID.prefix(8))...\" hash=\"\(hashPrefix)...\"")
 
         guard !peer.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Сервер (peer) пустой. Заполни в Settings → VK TURN.")
+            ExtLog.warn("[vkturn] attach SKIPPED — H2 tamizdat:// server not mirrored yet. Open Settings → Proxies and save a Whitelist H2 URI (or Main URI fallback).")
             return
         }
         guard !password.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Пароль подключения пустой. Заполни в Settings → VK TURN.")
+            ExtLog.warn("[vkturn] attach SKIPPED — H2 tamizdat:// shortid not mirrored yet. Re-save the Whitelist H2 URI in Settings → Proxies.")
             return
         }
 
@@ -755,7 +755,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // in the main app only touches that process' idle Go runtime.
             appendExtLog("info: app requested VK TURN creds refresh")
             let result = Self.refreshVKTurnCredsFromAppGroup()
-            completionHandler?(result.data(using: .utf8))
+            if result == "not running" {
+                // If the tunnel started before VK creds existed,
+                // attachVKTurnUpstream() skipped. A later successful
+                // refresh should start the runner immediately instead
+                // of waiting for a reconnect.
+                let groupID = "group.com.anarki.samizdat-test"
+                let mode = UserDefaults(suiteName: groupID)?
+                    .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+                if mode == "vkTurn" {
+                    appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
+                    Self.attachVKTurnUpstream()
+                    completionHandler?("attachStarted".data(using: .utf8))
+                } else {
+                    completionHandler?(result.data(using: .utf8))
+                }
+            } else {
+                completionHandler?(result.data(using: .utf8))
+            }
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which
