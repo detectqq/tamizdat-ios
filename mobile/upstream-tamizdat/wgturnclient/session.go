@@ -44,6 +44,36 @@ const (
 // (client/main.go:66, 1404-1409).
 var handshakeSem = make(chan struct{}, handshakeSemCap)
 
+type dtlsHandshaker interface {
+	HandshakeContext(context.Context) error
+}
+
+func runDTLSHandshakeWithThrottle(sessCtx context.Context, sessionID int, conn dtlsHandshaker) error {
+	// Acquire one slot from the package-level handshake throttle before
+	// running the DTLS handshake. The slot is released immediately after
+	// HandshakeContext returns: it must cap concurrent handshakes, not
+	// long-lived relay sessions.
+	acqCtx, acqCancel := context.WithTimeout(sessCtx, handshakeAcquireTTL)
+	select {
+	case handshakeSem <- struct{}{}:
+		acqCancel()
+	case <-acqCtx.Done():
+		acqCancel()
+		return fmt.Errorf("DTLS handshake throttle: не удалось получить слот за %s (все %d заняты)", handshakeAcquireTTL, handshakeSemCap)
+	}
+
+	hctx, hcancel := context.WithTimeout(sessCtx, 45*time.Second)
+	log.Printf("[ВОРКЕР #%d] [DTLS] Рукопожатие (Handshake)...", sessionID)
+	err := conn.HandshakeContext(hctx)
+	hcancel()
+	<-handshakeSem
+	if err != nil {
+		return fmt.Errorf("DTLS хендшейк: %w", err)
+	}
+	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
+	return nil
+}
+
 // NullLoggerFactory подавляет логи pion
 type NullLoggerFactory struct{}
 
@@ -369,36 +399,9 @@ func RunSession(
 	}
 	defer dtlsConn.Close()
 
-	// Acquire one slot from the package-level handshake throttle
-	// before running the DTLS handshake. Caps concurrency at
-	// handshakeSemCap (3). A 5 s budget is enough headroom for an
-	// in-flight neighbour to complete (a healthy DTLS handshake to
-	// OK CDN finishes in <1 s); after that we bail rather than queue
-	// indefinitely behind a stuck handshake.
-	//
-	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
-	// (client/main.go:1404-1409).
-	acqCtx, acqCancel := context.WithTimeout(sessCtx, handshakeAcquireTTL)
-	select {
-	case handshakeSem <- struct{}{}:
-		acqCancel()
-		// Release the slot when this session ends — defer here, not
-		// inside the handshake block, so we don't double-release on
-		// error paths between acquire and Handshake completion.
-		defer func() { <-handshakeSem }()
-	case <-acqCtx.Done():
-		acqCancel()
-		return false, fmt.Errorf("DTLS handshake throttle: не удалось получить слот за %s (все %d заняты)", handshakeAcquireTTL, handshakeSemCap)
+	if err := runDTLSHandshakeWithThrottle(sessCtx, sessionID, dtlsConn); err != nil {
+		return false, err
 	}
-
-	hctx, hcancel := context.WithTimeout(sessCtx, 45*time.Second)
-	log.Printf("[ВОРКЕР #%d] [DTLS] Рукопожатие (Handshake)...", sessionID)
-	err = dtlsConn.HandshakeContext(hctx)
-	hcancel()
-	if err != nil {
-		return false, fmt.Errorf("DTLS хендшейк: %w", err)
-	}
-	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
 
 	atomic.AddInt32(&stats.ActiveConnections, 1)
 	defer atomic.AddInt32(&stats.ActiveConnections, -1)

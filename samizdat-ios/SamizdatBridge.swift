@@ -149,12 +149,6 @@ final class SamizdatBridge: ObservableObject {
     /// therefore also sends a `refreshVKTurnCreds` provider message so
     /// the extension re-reads the App Group mirror and updates the live
     /// Go runner in the correct process.
-    ///
-    /// TODO(gomobile-rebuild): `SocksstubUpdateVKTurnCreds` is a new
-    /// export; the SamizdatClient.xcframework currently checked into
-    /// the repo predates it. After regenerating bindings the linker
-    /// will find the symbol and this call will start returning
-    /// meaningful values. See commit message for the regen command.
     @discardableResult
     static func updateVKTurnCreds(_ credsJSON: String) -> String {
         SocksstubUpdateVKTurnCreds(credsJSON)

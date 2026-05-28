@@ -36,7 +36,6 @@ var (
 	vkturnErr        atomic.Pointer[string]
 	vkturnNet        atomic.Pointer[netstack.Net]
 	vkturnRunning    atomic.Bool
-	vkturnAttachOnce sync.Once
 	vkturnAttachStop func()
 	vkturnMu         sync.Mutex
 )
@@ -65,7 +64,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	}
 
 	resetVKTurnAtomicsLocked()
-	vkturnAttachOnce = sync.Once{}
+	attachOnce := &sync.Once{}
 
 	// Pick transport from the first TURN server's metadata when the v2
 	// wire shape is present; otherwise default to UDP (legacy
@@ -127,7 +126,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	}()
 
 	rt.appendLog("info: vkturn runner started; waiting for GETCONF in background")
-	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh)
+	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh, attachOnce)
 	return ""
 }
 
@@ -355,13 +354,13 @@ func resetVKTurnAtomicsLocked() {
 	vkturnRunning.Store(false)
 }
 
-func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string) {
+func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string, attachOnce *sync.Once) {
 	timer := time.NewTimer(vkturnConfigAttachTimeout)
 	defer timer.Stop()
 
 	select {
 	case conf := <-configCh:
-		attachVKTurnConfig(runner, cancel, conf)
+		attachVKTurnConfig(runner, cancel, conf, attachOnce)
 	case <-runDone:
 		if ctx.Err() == nil && vkturnErr.Load() == nil {
 			storeVKTurnError("not running before GETCONF")
@@ -376,7 +375,7 @@ func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel
 	}
 }
 
-func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, conf string) {
+func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, conf string, attachOnce *sync.Once) {
 	if conf == "" {
 		return
 	}
@@ -384,7 +383,7 @@ func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, 
 
 	var res *wgturnclient.AttachResult
 	var attachErr error
-	vkturnAttachOnce.Do(func() {
+	attachOnce.Do(func() {
 		res, attachErr = runner.AttachWireGuardUserspace(conf)
 	})
 	if attachErr != nil {

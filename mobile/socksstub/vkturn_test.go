@@ -2,7 +2,6 @@ package socksstub
 
 import (
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/detectqq/tamizdat/wgturnclient"
@@ -14,7 +13,6 @@ func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
 	vkturnRunner = nil
 	vkturnCancel = nil
 	vkturnAttachStop = nil
-	vkturnAttachOnce = sync.Once{}
 	vkturnRunning.Store(false)
 	vkturnNet.Store(&netstack.Net{})
 	vkturnWGConfig.Store(nil)

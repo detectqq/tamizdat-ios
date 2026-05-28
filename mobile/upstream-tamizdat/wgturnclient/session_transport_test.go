@@ -1,6 +1,12 @@
 package wgturnclient
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestSelectTurnEndpointFiltersV2ByRequestedUDPTransport(t *testing.T) {
 	creds := &Credentials{
@@ -56,4 +62,53 @@ func TestSelectTurnEndpointFallsBackToLegacyURLsWhenV2Absent(t *testing.T) {
 	if endpoint.UseUDP || endpoint.UseTLS || endpoint.Proto != "TCP" {
 		t.Fatalf("endpoint transport = proto=%q useUDP=%t useTLS=%t, want TCP/no-TLS", endpoint.Proto, endpoint.UseUDP, endpoint.UseTLS)
 	}
+}
+
+func TestRunDTLSHandshakeWithThrottleReleasesSlotOnSuccessAndError(t *testing.T) {
+	resetHandshakeSemForTest(t)
+
+	if err := runDTLSHandshakeWithThrottle(context.Background(), 0, fakeDTLSHandshaker{}); err != nil {
+		t.Fatalf("runDTLSHandshakeWithThrottle success: %v", err)
+	}
+	if got := len(handshakeSem); got != 0 {
+		t.Fatalf("handshake semaphore leaked after success: len=%d", got)
+	}
+
+	boom := errors.New("boom")
+	err := runDTLSHandshakeWithThrottle(context.Background(), 1, fakeDTLSHandshaker{err: boom})
+	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
+		t.Fatalf("runDTLSHandshakeWithThrottle error = %v, want boom", err)
+	}
+	if got := len(handshakeSem); got != 0 {
+		t.Fatalf("handshake semaphore leaked after error: len=%d", got)
+	}
+}
+
+func TestRunDTLSHandshakeWithThrottleTimesOutWhenFull(t *testing.T) {
+	resetHandshakeSemForTest(t)
+	for i := 0; i < handshakeSemCap; i++ {
+		handshakeSem <- struct{}{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := runDTLSHandshakeWithThrottle(ctx, 2, fakeDTLSHandshaker{})
+	if err == nil || !strings.Contains(err.Error(), "DTLS handshake throttle") {
+		t.Fatalf("runDTLSHandshakeWithThrottle full semaphore error = %v", err)
+	}
+}
+
+type fakeDTLSHandshaker struct {
+	err error
+}
+
+func (f fakeDTLSHandshaker) HandshakeContext(context.Context) error {
+	return f.err
+}
+
+func resetHandshakeSemForTest(t *testing.T) {
+	t.Helper()
+	old := handshakeSem
+	handshakeSem = make(chan struct{}, handshakeSemCap)
+	t.Cleanup(func() { handshakeSem = old })
 }

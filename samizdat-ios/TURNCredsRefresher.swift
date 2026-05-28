@@ -15,8 +15,8 @@ import UserNotifications
 ///
 /// Lifetimes:
 ///   - Single shared instance per process; survives scene transitions.
-///   - Owns a per-process `VKCredsClient` actor — its URLSession +
-///     cookie jar live as long as the app process.
+///   - Builds a fresh `VKCredsClient` per refresh so each attempt owns
+///     its own URLSession/cookie state.
 ///   - The slider-fallback flow is surfaced via `manualChallenge`,
 ///     which `ContentView` binds to a `ManualCaptchaSheet`. When the
 ///     sheet finishes, the coordinator resumes its waiting
