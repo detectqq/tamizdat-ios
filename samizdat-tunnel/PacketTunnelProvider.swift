@@ -305,11 +305,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) hashLen=\(hashLen)")
 
         guard !peer.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — H2 tamizdat:// server not mirrored yet. Open Settings → Proxies and save a Whitelist H2 URI (or Main URI fallback).")
+            ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
             return
         }
         guard !password.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — H2 tamizdat:// shortid not mirrored yet. Re-save the Whitelist H2 URI in Settings → Proxies.")
+            ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// shortid not mirrored yet. Re-save Main URI in Settings → Proxies.")
             return
         }
 

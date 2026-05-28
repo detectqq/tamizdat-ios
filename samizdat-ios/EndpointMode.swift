@@ -100,17 +100,12 @@ enum SamizdatURLCodec {
         return primary + sep + "backup=" + encoded
     }
 
-    /// Extract the H2 peer tuple used by VK TURN: server comes from the
-    /// H2 tamizdat:// URI authority, password comes from that URI's shortid.
-    /// Prefer the Whitelist/backup H2 URI because TURN replaces that endpoint;
-    /// fall back to primary for single-endpoint configs.
+    /// Extract the peer tuple used by VK TURN from the Main H2 URI only:
+    /// server comes from the primary tamizdat:// URI authority, password
+    /// comes from that URI's shortid. Backup/Whitelist URI is deliberately
+    /// ignored; TURN uses the user's normal Main server identity.
     static func h2PeerConfig(from combined: String) -> H2PeerConfig? {
-        let parts = split(combined)
-        if let backup = parts.backup?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !backup.isEmpty {
-            return h2PeerConfigFromSingleURL(backup)
-        }
-        let primary = parts.primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let primary = split(combined).primary.trimmingCharacters(in: .whitespacesAndNewlines)
         return h2PeerConfigFromSingleURL(primary)
     }
 
@@ -122,10 +117,14 @@ enum SamizdatURLCodec {
               !host.isEmpty else {
             return nil
         }
-        let shortID = components.queryItems?
+        let userShortID = components.percentEncodedUser?
+            .removingPercentEncoding?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let queryShortID = components.queryItems?
             .first { $0.name.lowercased() == "shortid" }?
             .value?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let shortID = userShortID.isEmpty ? queryShortID : userShortID
         guard !shortID.isEmpty else { return nil }
 
         let displayHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host

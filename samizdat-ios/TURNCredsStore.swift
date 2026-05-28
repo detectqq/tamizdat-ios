@@ -346,10 +346,10 @@ enum VKCredsPreferences {
     }
 
     /// Mirror derived H2 identity into App Group keys consumed by the
-    /// Network Extension. VK TURN does not have its own peer/password:
-    /// peer is the Whitelist/H2 Tamizdat server (or primary fallback) and
-    /// password is that URI's shortid. Passing nil clears the mirror so stale manual values cannot
-    /// survive after the H2 config is removed.
+    /// Network Extension. VK TURN does not have editable peer/password:
+    /// peer is derived from the Main tamizdat:// URI authority and
+    /// password is that user's shortid. Passing nil clears the mirror so
+    /// stale values cannot survive after the H2 config is removed.
     @discardableResult
     static func applyDerivedH2PeerConfig(_ config: SamizdatURLCodec.H2PeerConfig?) -> Bool {
         guard let config else {

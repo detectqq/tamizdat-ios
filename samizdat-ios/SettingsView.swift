@@ -36,20 +36,11 @@ struct SettingsView: View {
     @State private var pingURLDraft: String = PingURLPreferences.url
 
     // VK TURN call-hash field. The hash is the slug after `/join/` in a
-    // VK call invite URL (e.g. `https://vk.ru/call/join/<HASH>`). The
-    // user creates a group call in VK, copies the invite link, pastes
-    // either the full URL or just the hash into this field. The hash is
-    // persisted in App Group UserDefaults so the NE can also see it.
+    // VK call invite URL (e.g. `https://vk.ru/call/join/<HASH>`). Only
+    // the hash is editable here: peer/server and connection password are
+    // derived from Main tamizdat:// URI and mirrored to App Group on Save.
     @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
-    @State private var vkDerivedPeerAddr: String = VKCredsPreferences.peerAddr
-    @State private var vkDerivedPasswordConfigured: Bool = !VKCredsPreferences.connectPassword.isEmpty
     @State private var vkCallHashFeedback: String = ""
-
-    /// Debounce token for the auto-persist refresh trigger. The three
-    /// VK TURN fields fire `onChange` on every keystroke; we
-    /// schedule a forceRefresh 1 s after the last edit, cancelling
-    /// any pending one. Tap "Clear" to bail out cleanly.
-    @State private var vkRefreshDebounceTask: Task<Void, Never>?
 
     // IPA-D23: whitelist-detection probe targets.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
@@ -250,42 +241,9 @@ struct SettingsView: View {
                     .padding(.vertical, 11)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { persistAndMaybeRefresh() }
-                    .onChange(of: vkCallHashDraft) { _, _ in persistAndMaybeRefresh() }
+                    .onSubmit { saveVKTurnSettings() }
 
-                Text("Сервер (из H2 URI)")
-                    .font(.geist(.medium, size: 12))
-                    .foregroundStyle(theme.textMuted)
-                Text(vkDerivedPeerAddr.isEmpty ? "Нет Whitelist/Main H2 URI" : vkDerivedPeerAddr)
-                    .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(vkDerivedPeerAddr.isEmpty ? theme.textDim : theme.text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(theme.chip)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-
-                Text("Пароль подключения")
-                    .font(.geist(.medium, size: 12))
-                    .foregroundStyle(theme.textMuted)
-                Text(vkDerivedPasswordConfigured ? "shortid из Whitelist/Main H2 URI" : "Нет shortid в Whitelist/Main H2 URI")
-                    .font(.geistMono(.regular, size: 12.5))
-                    .foregroundStyle(vkDerivedPasswordConfigured ? theme.text : theme.textDim)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(theme.chip)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-
-                // VK TURN peer/password are derived from the H2
-                // tamizdat:// URI: server = URI authority, password =
-                // shortid. Prefer Whitelist/H2, fallback to Main.
-                // Persistence happens on every hash change; a debounced
-                // forceRefresh fires 1 s after the last edit when hash +
-                // derived H2 tuple are available. The Whitelist-mode
-                // picker (H2 / TURN) in the Whitelist detection card is
-                // the single source of truth for whether VK TURN is engaged.
-                Text("Hash сохраняется автоматически. Сервер берётся из H2 tamizdat:// URI, пароль = shortid из этого URI. VK TURN включается, когда «Whitelist mode = TURN» в разделе Whitelist detection.")
+                Text("Only the VK call hash is saved here. Server is derived from Main URI; connection password is that user's shortid. VK TURN is enabled by Whitelist mode = TURN.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
                     .padding(.top, 4)
@@ -296,28 +254,13 @@ struct SettingsView: View {
                         .foregroundStyle(theme.textDim)
                 }
 
-                Button(action: clearVKHash) {
-                    Text("Clear")
+                Button(action: saveVKTurnSettings) {
+                    Text("Save")
                         .font(.geist(.semibold, size: 13))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
-                        .background(theme.chip)
-                        .foregroundStyle(theme.text)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
-                .buttonStyle(.plain)
-                // Emergency reset for the "stuck refresh" state. If a
-                // previous refresh wedged (network hang, WKWebView never
-                // completing) `isRefreshing` stays true forever and every
-                // subsequent forceRefresh just skips. This button cancels
-                // the in-flight Task and flips the flag back.
-                Button(action: resetRefreshState) {
-                    Text("Reset refresh state")
-                        .font(.geist(.semibold, size: 13))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(theme.amberDim)
-                        .foregroundStyle(theme.amber)
+                        .background(theme.mint)
+                        .foregroundStyle(theme.mintInk)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
@@ -343,69 +286,30 @@ struct SettingsView: View {
         let blob = ConfigStore.shared.load() ?? ""
         let derived = SamizdatURLCodec.h2PeerConfig(from: blob)
         VKCredsPreferences.applyDerivedH2PeerConfig(derived)
-        vkDerivedPeerAddr = derived?.server ?? ""
-        vkDerivedPasswordConfigured = derived?.shortID.isEmpty == false
         return derived
     }
 
-    /// Silent persist + debounced refresh. Called from the hash TextField's
-    /// `onChange`. Normalises hash, mirrors H2 URI authority+shortid
-    /// into the App Group keys consumed by the Network Extension, then
-    /// schedules a single forceRefresh 1 second after the last edit settles.
-    /// Empty hash or missing H2 URI doesn't trip refresh — we just save the
-    /// partial state so the user can come back and complete it later.
-    ///
-    /// Doesn't touch EndpointTurnMode any more — the Whitelist-mode
-    /// picker (H2 / TURN) is the single source of truth.
-    private func persistAndMaybeRefresh() {
+    /// Save the VK call hash explicitly. Peer/server and password are
+    /// always derived from the Main tamizdat:// URI: server = Main URI
+    /// authority, password = that user's shortid.
+    private func saveVKTurnSettings() {
         let derived = syncVKDerivedH2Config()
-
         let hash = Self.normalizeVKHash(vkCallHashDraft)
         VKCredsPreferences.primaryCallHash = hash
+        vkCallHashDraft = hash
 
-        // Re-sync drafts if normalisation changed them — but only when
-        // the user has paused typing, otherwise we fight against their
-        // edit position. Detect "paused" by deferring the rewrite to
-        // after the debounce timer fires.
-
-        // Cancel any pending debounce.
-        vkRefreshDebounceTask?.cancel()
-        vkCallHashFeedback = ""
-
-        // Only fire the refresh once hash and derived H2 peer config exist.
-        let ready = !hash.isEmpty && derived != nil
-        guard ready else {
+        guard !hash.isEmpty else {
+            TURNCredsStore.shared.clear()
+            vkCallHashFeedback = "Сохранено: hash пуст, TURN credentials очищены"
+            return
+        }
+        guard derived != nil else {
+            vkCallHashFeedback = "Нет Main URI или shortid в Proxies"
             return
         }
 
-        vkRefreshDebounceTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if Task.isCancelled { return }
-            // Snap normalised forms back into the drafts now that the
-            // user has paused typing.
-            if vkCallHashDraft != hash {
-                vkCallHashDraft = hash
-            }
-            if vkDerivedPeerAddr != (derived?.server ?? "") {
-                vkDerivedPeerAddr = derived?.server ?? ""
-            }
-            vkDerivedPasswordConfigured = derived?.shortID.isEmpty == false
-            vkCallHashFeedback = "Автообновление..."
-            TURNCredsRefresher.shared.forceRefresh()
-        }
-    }
-
-    private func clearVKHash() {
-        vkRefreshDebounceTask?.cancel()
-        VKCredsPreferences.primaryCallHash = ""
-        vkCallHashDraft = ""
-        vkCallHashFeedback = "Очищено"
-        TURNCredsStore.shared.clear()
-    }
-
-    private func resetRefreshState() {
-        TURNCredsRefresher.shared.resetRefreshState()
-        vkCallHashFeedback = "Состояние refresh сброшено"
+        vkCallHashFeedback = "Сохранено; обновляю TURN credentials..."
+        TURNCredsRefresher.shared.forceRefresh()
     }
 
     private var configurationCard: some View {
